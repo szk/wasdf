@@ -1,0 +1,27 @@
+[package]
+name = "wasdf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wasdf"
+path = "src/main.rs"
+
+[dependencies]
+wasdf-sdk = { path = "../wasdf-sdk" }
+ratatui = { workspace = true, features = ["crossterm"] }
+crossterm = { workspace = true }
+fuzzy-matcher = { workspace = true }
+stak = "0.12"
+stak-compiler = "0.12"
+libloading = "0.8"
+libc = "0.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+chafa-syms-rs = "0.1"
+# Syntax highlighting for text previews. fancy-regex backend keeps it pure Rust
+# (no onig/C dependency); bundles the default syntax + theme sets.
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+
+[build-dependencies]
+stak-build = { version = "0.12", optional = true }

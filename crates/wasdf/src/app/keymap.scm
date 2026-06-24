@@ -1,0 +1,30 @@
+(quote (
+    (file file (
+        ("w" cursor-up) ("s" cursor-down) ("a" cursor-left) ("d" cursor-right) ("Enter" activate)
+        ("k" func-up)   ("Up" func-up)    ("j" func-down)   ("Down" func-down)
+        ("h" func-left) ("Left" func-left) ("l" func-right) ("Right" func-right)
+        ("Space" toggle-select) ("f" file-search) ("x" command-palette)
+        ("W" cursor-top) ("S" cursor-bottom) ("Ctrl-a" select-all)
+        ("c" start-copy) ("m" start-move) ("R" start-rename) ("e" start-edit)
+        ("," cycle-function-panel) ("." toggle-dotfiles) ("v" cycle-list-layout)
+        ("Esc" clear-selection) ("r" refresh)
+        ("Backspace" delete-selected) ("Delete" delete-selected)
+        ("Tab" focus-next-panel) ("Shift-Tab" focus-prev-panel) ("q" quit) ("Ctrl-c" quit)))
+    (file function (
+        ("j" scroll-down) ("Down" scroll-down) ("k" scroll-up) ("Up" scroll-up)
+        ("g" scroll-top)  ("G" scroll-bottom)
+        ("n" toggle-line-numbers sublayout-content)
+        ("Enter" open sublayout-content)
+        ("Enter" set-sublayout-content sublayout-exec)
+        ("Ctrl-c" kill-process sublayout-exec)
+        ("," cycle-function-panel) ("Esc" hide-function-panel) ("q" hide-function-panel)))
+    (select #f (
+        ("Enter" confirm) ("Esc" cancel)
+        ("Ctrl-n" cursor-down) ("Down" cursor-down) ("Ctrl-p" cursor-up) ("Up" cursor-up)
+        ("w" cursor-up    select-phase-navigate) ("s" cursor-down   select-phase-navigate)
+        ("a" cursor-left  select-phase-navigate) ("d" cursor-right  select-phase-navigate)
+        ("W" cursor-top   select-phase-navigate) ("S" cursor-bottom select-phase-navigate)
+        ("v" cycle-list-layout select-phase-navigate)
+        ("Space" toggle-select select-phase-navigate) ("q" cancel select-phase-navigate)))
+    (policy #f (
+        ("y" confirm) ("Enter" confirm) ("n" cancel) ("Esc" cancel)))))

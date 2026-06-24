@@ -1,0 +1,9 @@
+[package]
+name = "wasdf-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wasdf_sdk"
+path = "src/lib.rs"

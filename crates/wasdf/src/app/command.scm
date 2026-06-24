@@ -1,0 +1,13 @@
+(quote (
+    (refresh         "reload the directory"      refresh)
+    (toggle-dotfiles "show/hide hidden files"    toggle-dotfiles)
+    (select-all      "select all entries"        select-all)
+    (clear-selection "clear the selection"       clear-selection)
+    (copy            "copy selection/cursor"     start-copy)
+    (move            "move selection/cursor"     start-move)
+    (rename          "rename the cursor entry"   start-rename)
+    (delete          "delete selection/cursor"   delete-selected)
+    (edit            "edit in $EDITOR"           start-edit)
+    (mkdir           "make a directory"          (push-path-input mkdir))
+    (touch           "create an empty file"      (push-path-input touch))
+    (quit            "quit wasdf"                quit)))

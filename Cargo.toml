@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/wasdf", "crates/wasdf-sdk", "crates/wasdf-example-ext"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache"
+
+[workspace.dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+fuzzy-matcher = "0.3"
+
+# The resident Scheme REPL compiles its source at runtime by running stak's
+# Scheme-implemented compiler on the stak VM. That interpreter is far too slow
+# unoptimized, so optimize the hot stak crates even in debug builds (wasdf
+# itself stays unoptimized and debuggable).
+[profile.dev.package.stak-vm]
+opt-level = 3
+[profile.dev.package.stak-r7rs]
+opt-level = 3
+[profile.dev.package.stak-dynamic]
+opt-level = 3
+[profile.dev.package.stak-compiler]
+opt-level = 3
