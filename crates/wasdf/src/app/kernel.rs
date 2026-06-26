@@ -70,11 +70,10 @@ impl App {
     pub fn boot(cwd: std::path::PathBuf) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<AppEvent>();
 
-        // Spawn the resident Scheme REPL session first (pillar #3). Wait briefly
-        // for it to be ready: on a warm bytecode cache it is ready in
-        // milliseconds and parses the embedded config; on a cold cache (first
-        // ever launch, multi-minute compile) we fall back to native defaults so
-        // boot never freezes — the session warms in the background and caches.
+        // Spawn the resident Scheme session first (pillar #3). Wait briefly for
+        // it to be ready: the steel engine loads its stdlib on the dedicated
+        // thread and signals readiness. If it is not ready in time, fall back to
+        // native defaults so boot never freezes.
         let scheme = crate::script::SchemeSession::spawn();
         let scheme_ready = scheme.wait_ready(Duration::from_secs(3));
 
@@ -535,8 +534,8 @@ fn scheme_keymaps(session: &crate::script::SchemeSession) -> Vec<Binding> {
 }
 
 /// Evaluate an extension's declarative Scheme source into Extension-layer keymap
-/// bindings. Uses the resident REPL when ready (Role 1: the session is the
-/// config parser); on a cold cache it parses the quoted literal directly so the
+/// bindings. Uses the resident Scheme session when ready (Role 1: the session is
+/// the config parser); if not yet ready, parses the quoted literal directly so
 /// bindings still register. The source is `(quote ((mode panel (binding…)) …))`.
 fn extension_scheme_keymaps(
     session: &crate::script::SchemeSession,
@@ -956,7 +955,7 @@ mod tests {
         let mut app = App::boot(dir);
         app.scheme.wait_ready(Duration::from_secs(600));
         app.pump_one(); // initial ReadDir
-        // Issue an EvalScheme plan; the resident REPL computes it and the
+        // Issue an EvalScheme plan; the resident Scheme session computes it and the
         // result returns as an AsyncResult the reducer turns into a notice.
         let generation = app.state.mode_generation();
         let cwd = app.cwd();

@@ -579,4 +579,4 @@ before layer priority, so a User binding overrides a Core one only when its
 panel scope is at least as specific.
 
 Conditional bindings use `:when` clauses, evaluated in three classes without
-any REPL round trip on the input path — see [SCHEME.md](SCHEME.md).
+any Scheme session round trip on the input path — see [SCHEME.md](SCHEME.md).

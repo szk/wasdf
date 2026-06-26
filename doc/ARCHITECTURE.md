@@ -19,7 +19,7 @@ are no per-service plugin traits.
 
 | Kind | What it is | Examples |
 |------|-----------|----------|
-| Kernel service | A concrete struct inside the kernel. One implementation each, configured by data; no registration machinery | KeymapRegistry, CommandRegistry, ResolverChain, the Scheme REPL session |
+| Kernel service | A concrete struct inside the kernel. One implementation each, configured by data; no registration machinery | KeymapRegistry, CommandRegistry, ResolverChain, the Scheme session |
 | Extension | Implements the single Extension trait. Bundled (statically linked) or optional (dynamically loaded) | PreviewExtension, ArchiveExtension (bundled); third-party extensions (optional) |
 
 The only service trait is MatcherBackend (fuzzy ranking; one shipped
@@ -110,7 +110,7 @@ it. The round trip is fixed: Intent → Plan → kernel task → AsyncResult →
 | Work | Mode | Reason |
 |------|------|--------|
 | Reducer, keymap resolution, mode transitions, extension `handle_intent`, content decode + render hook | sync | immediate response; purity (decode runs on the main thread — see Read below) |
-| Directory reads, content byte reads, matcher ranking, external commands, REPL queries | async | I/O or heavy compute |
+| Directory reads, content byte reads, matcher ranking, external commands, Scheme session queries | async | I/O or heavy compute |
 
 ### Plans — a Closed Set
 
@@ -126,7 +126,7 @@ extension's function-panel content is loaded by the generic Read plan.
 | ResolveAndRun | RunResolver (copy/move/rename/mkdir/touch/delete), Open, extension plans | resolver | Background: detached process, no output capture, completion notification only | OpDone |
 | Execute | Execute | execute | Captured: stdout streamed line-by-line into the Exec frame, stderr appended at exit | ExecOutput |
 | Suspend | Edit (the user's editor) | execute | Suspended: leave the alternate screen, restore the cooked terminal, pause the event loop, run the child in the foreground; on exit restore the TUI and issue Refresh | OpDone |
-| EvalScheme | dynamic arbitrary `:when` conditions, expression-valued intent arguments | scheme | async query to the resident REPL | SchemeValue |
+| EvalScheme | dynamic arbitrary `:when` conditions, expression-valued intent arguments | scheme | async query to the resident Scheme session | SchemeValue |
 
 Background, Captured, and Suspended are the only three external-process
 execution forms. Only Execute shows output in the function panel; resolver
@@ -284,7 +284,7 @@ shared types); implementations live inside the directory.
 | services | resolver and matcher type surfaces | CommandRegistry; confirmation spec; ResolverChain; MatcherBackend with SkimMatcher |
 | ui | re-exports | UiManager (render caches only); the frame compositor (`render`) and its top / middle / bottom bands; the top panel (nav and prop children); the main area (file list, select input + candidates, the function panel with its command summary); the generic content blitter (`content` — turns `PanelContent` + search/scroll into styled lines, shared by all content extensions); panel chrome (connected borders, titles, scrollbars); the help row |
 | extension | the bundled-extension list — the only place bundled extensions are named | the Extension trait (`provides_function_content`, `accept_content`, `render_function`, `scheme_source`, `keymaps`, `handle_intent`) with `FunctionRenderCtx`/`FunctionDraw`; ExtensionRegistry (loading rules, disable, the active content provider); the dynamic loader; the preview extension (decode / highlight / search submodules) and archive |
-| script | re-exports | The resident stak REPL session (runtime-compiled bootstrap, disk bytecode cache); the single string codec and a small s-expression reader (the only place intent/key/mode/datum strings are parsed or formatted); the config decoders (keymaps, commands, resolvers ← Scheme); condition AST and native predicates; KeymapRegistry |
+| script | re-exports | The resident steel (`steel-core`) session (dedicated thread + mpsc channel; Engine is `!Send`/`!Sync`); the single string codec and a small s-expression reader (the only place intent/key/mode/datum strings are parsed or formatted); the config decoders (keymaps, commands, resolvers ← Scheme); condition AST and native predicates; KeymapRegistry |
 | exec, fs, runtime | — | the external-command executor (Background/Captured forms — the resolver builds the argv, `exec` runs it) plus option extraction from a command's `--help`/`man`; async directory reading and the recursive walk; TaskManager (worker threads, one live task per unique purpose, streaming Execute, the generic Read) |
 
 A separate wasdf-sdk crate holds the ABI-stable types shared with dynamically
@@ -294,12 +294,11 @@ detection, MIME detection.
 ## Startup Sequence
 
 1. Kernel boot.
-2. Spawn the resident Scheme REPL session and wait briefly for it to be ready
-   (a warm bytecode cache is ready in milliseconds; a cold cache compiles in the
-   background). Evaluate the embedded Scheme defaults (keymaps, commands,
-   resolvers) through the session and decode them into the registries via the
-   codec; if the session is not ready or evaluation fails, fall back to the
-   native embedded defaults ([SCHEME.md](SCHEME.md)).
+2. Spawn the resident Scheme session (steel engine on a dedicated thread) and
+   wait briefly for it to be ready (stdlib load). Evaluate the embedded Scheme
+   defaults (keymaps, commands, resolvers) through the session and decode them
+   into the registries via the codec; if the session is not ready or evaluation
+   fails, fall back to the native embedded defaults ([SCHEME.md](SCHEME.md)).
 3. Register bundled extensions.
 4. Load optional extensions per the loading rules in [EXTENSION.md](EXTENSION.md).
 5. Load user configuration (User layer).

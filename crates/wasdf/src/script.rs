@@ -1,8 +1,6 @@
-//! The script layer. In the full design, an embedded R7RS Scheme session (stak)
-//! parses configuration, glues extensions, and declares layouts. This MVP
-//! provides the same registries and the native `:when` condition evaluator and
-//! codec, with the embedded defaults declared natively in place of the resident
-//! REPL. The codec remains the single owner of key/intent/mode string forms.
+//! The script layer. An embedded Scheme session (steel-core, dedicated thread)
+//! parses configuration, glues extensions, and evaluates dynamic conditions.
+//! The codec is the single owner of key/intent/mode/datum string forms.
 
 pub mod codec;
 pub mod condition;

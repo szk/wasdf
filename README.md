@@ -25,11 +25,11 @@ Runs on **macOS**, **Linux**, and **Windows via WSL2**.
 | Keys | Action |
 |------|--------|
 | `w` `a` `s` `d` | move the cursor up / left / down / right |
-| `h` `j` `k` `l` | control the preview |
+| `h` `j` `k` `l` | control the function pane |
 | `Enter` | enter directory / open file · `Space` toggle select |
 | `f` · `x` | file search · command palette |
 | `c` `m` `R` `e` | copy · move · rename · edit |
-| `v` · `,` | cycle list layout (rows/columns/grid) · cycle preview pane |
+| `v` · `,` | cycle list layout (rows/columns/grid) · cycle the ratio of function pane |
 | `q` | quit |
 
 `Enter`/`y` mean OK, `Esc`/`n` mean cancel. Full keymap: [doc/UI.md](doc/UI.md).
@@ -38,7 +38,7 @@ Runs on **macOS**, **Linux**, and **Windows via WSL2**.
 
 Three pillars: **spec-driven layout & keys** ([doc/UI.md](doc/UI.md)); **everything
 is an extension**, yet it boots usable with zero ([doc/EXTENSION.md](doc/EXTENSION.md));
-a **resident R7RS Scheme REPL** ([stak](https://github.com/raviqqe/stak)) as the
+a **resident Scheme session** ([steel-core](https://github.com/mattwparas/steel)) as the
 config parser, extension glue, and layouter ([doc/SCHEME.md](doc/SCHEME.md)).
 
 One pipeline drives it all — `key → Intent → plan → kernel async → AsyncResult →
@@ -52,8 +52,8 @@ rustup update
 cargo run -p wasdf
 ```
 
-Rust edition 2024. The Scheme REPL compiles its bootstrap at first launch and
-caches the bytecode; the first cold start is slower.
+Rust edition 2024. The Scheme session (steel-core) loads its stdlib at startup
+on a dedicated thread; the first launch waits briefly then continues.
 
 **Platforms:** macOS, Linux, and Windows under **WSL2** (run it inside the WSL2
 Linux environment, not native Windows). Optional dynamic extensions load as

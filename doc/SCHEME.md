@@ -1,24 +1,28 @@
 # Scheme Configuration
 
-wasdf uses R7RS Scheme, evaluated by the stak interpreter, in three roles:
-the parser of all configuration, the glue declaring each extension's keys,
-commands, and conditions, and the layouter. stak runs as a resident REPL
-session — a dedicated OS thread owns the VM running a read-eval-print loop, and
-the kernel talks to it over a byte pipe. It is not a one-shot compile-and-exit
-VM.
+wasdf uses a Scheme-like language, evaluated by the steel engine
+(`steel-core`), in three roles: the parser of all configuration, the glue
+declaring each extension's keys, commands, and conditions, and the layouter.
+steel runs as a resident session — a dedicated OS thread owns the `Engine`
+(which is `!Send`/`!Sync`), and the kernel communicates with it via an mpsc
+channel. Evaluation is synchronous from the caller's perspective (the call
+blocks on the reply channel, with a timeout).
 
-The REPL bootstrap is kept as Scheme source and compiled to bytecode at
-runtime (no build-time/embedded bytecode). Because stak's compiler is itself a
-Scheme program on the VM, that compile is costly, so the bytecode is cached on
-disk under the user configuration directory, keyed by a hash of the source, and
-reused — the source remains authoritative. The first launch (cold cache)
-compiles in the background and falls back to the native embedded defaults until
-the session is ready; subsequent launches load the cache and boot instantly.
+The engine stdlib loads at session startup on the dedicated thread. Boot is
+non-blocking: the thread signals readiness via a Condvar after stdlib load
+completes, and the kernel waits briefly before falling back to native embedded
+defaults. There is no bytecode cache and no respawn — if the engine thread
+exits, the session is silently disabled for the remainder of the process.
+
+The embedded `.scm` configuration files are pure `(quote (...))` data
+literals; they use no R7RS-specific features and evaluate on steel without
+modification. Dynamic evaluation (`Plan::EvalScheme`) uses steel's built-in
+procedures.
 
 All encoding and decoding of intents, keys, and modes goes through the single
 codec module in script (including a small s-expression reader for the session's
 output); no other module parses or formats these strings. Any evaluation or
-parse failure — and a not-yet-ready cold-cache session — falls back to the
+parse failure — and a not-yet-ready session — falls back to the
 native embedded defaults instead of dropping registrations.
 
 ## Role 1: Configuration Parser
@@ -34,7 +38,7 @@ native embedded defaults instead of dropping registrations.
   forms load at the User layer ([UI.md](UI.md)). The config directory is
   `$WASDF_CONFIG_DIR`, else `$XDG_CONFIG_HOME/wasdf`, else `~/.config/wasdf`.
 
-Configuration forms (all plain R7RS s-expressions):
+Configuration forms (all plain Scheme s-expressions):
 
 | Form | Declares | Elements |
 |------|----------|----------|
@@ -58,7 +62,7 @@ conditions, and its extension intent expressions. Rust stays the how
 (rendering, intent handling, plan construction); Scheme is the what and when.
 
 When conditions fall into three evaluation classes. The input path never
-blocks on the REPL.
+blocks on the Scheme session.
 
 | Class | Examples | Evaluated |
 |-------|----------|-----------|
@@ -89,14 +93,12 @@ same native condition evaluator as keymaps; rendering makes no Scheme round
 trip. See [UI.md](UI.md) for the two core built-in layouts and the panel
 catalog.
 
-## Respawn Rules
+## Session Lifetime
 
-- If the VM thread panics, the session is respawned and the dynamic
-  arbitrary-expression cache is discarded.
-- Re-initialization order: embedded defaults, then user configuration, then
-  each extension's Scheme source.
-- Key input during a respawn is processed normally; arbitrary-expression
-  conditions count as false until re-evaluated.
+The engine thread runs for the life of the process. If it exits (engine
+panic), the session becomes permanently unavailable — all subsequent `eval`
+calls return a "thread gone" error and the fallback native defaults remain
+active. There is no respawn.
 
 ## Error Handling
 
@@ -105,7 +107,7 @@ catalog.
 | Parse error | surfaced as a notification; the script is skipped |
 | Evaluation error | surfaced as a notification; the expression is skipped |
 | Protocol mismatch | warning; fall back to embedded defaults |
-| Session death | respawn per the rules above |
+| Session death | session permanently disabled; native defaults remain active |
 
 MVP limits: no macro definition, limited function definition, conditionals
 only via when clauses, and a flat option store without a nested configuration

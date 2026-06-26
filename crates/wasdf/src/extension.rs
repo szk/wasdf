@@ -69,7 +69,7 @@ pub trait Extension: Send {
         Vec::new()
     }
 
-    /// The extension's declarative Scheme source, evaluated in the resident REPL
+    /// The extension's declarative Scheme source, evaluated in the resident Scheme session
     /// at registration. The `what/when` of the extension — keymaps and the like
     /// declared as data — as opposed to `keymaps()`, the native `how`. Returns a
     /// quoted keymap-group form `(quote ((mode panel (binding…)) …))`, merged
