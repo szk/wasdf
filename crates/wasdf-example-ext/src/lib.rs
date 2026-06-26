@@ -2,7 +2,7 @@
 //! behavior** half. Its declarations (id, commands, keymaps, resolvers) live in
 //! the sibling `example.scm` manifest, which the kernel discovers and reads; this
 //! library only exports the C ABI behavior the manifest's intents route to: an
-//! API-version query, an intent handler, and (ABI v3+) a cursor-changed
+//! API-version query, an intent handler, and a cursor-changed
 //! subscriber that pushes content into the function panel as the cursor moves.
 //!
 //! Build it as a dynamic library and drop it — together with `example.scm` —
@@ -12,6 +12,16 @@
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+
+/// The `greet` reply — static Scheme data kept in `greet.scm` and included here,
+/// so the function-panel content lives as `.scm` rather than a Rust string
+/// literal (mirroring the kernel's `*_SCHEME = include_str!(…)` idiom).
+const GREET_SCHEME: &str = include_str!("greet.scm");
+/// The `step` reply template (`step.scm`); `{n}` is filled with the step count.
+const STEP_SCHEME: &str = include_str!("step.scm");
+/// The `cursor-changed` reply template (`cursor.scm`); `{path}` is filled with
+/// the (already Scheme-escaped) cursor path.
+const CURSOR_SCHEME: &str = include_str!("cursor.scm");
 
 /// Report the ABI version this extension was built against.
 #[unsafe(no_mangle)]
@@ -31,7 +41,8 @@ thread_local! {
 /// Scheme datum), and returns follow-up intents as a Scheme list. `greet`
 /// renders styled text into the function panel via `show-function-content`
 /// (the first line carries a colored 5-byte run, "GREET"); the kernel stores and
-/// draws it generically with no kernel edits.
+/// draws it generically with no kernel edits. The Scheme replies are externalized
+/// to sibling `.scm` files (`GREET_SCHEME` / `STEP_SCHEME`).
 #[unsafe(no_mangle)]
 pub extern "C" fn wasdf_handle_intent(intent: *const c_char, _data: *const c_char) -> *const c_char {
     let name = if intent.is_null() {
@@ -40,14 +51,7 @@ pub extern "C" fn wasdf_handle_intent(intent: *const c_char, _data: *const c_cha
         unsafe { CStr::from_ptr(intent) }.to_str().unwrap_or("")
     };
     let response: String = match name {
-        // The GREET run carries both fg and a bg (the 7-element run form), so the
-        // extension owns its colors fully across the ABI.
-        "greet" => "((show-function-content \"example\" (lines \
-            (\"GREET\" (5 80 250 123 40 42 54)) \
-            (\"Rendered by wasdf-example-ext in the function panel.\") \
-            (\"This content crossed the C ABI as Scheme data.\") \
-            (\"Scroll with j / k. Search with /. Press t to step.\"))))"
-            .to_string(),
+        "greet" => GREET_SCHEME.to_string(),
         // Interactive: advance the extension's own state and reflect it both in
         // the kernel view state (update-function-view) and the rendered content.
         "step" => {
@@ -55,12 +59,7 @@ pub extern "C" fn wasdf_handle_intent(intent: *const c_char, _data: *const c_cha
                 *c.borrow_mut() += 1;
                 *c.borrow()
             });
-            format!(
-                "((update-function-view {n}) \
-                 (show-function-content \"example\" (lines \
-                    (\"step: {n}\") \
-                    (\"Press t again to advance; the view state is stored in the kernel.\"))))"
-            )
+            STEP_SCHEME.replace("{n}", &n.to_string())
         }
         _ => "()".to_string(),
     };
@@ -75,7 +74,7 @@ thread_local! {
     static CURSOR_RESULT: RefCell<CString> = RefCell::new(CString::new("()").unwrap());
 }
 
-/// React to the kernel's **cursor-changed** event (ABI v3). The kernel passes the
+/// React to the kernel's **cursor-changed** event. The kernel passes the
 /// path now under the cursor; we reply with `show-function-content` echoing it, to
 /// demonstrate that a dynamically-loaded extension can subscribe to cursor
 /// movement with no kernel edits. (While this extension is loaded it takes over
@@ -89,13 +88,7 @@ pub extern "C" fn wasdf_on_cursor_changed(path: *const c_char) -> *const c_char 
     };
     // Escape embedded double-quotes so the reply stays a valid Scheme string.
     let safe = path.replace('\\', "\\\\").replace('"', "\\\"");
-    let response = format!(
-        "((show-function-content \"example\" (lines \
-            (\"cursor-changed →\" (13 80 250 123)) \
-            (\"{safe}\") \
-            (\"This line was pushed by wasdf-example-ext reacting to the\") \
-            (\"cursor-changed event over the C ABI (no kernel edits).\"))))"
-    );
+    let response = CURSOR_SCHEME.replace("{path}", &safe);
     CURSOR_RESULT.with(|r| {
         *r.borrow_mut() = CString::new(response).unwrap_or_default();
         r.borrow().as_ptr()

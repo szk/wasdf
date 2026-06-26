@@ -332,6 +332,16 @@ impl AppState {
         generation
     }
 
+    /// Collapse the mode stack back to the base File mode and drop any Select
+    /// state. Used after a suspended child (the editor) returns: the edit is
+    /// over, so we land on the file list regardless of what ran — and any stray
+    /// bytes the child left in stdin can't strand us in a half-opened mode.
+    pub fn reset_to_file(&mut self) {
+        self.modes.truncate(1);
+        self.select = None;
+        self.focused_panel = "file".into();
+    }
+
     /// Clamp the cursor into range after a listing change.
     pub fn clamp_cursor(&mut self) {
         if self.entries.is_empty() {

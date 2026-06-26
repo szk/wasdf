@@ -319,8 +319,8 @@ mod tests {
     }
 
     /// End-to-end smoke test: load the *real* compiled `wasdf-example-ext`
-    /// dynamic library through the actual loader (dlopen → ABI v2 check → glue
-    /// parse → symbol bind), then exercise the full bridge: the `g` key resolves
+    /// dynamic library through the actual loader (dlopen → ABI version check →
+    /// glue parse → symbol bind), then exercise the full bridge: the `g` key resolves
     /// to the extension's intent, and a real cross-library `handle_intent` call
     /// returns the decoded follow-up. Self-skips when the artifact is not built
     /// (so a plain `cargo test` stays green); build it first with
@@ -396,7 +396,7 @@ mod tests {
             other => panic!("step did not update the view + content: {other:?}"),
         }
 
-        // ABI v3: the cursor-changed event crosses the boundary. With a cursor
+        // The cursor-changed event crosses the boundary. With a cursor
         // entry in File mode, on_cursor_changed calls wasdf_on_cursor_changed and
         // decodes the pushed content reply.
         let mut cursor_state = AppState::new(dir.clone());

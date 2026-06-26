@@ -69,7 +69,7 @@ datums, no Rust types cross the boundary):
 |--------|-----------|------|
 | `wasdf_abi_version` | `() -> u32` | Must equal `wasdf_sdk::API_VERSION` exactly, else the library is skipped |
 | `wasdf_handle_intent` | `(intent, data) -> *const c_char` | Optional. Receives the intent id and its ExtensionValue payload (as a Scheme datum) and returns follow-up intents as a Scheme list, decoded back into core intents |
-| `wasdf_on_cursor_changed` | `(path) -> *const c_char` | Optional (v3). Subscribes to the cursor-changed event: receives the cursor path and returns follow-up intents (same datum form as `wasdf_handle_intent`, e.g. `show-function-content`) — reacts to cursor movement with no kernel edits |
+| `wasdf_on_cursor_changed` | `(path) -> *const c_char` | Optional. Subscribes to the cursor-changed event: receives the cursor path and returns follow-up intents (same datum form as `wasdf_handle_intent`, e.g. `show-function-content`) — reacts to cursor movement with no kernel edits |
 
 The bridge carries commands, resolver entries, **keymaps** (entry bindings into
 core modes, whose intents are typically `(ext …)` forms; `:when` is limited to
@@ -83,10 +83,10 @@ text; images are bundled-only — raw RGB does not cross the ABI), and
 `(update-function-view VALUE)`, which stores opaque per-extension view state.
 A dynamic extension can *write* that view state but does not yet *receive* it as
 input (the bridge passes only the intent id and its data). Custom modes and
-panels are not carried across the ABI. `API_VERSION` is 4 (`keymaps` landed in
-v2; the cursor-changed subscriber `wasdf_on_cursor_changed` in v3; in v4 the glue
-moved out of the library into the `.scm` manifest and `wasdf_glue` was removed,
-so the library exports only `wasdf_abi_version` plus the optional handlers).
+panels are not carried across the ABI. `API_VERSION` is 0 (the initial prototype
+ABI): the glue lives in the `.scm` manifest, and the library exports only
+`wasdf_abi_version` plus the optional `wasdf_handle_intent` /
+`wasdf_on_cursor_changed` handlers the manifest's intents route to.
 
 Dynamic content reaches the panel via this **push** path (`show-function-content`
 from `handle_intent` or `on_cursor_changed`). The **pull** render hook (`render_function`, below) is a

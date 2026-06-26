@@ -32,8 +32,37 @@ pub fn run_suspended(argv: &[String], cwd: &std::path::Path) -> io::Result<Defau
             .map(|_| ())
     };
     let term = init();
+    // Re-entering the alternate screen makes the terminal answer the color /
+    // device-attributes queries it was sent (by the editor, and by our own
+    // re-init). Those replies arrive a beat *after* we are back, and if read as
+    // keys they open spurious modes: the trailing `c` of a DA reply (`ESC[?…c`)
+    // starts copy, and the OSC color bytes (`]10;rgb:…`) then fill its argument.
+    // Drain them before the input thread resumes.
+    drain_pending_input();
     status?;
     Ok(term)
+}
+
+/// Swallow the terminal-reply bytes a suspended child leaves behind. The replies
+/// can land slightly after we re-enter the TUI, so we drain through crossterm —
+/// its own fd and escape-sequence parser, so partial sequences are consumed
+/// whole — for a short fixed window rather than stopping at the first quiet
+/// moment. Safe because the input thread is paused for the entire suspended
+/// span, so no genuine keystroke is discarded here.
+fn drain_pending_input() {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        match crossterm::event::poll(remaining) {
+            Ok(true) => {
+                if crossterm::event::read().is_err() {
+                    break;
+                }
+            }
+            // Timed out with the window elapsed, or a poll error — either way stop.
+            _ => break,
+        }
+    }
 }
 
 /// Convert a crossterm key event into a core Key. Returns None for events that

@@ -6,6 +6,8 @@ members = ["crates/wasdf", "crates/wasdf-sdk", "crates/wasdf-example-ext"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache"
+rust-version = "1.95"
+
 
 [workspace.dependencies]
 ratatui = "0.30"

@@ -280,8 +280,10 @@ impl App {
         self.state.cwd.clone()
     }
 
-    /// After a suspend returns, refresh the listing.
+    /// After a suspend returns, drop back to the file list (the edit is over,
+    /// regardless of outcome) and refresh the listing.
     pub fn after_suspend(&mut self) {
+        self.state.reset_to_file();
         self.dispatch(Intent::Refresh);
     }
 
