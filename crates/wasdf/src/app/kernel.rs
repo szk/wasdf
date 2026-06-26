@@ -281,7 +281,9 @@ impl App {
     }
 
     /// After a suspend returns, drop back to the file list (the edit is over,
-    /// regardless of outcome) and refresh the listing.
+    /// regardless of outcome) and refresh. Refresh re-reads both the directory
+    /// listing and the visible function-panel content, so an edit made in the
+    /// suspended child (the editor) shows on return without moving the cursor.
     pub fn after_suspend(&mut self) {
         self.state.reset_to_file();
         self.dispatch(Intent::Refresh);

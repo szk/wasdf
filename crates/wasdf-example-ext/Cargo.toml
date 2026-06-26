@@ -3,6 +3,8 @@ name = "wasdf-example-ext"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# A sample extension shipped as source for reference; not a crates.io artifact.
+publish = false
 
 [lib]
 name = "wasdf_example_ext"

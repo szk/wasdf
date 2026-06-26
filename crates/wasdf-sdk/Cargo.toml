@@ -3,6 +3,12 @@ name = "wasdf-sdk"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "SDK for building wasdf file-manager extensions (the C ABI and shared types)."
+keywords = ["wasdf", "extension", "sdk", "tui", "plugin"]
+categories = ["command-line-utilities", "api-bindings"]
 
 [lib]
 name = "wasdf_sdk"

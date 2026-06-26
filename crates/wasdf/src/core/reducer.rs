@@ -404,7 +404,7 @@ pub fn apply_intent(state: &mut AppState, intent: Intent, ctx: &dyn CommandLooku
             Effects::none()
         }
 
-        Intent::Refresh => read_dir_effect(state),
+        Intent::Refresh => refresh(state),
         Intent::Quit => {
             state.quit = true;
             Effects::none()
@@ -882,6 +882,29 @@ fn read_dir_effect(state: &AppState) -> Effects {
     })
 }
 
+/// Refresh from disk: re-read the directory listing, and — when the function
+/// panel is showing content — reload that content too. The content reload goes
+/// out as a forced `LoadContent` at offset 0, which re-reads the file via the
+/// kernel directly and so bypasses a content owner's same-path load cache (the
+/// previewer skips a re-read for an already-loaded path). This is what makes an
+/// edit performed in a suspended editor appear on return without first moving
+/// the cursor off the file and back. Generic: any content owner, the cursor path.
+fn refresh(state: &AppState) -> Effects {
+    let mut fx = read_dir_effect(state);
+    if state.function.visible && state.function.sublayout == SubLayout::Content {
+        if let (Some(owner), Some(entry)) =
+            (state.function.content_owner.clone(), state.current_entry())
+        {
+            fx.intents.push(Intent::LoadContent {
+                owner,
+                path: entry.path.clone(),
+                offset: 0,
+            });
+        }
+    }
+    fx
+}
+
 fn resolve_plan(request: ResolverRequest) -> Effects {
     Effects::plan(Plan::ResolveAndRun { request })
 }
@@ -1288,6 +1311,36 @@ mod tests {
         apply_intent(&mut s, Intent::ResetContentView, &NoCommands);
         assert_eq!((s.function.scroll, s.function.hscroll), (0, 0));
         assert!(s.function.search.matches.is_empty());
+    }
+
+    #[test]
+    fn refresh_reloads_visible_function_content() {
+        // Refresh re-reads the directory AND, when the function panel shows
+        // content, forces a LoadContent at offset 0 for the cursor path — so an
+        // edit made in a suspended editor is re-read on return (the previewer
+        // would otherwise skip a same-path re-read). With the panel hidden, only
+        // the directory is re-read.
+        let mut s = AppState::new(std::path::PathBuf::from("/d"));
+        s.entries = file_entries(2);
+        s.cursor = 1;
+        s.function.visible = true;
+        s.function.sublayout = SubLayout::Content;
+        s.function.content_owner = Some("preview".into());
+        let fx = apply_intent(&mut s, Intent::Refresh, &NoCommands);
+        assert!(matches!(fx.plans.as_slice(), [Plan::ReadDir { .. }]), "re-reads the directory");
+        match fx.intents.as_slice() {
+            [Intent::LoadContent { owner, path, offset }] => {
+                assert_eq!(owner, "preview");
+                assert_eq!(path, &s.entries[1].path);
+                assert_eq!(*offset, 0, "forced reload from the start bypasses the owner cache");
+            }
+            other => panic!("expected a forced LoadContent, got {other:?}"),
+        }
+
+        // Hidden panel: no content reload.
+        s.function.visible = false;
+        let fx = apply_intent(&mut s, Intent::Refresh, &NoCommands);
+        assert!(fx.intents.is_empty(), "no content reload when the panel is hidden");
     }
 
     #[test]

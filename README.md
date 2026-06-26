@@ -25,7 +25,7 @@ Runs on **macOS**, **Linux**, and **Windows via WSL2**.
 | Keys | Action |
 |------|--------|
 | `w` `a` `s` `d` | move the cursor up / left / down / right |
-| `h` `j` `k` `l` | scroll the preview |
+| `h` `j` `k` `l` | control the preview |
 | `Enter` | enter directory / open file · `Space` toggle select |
 | `f` · `x` | file search · command palette |
 | `c` `m` `R` `e` | copy · move · rename · edit |

@@ -3,13 +3,20 @@ name = "wasdf"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "A keyboard-only TUI file manager built around WASD/hjkl navigation for mini-keyboards."
+readme = "../../README.md"
+keywords = ["tui", "file-manager", "ratatui", "terminal", "wasd"]
+categories = ["command-line-utilities", "filesystem"]
 
 [[bin]]
 name = "wasdf"
 path = "src/main.rs"
 
 [dependencies]
-wasdf-sdk = { path = "../wasdf-sdk" }
+wasdf-sdk = { path = "../wasdf-sdk", version = "0.1.0" }
 ratatui = { workspace = true, features = ["crossterm"] }
 crossterm = { workspace = true }
 fuzzy-matcher = { workspace = true }
