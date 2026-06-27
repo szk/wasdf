@@ -10,4 +10,8 @@
     (edit            "edit in $EDITOR"           start-edit)
     (mkdir           "make a directory"          (push-path-input mkdir))
     (touch           "create an empty file"      (push-path-input touch))
+    (home            "go to the VFS root"        (navigate-to "@"))
+    (bookmarks       "open bookmarks"            (navigate-to "@/bookmarks"))
+    (settings        "open settings"             (navigate-to "@/settings"))
+    (add-bookmark    "bookmark current path"     (ext bookmarks add))
     (quit            "quit wasdf"                quit)))

@@ -4,44 +4,24 @@
 //! contains no intent-specific branches beyond the two structural gates the
 //! spec names (extension resolver key, destructive → Policy).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use crate::core::{
     self, AppEvent, AppState, AsyncResult, AsyncStatus, ExtensionValue, Intent, Key, KeyCode, Mode,
-    Payload, Plan, Purpose, ResolverRequest, KEY_RESOLVER,
+    OptionDef, OptionStore, Payload, Plan, Purpose, ResolverRequest, KEY_RESOLVER,
 };
-use crate::extension::{self, ExtensionRegistry};
+use crate::extension::{self, Extension, ExtensionRegistry};
 use crate::runtime::TaskManager;
 use crate::script::condition::{Cond, Conditions};
 use crate::script::keymap::{Binding, KeymapRegistry, Layer};
 use crate::services::command::CommandDef;
 use crate::services::resolver::ResolverEntry;
-use crate::services::{CommandRegistry, ResolverChain, SkimMatcher};
+use crate::services::{CommandRegistry, MatcherConfig, ResolverChain, SkimMatcher};
 use crate::ui::UiManager;
 
 const REDISPATCH_CAP: u32 = 32;
-
-/// The flat option store (the Scheme `set-option` analogue). Behavior-affecting
-/// flags read by the kernel's hooks. Unknown keys would warn at parse time.
-#[derive(Debug, Clone)]
-pub struct Options {
-    /// ui.content.auto-update — refresh the function-panel content as the file
-    /// cursor moves.
-    pub content_auto_update: bool,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        // Default off, per UI.md. Overridable by env until config parsing lands.
-        Options {
-            content_auto_update: std::env::var("WASDF_CONTENT_AUTO")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
-        }
-    }
-}
 
 pub struct App {
     pub state: AppState,
@@ -53,7 +33,9 @@ pub struct App {
     pub tasks: TaskManager,
     pub ui: UiManager,
     pub scheme: Arc<crate::script::SchemeSession>,
-    pub options: Options,
+    /// The unified option store: all options (core + extensions) keyed by name.
+    pub store: Arc<OptionStore>,
+    pub vfs: Arc<crate::vfs::Vfs>,
     pub rx: Receiver<AppEvent>,
     pub tx: Sender<AppEvent>,
     pending_suspend: Option<Vec<String>>,
@@ -102,25 +84,72 @@ impl App {
             crate::services::resolver::defaults()
         });
 
+        // Build the VFS: embedded defaults (filesystem + bookmarks), then extensions.
+        // The settings provider is contributed by the settings extension below.
+        let (default_providers, bookmarks_state) = crate::vfs::defaults();
+        let mut vfs = crate::vfs::Vfs::default();
+        vfs.extend(default_providers);
+
+        // The bookmarks extension shares the Arc with the bookmarks provider.
+        let bookmarks_ext = extension::bookmarks::BookmarksExtension::new(bookmarks_state);
+
+        // ── OptionStore ────────────────────────────────────────────────────────
+        // Collect option defs from core + all extensions before registering, so
+        // the store is built once with all defs (first-wins on duplicate keys).
+        let bundled_exts = extension::bundled();
+        let optional_exts = load_optional_extensions();
+
+        let mut all_option_defs = scheme_core_option_defs(&scheme, scheme_ready);
+        for ext in &bundled_exts {
+            all_option_defs.extend(extension_option_defs(&scheme, scheme_ready, ext.as_ref()));
+        }
+        for ext in &optional_exts {
+            all_option_defs.extend(extension_option_defs(&scheme, scheme_ready, ext.as_ref()));
+        }
+        let store: Arc<OptionStore> = Arc::new(OptionStore::new(all_option_defs));
+
+        // Build the typed MatcherConfig from store defaults; SettingsExtension
+        // and TaskManager share the same Arc so live edits propagate without restart.
+        let matcher_cfg: Arc<Mutex<MatcherConfig>> = Arc::new(Mutex::new(MatcherConfig {
+            tail_bonus: store.get_i64("matcher.tail-bonus"),
+            depth_penalty: store.get_i64("matcher.depth-penalty"),
+            length_penalty: store.get_i64("matcher.length-penalty"),
+            exec_bonus: store.get_i64("matcher.exec-bonus"),
+            preferred_ext: store.get_list("matcher.preferred-ext"),
+            noise_ext: store.get_list("matcher.noise-ext"),
+            noise_dirs: store.get_list("matcher.noise-dirs"),
+        }));
+
+        let settings_ext = extension::settings::SettingsExtension::new(
+            store.clone(),
+            matcher_cfg.clone(),
+            config_dir().map(|d| d.join("config.scm")),
+        );
+
         // Register bundled extensions: keymaps, commands, resolver entries,
         // conditions. The only place bundled extensions are named is the facade.
         let mut extensions = ExtensionRegistry::new();
-        for ext in extension::bundled() {
+        for ext in bundled_exts {
             keymap.extend(ext.keymaps());
             keymap.extend(extension_scheme_keymaps(&scheme, scheme_ready, ext.as_ref()));
             commands.extend(ext.commands());
             resolver.extend(ext.resolver_entries());
+            vfs.extend(ext.vfs_providers());
             ext.register_conditions(&mut conditions);
             extensions.register(ext);
         }
+        // Bookmarks and settings registered separately (they need shared Arcs).
+        // Settings is registered before optional extensions so its ID wins any
+        // collision from an optional extension with the same name.
+        extensions.register(Box::new(bookmarks_ext));
+        vfs.extend(settings_ext.vfs_providers());
+        extensions.register(Box::new(settings_ext));
 
-        // Optional (dynamically loaded) extensions: bundled first, then optional
-        // in file-name order; an id collision disables the later one. Registered
-        // like bundled so their keymaps/commands/resolvers apply and extension
-        // intents route to their handle_intent.
+        // Optional (dynamically loaded) extensions: in file-name order; an id
+        // collision disables the later one.
         let mut ext_ids: std::collections::HashSet<String> =
             extensions.iter().map(|e| e.id().to_string()).collect();
-        for ext in load_optional_extensions() {
+        for ext in optional_exts {
             if !ext_ids.insert(ext.id().to_string()) {
                 eprintln!("optional extension id collides ({}); disabled", ext.id());
                 continue;
@@ -129,14 +158,25 @@ impl App {
             keymap.extend(extension_scheme_keymaps(&scheme, scheme_ready, ext.as_ref()));
             commands.extend(ext.commands());
             resolver.extend(ext.resolver_entries());
+            vfs.extend(ext.vfs_providers());
             ext.register_conditions(&mut conditions);
             extensions.register(ext);
         }
 
-        // User layer last: highest priority, with collision detection across
-        // all layers. Deleting the user file reproduces the embedded defaults.
+        // Give every extension the store so they can read their own options.
+        for ext in extensions.iter() {
+            ext.bind_store(&store);
+        }
+
+        // User layer last: apply to store (warns on invalid values for known keys);
+        // then project any matcher.* changes into the shared MatcherConfig.
         if scheme_ready {
-            keymap.extend(scheme_user_keymaps(&scheme));
+            let (user_binds, user_opts) = scheme_user_config(&scheme, &store);
+            keymap.extend(user_binds);
+            for (k, v) in &user_opts {
+                apply_option(&store, k, v);
+            }
+            project_matcher(&store, &matcher_cfg);
         }
 
         for w in keymap.warnings() {
@@ -144,9 +184,16 @@ impl App {
         }
 
         let resolver = Arc::new(resolver);
+        let vfs = Arc::new(vfs);
         let matcher: Arc<dyn crate::services::MatcherBackend> = Arc::new(SkimMatcher::default());
-        let tasks =
-            TaskManager::new(tx.clone(), resolver.clone(), matcher, Some(scheme.clone()));
+        let tasks = TaskManager::new(
+            tx.clone(),
+            resolver.clone(),
+            matcher,
+            Some(scheme.clone()),
+            vfs.clone(),
+            matcher_cfg.clone(),
+        );
 
         let state = AppState::new(cwd.clone());
         let ui = UiManager::new();
@@ -161,7 +208,8 @@ impl App {
             tasks,
             ui,
             scheme,
-            options: Options::default(),
+            store,
+            vfs,
             rx,
             tx,
             pending_suspend: None,
@@ -203,6 +251,14 @@ impl App {
         if result.purpose == Purpose::Content {
             if result.status == AsyncStatus::Ok {
                 if let Payload::Read { owner, path, result: read } = result.payload {
+                    // Drop a content read whose path is no longer under the cursor:
+                    // the user navigated away (e.g. into an empty directory) while
+                    // the read was in flight. Without this gate the late read would
+                    // re-populate the preview that the cursor-changed clear just
+                    // dropped, leaving the previous file's content on screen.
+                    if self.cursor_signature().0.as_deref() != Some(path.as_path()) {
+                        return;
+                    }
                     if let Some(ext) = self.extensions.find(&owner) {
                         ext.accept_content(&path, &read);
                     }
@@ -465,6 +521,10 @@ fn resolver_request(data: &ExtensionValue) -> Option<ResolverRequest> {
     Some(ResolverRequest { op, src, dst, path, paths, opts, label })
 }
 
+/// The embedded core option declarations; evaluated by the session (or parsed
+/// directly when the session is not yet ready) to seed the `OptionStore`.
+const CORE_OPTIONS_SCHEME: &str = include_str!("options.scm");
+
 /// The embedded default resolver schema, in Scheme. Evaluated by the session so
 /// Scheme is genuinely the source of truth for this configuration.
 const RESOLVER_SCHEME: &str = include_str!("resolver.scm");
@@ -533,6 +593,59 @@ fn scheme_keymaps(session: &crate::script::SchemeSession) -> Vec<Binding> {
     )
 }
 
+/// Parse the core option declarations (`options.scm`) into `OptionDef`s. Uses
+/// the session when ready; falls back to direct `sexpr::parse` on the quoted
+/// literal (same dual-path as keymaps).
+fn scheme_core_option_defs(
+    session: &crate::script::SchemeSession,
+    ready: bool,
+) -> Vec<OptionDef> {
+    let inner = if ready {
+        session.eval(CORE_OPTIONS_SCHEME).and_then(|p| crate::script::sexpr::parse(&p))
+    } else {
+        crate::script::sexpr::parse(CORE_OPTIONS_SCHEME).and_then(|d| {
+            d.as_list()
+                .and_then(|l| l.get(1).cloned())
+                .ok_or_else(|| "core options source is not a (quote …) form".to_string())
+        })
+    };
+    match inner.and_then(|d| crate::script::config::parse_option_config(&d)) {
+        Ok(defs) => defs,
+        Err(e) => {
+            eprintln!("core option defs failed ({e}); no options registered");
+            Vec::new()
+        }
+    }
+}
+
+/// Parse an extension's `option_scheme()` into `OptionDef`s. Same dual-path
+/// (session / direct parse) as `extension_scheme_keymaps`.
+fn extension_option_defs(
+    session: &crate::script::SchemeSession,
+    ready: bool,
+    ext: &dyn crate::extension::Extension,
+) -> Vec<OptionDef> {
+    let Some(src) = ext.option_scheme() else {
+        return Vec::new();
+    };
+    let inner = if ready {
+        session.eval(&src).and_then(|p| crate::script::sexpr::parse(&p))
+    } else {
+        crate::script::sexpr::parse(&src).and_then(|d| {
+            d.as_list()
+                .and_then(|l| l.get(1).cloned())
+                .ok_or_else(|| "extension option source is not a (quote …) form".to_string())
+        })
+    };
+    match inner.and_then(|d| crate::script::config::parse_option_config(&d)) {
+        Ok(defs) => defs,
+        Err(e) => {
+            eprintln!("extension '{}' option defs failed ({e}); ignoring", ext.id());
+            Vec::new()
+        }
+    }
+}
+
 /// Evaluate an extension's declarative Scheme source into Extension-layer keymap
 /// bindings. Uses the resident Scheme session when ready (Role 1: the session is
 /// the config parser); if not yet ready, parses the quoted literal directly so
@@ -594,76 +707,146 @@ fn config_dir() -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
-/// Load User-layer keybindings: write the commented template if absent, then
-/// parse the uncommented `(bind …)` lines. The User layer wins via priority,
-/// and deleting the file reproduces exactly the embedded defaults.
-fn scheme_user_keymaps(session: &crate::script::SchemeSession) -> Vec<Binding> {
+/// Apply a single `(set-option key value)` pair from the config loader. Warns
+/// when the value is rejected by the def's kind validator (unknown keys are
+/// silently stashed in `unowned` for late-arriving optional extensions).
+fn apply_option(store: &OptionStore, key: &str, val: &str) {
+    if !store.set(key, val) && store.def(key).is_some() {
+        eprintln!("user config: invalid value '{val}' for option '{key}'");
+    }
+}
+
+/// Rebuild the typed `MatcherConfig` from current store values. Mirrors the
+/// same helper in `settings.rs`; called at boot after user config is applied.
+fn project_matcher(os: &OptionStore, cfg: &Mutex<MatcherConfig>) {
+    let mut mc = cfg.lock().unwrap();
+    mc.tail_bonus = os.get_i64("matcher.tail-bonus");
+    mc.depth_penalty = os.get_i64("matcher.depth-penalty");
+    mc.length_penalty = os.get_i64("matcher.length-penalty");
+    mc.exec_bonus = os.get_i64("matcher.exec-bonus");
+    mc.preferred_ext = os.get_list("matcher.preferred-ext");
+    mc.noise_ext = os.get_list("matcher.noise-ext");
+    mc.noise_dirs = os.get_list("matcher.noise-dirs");
+}
+
+/// Load the user configuration: write the commented template (`config.scm`) if
+/// absent, then parse the uncommented `(bind …)` and `(set-option …)` lines.
+/// The User layer wins via priority; deleting the file reproduces the defaults.
+fn scheme_user_config(
+    session: &crate::script::SchemeSession,
+    store: &OptionStore,
+) -> (Vec<Binding>, Vec<(String, String)>) {
     // Tests never touch the real user config; the user-config decode path is
-    // covered directly by parse_user_binds / keybindings_template tests.
+    // covered directly by parse_user_config / config_template tests.
     if cfg!(test) {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    let Some(dir) = config_dir() else { return Vec::new() };
-    let path = dir.join("keybindings.scm");
-    if !path.exists() {
-        let _ = std::fs::write(&path, keybindings_template());
-    }
-    let Ok(contents) = std::fs::read_to_string(&path) else { return Vec::new() };
-    // Read the uncommented (bind …) forms as data through the session, so the
-    // Scheme reader handles comment stripping and syntax validation.
+    let Some(dir) = config_dir() else { return (Vec::new(), Vec::new()) };
+    // Accept config.scm; fall back to the old keybindings.scm name for
+    // backward compatibility with existing user configs.
+    let path = {
+        let new_path = dir.join("config.scm");
+        let old_path = dir.join("keybindings.scm");
+        if !new_path.exists() && old_path.exists() {
+            old_path
+        } else {
+            if !new_path.exists() {
+                let _ = std::fs::write(&new_path, config_template(store));
+            }
+            new_path
+        }
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else { return (Vec::new(), Vec::new()) };
+    // Read the uncommented forms as data through the session, so the Scheme
+    // reader handles comment stripping and syntax validation.
     let expr = format!("(quote ({contents}))");
     match session
         .eval(&expr)
         .and_then(|printed| crate::script::sexpr::parse(&printed))
-        .and_then(|datum| parse_user_binds(&datum))
+        .and_then(|datum| parse_user_config(&datum))
     {
-        Ok(binds) => binds,
+        Ok(result) => result,
         Err(e) => {
-            eprintln!("user keybindings failed ({e}); ignoring user overrides");
-            Vec::new()
+            eprintln!("user config failed ({e}); ignoring user overrides");
+            (Vec::new(), Vec::new())
         }
     }
 }
 
-fn parse_user_binds(datum: &crate::script::sexpr::Datum) -> Result<Vec<Binding>, String> {
+fn parse_user_config(
+    datum: &crate::script::sexpr::Datum,
+) -> Result<(Vec<Binding>, Vec<(String, String)>), String> {
     use crate::script::sexpr::Datum;
-    let forms = datum.as_list().ok_or("user keybindings is not a list")?;
-    let mut out = Vec::new();
+    let forms = datum.as_list().ok_or("user config is not a list")?;
+    let mut binds = Vec::new();
+    let mut opts = Vec::new();
     for form in forms {
-        let p = form.as_list().ok_or("binding is not a list")?;
-        if p.first().and_then(|d| d.as_sym()) != Some("bind") {
-            return Err("expected a (bind …) form".into());
+        let p = form.as_list().ok_or("config form is not a list")?;
+        match p.first().and_then(|d| d.as_sym()) {
+            Some("bind") => {
+                let mode =
+                    p.get(1).and_then(|d| d.as_sym()).ok_or("bind missing mode")?.to_string();
+                let panel = match p.get(2) {
+                    Some(Datum::Bool(false)) => None,
+                    Some(d) => d.as_sym().map(str::to_string),
+                    None => None,
+                };
+                let key_name = p.get(3).and_then(|d| d.text()).ok_or("bind missing key")?;
+                let key = crate::script::codec::parse_key(key_name)
+                    .ok_or_else(|| format!("unknown key: {key_name}"))?;
+                let intent = p
+                    .get(4)
+                    .and_then(crate::script::codec::intent_from_datum)
+                    .ok_or("bind has an unknown intent")?;
+                let when = match p.get(5) {
+                    Some(d) => crate::script::codec::cond_from_datum(d),
+                    None => Cond::Always,
+                };
+                binds.push(Binding { mode, panel, key, intent, when, layer: Layer::User });
+            }
+            Some("set-option") => {
+                let key =
+                    p.get(1).and_then(|d| d.text()).ok_or("set-option missing key")?.to_string();
+                let val =
+                    p.get(2).and_then(|d| d.text()).ok_or("set-option missing value")?.to_string();
+                opts.push((key, val));
+            }
+            Some(other) => {
+                eprintln!("user config: unknown form '{other}'; skipping");
+            }
+            None => return Err("empty config form".into()),
         }
-        let mode = p.get(1).and_then(|d| d.as_sym()).ok_or("bind missing mode")?.to_string();
-        let panel = match p.get(2) {
-            Some(Datum::Bool(false)) => None,
-            Some(d) => d.as_sym().map(str::to_string),
-            None => None,
-        };
-        let key_name = p.get(3).and_then(|d| d.text()).ok_or("bind missing key")?;
-        let key = crate::script::codec::parse_key(key_name)
-            .ok_or_else(|| format!("unknown key: {key_name}"))?;
-        let intent = p
-            .get(4)
-            .and_then(crate::script::codec::intent_from_datum)
-            .ok_or("bind has an unknown intent")?;
-        let when = match p.get(5) {
-            Some(d) => crate::script::codec::cond_from_datum(d),
-            None => Cond::Always,
-        };
-        out.push(Binding { mode, panel, key, intent, when, layer: Layer::User });
     }
-    Ok(out)
+    Ok((binds, opts))
 }
 
-/// Generate the fully commented-out keybindings template from the embedded
-/// keymap source, so every default appears as an editable `(bind …)` line.
-fn keybindings_template() -> String {
+/// Generate the unified configuration template (`config.scm`): option stubs
+/// derived from the store's declared options, followed by every default
+/// keybinding commented out so the user can uncomment and edit individual lines.
+fn config_template(store: &OptionStore) -> String {
     let mut s = String::from(
-        ";; wasdf keybindings — uncomment and edit a line to override a default.\n\
-         ;; Deleting this file restores the built-in defaults exactly.\n\
-         ;; Form: (bind <mode> <panel|#f> \"<key>\" <intent> [<when>])\n\n",
+        ";; wasdf configuration — uncomment and edit a line to override a default.\n\
+         ;; Deleting this file restores the built-in defaults exactly.\n\n\
+         ;; Options\n",
     );
+    for (cat, defs) in store.categories() {
+        s.push_str(&format!(";; {cat}\n"));
+        for def in defs {
+            let hint = def.kind.hint();
+            if hint.is_empty() {
+                s.push_str(&format!(
+                    ";; (set-option \"{}\" \"{}\")\n",
+                    def.key, def.default
+                ));
+            } else {
+                s.push_str(&format!(
+                    ";; (set-option \"{}\" \"{}\")  ; {}\n",
+                    def.key, def.default, hint
+                ));
+            }
+        }
+    }
+    s.push_str("\n;; Keybindings\n;; Form: (bind <mode> <panel|#f> \"<key>\" <intent> [<when>])\n\n");
     if let Ok(quoted) = crate::script::sexpr::parse(KEYMAP_SCHEME) {
         // KEYMAP_SCHEME parses as (quote (<group> …)); take the groups.
         if let Some(groups) = quoted.as_list().and_then(|l| l.get(1)).and_then(|d| d.as_list()) {
@@ -789,6 +972,53 @@ mod tests {
     }
 
     #[test]
+    fn content_read_off_the_cursor_is_dropped() {
+        // Reproduces the empty-directory race: a content read that was in flight
+        // when the cursor left its target (navigating into an empty directory)
+        // must be dropped on arrival, so it does not re-populate the preview that
+        // the cursor-changed clear already dropped.
+        let dir = temp_dir_with_files();
+        let mut app = App::boot(dir.clone());
+        app.pump_one(); // initial ReadDir
+
+        // Show the function panel on a file and load its content.
+        app.dispatch_for_test(Intent::CursorDown); // off the directory, onto a file
+        app.dispatch_for_test(Intent::CursorRight); // reveal + follow
+        app.pump_one(); // the content read is accepted (cursor still on it)
+        assert!(app.function_content_rows().is_some(), "preview loaded for the file");
+
+        // Simulate entering an empty directory: no entries, so nothing is under the
+        // cursor. The cursor-changed clear drops the stale preview.
+        app.state.entries.clear();
+        app.state.cursor = 0;
+        app.broadcast_cursor_changed();
+        assert!(app.function_content_rows().is_none(), "preview cleared on empty dir");
+
+        // A late read for the file we navigated away from arrives — it must be
+        // dropped, not re-stashed.
+        let stale = AsyncResult {
+            request_id: 0,
+            purpose: Purpose::Content,
+            mode_generation: app.state.mode_generation(),
+            status: AsyncStatus::Ok,
+            payload: Payload::Read {
+                owner: "preview".into(),
+                path: dir.join("alpha.txt"),
+                result: crate::core::ReadResult::Bytes {
+                    offset: 0,
+                    bytes: b"STALE\n".to_vec(),
+                    eof: true,
+                },
+            },
+        };
+        app.handle_async(stale);
+        assert!(
+            app.function_content_rows().is_none(),
+            "a content read off the current cursor must not repopulate the preview",
+        );
+    }
+
+    #[test]
     fn delete_pushes_policy_then_confirms() {
         let dir = temp_dir_with_files();
         let target = dir.join("beta.txt");
@@ -830,7 +1060,7 @@ mod tests {
         let dir = temp_dir_with_files();
         let mut app = App::boot(dir);
         app.pump_one();
-        app.options.content_auto_update = true;
+        app.store.set("content-auto-update", "#t");
         app.state.function.visible = true;
         app.state.focused_panel = "file".into();
         // Move the file cursor; the on_cursor_move hook reads the file's content.
@@ -904,8 +1134,9 @@ mod tests {
             )
             .unwrap();
         let datum = crate::script::sexpr::parse(&printed).unwrap();
-        let binds = parse_user_binds(&datum).unwrap();
+        let (binds, opts) = parse_user_config(&datum).unwrap();
         assert_eq!(binds.len(), 2, "the commented line is skipped");
+        assert!(opts.is_empty());
         assert!(binds.iter().all(|b| b.layer == Layer::User));
         let z = &binds[0];
         assert_eq!(z.key, Key { code: KeyCode::Char('z'), mods: Mods::NONE });
@@ -914,12 +1145,47 @@ mod tests {
     }
 
     #[test]
-    fn keybindings_template_is_commented() {
-        let t = keybindings_template();
+    fn config_template_is_commented() {
+        let defs = {
+            let outer = crate::script::sexpr::parse(CORE_OPTIONS_SCHEME).unwrap();
+            let inner = outer.as_list().unwrap()[1].clone();
+            crate::script::config::parse_option_config(&inner).unwrap()
+        };
+        let store = OptionStore::new(defs);
+        let t = config_template(&store);
         assert!(t.contains("; (bind file file \"w\" cursor-up)"));
         assert!(t.contains("; (bind select #f \"Enter\" confirm)"));
         // Every binding line is commented out.
         assert!(t.lines().filter(|l| l.contains("(bind ")).all(|l| l.trim_start().starts_with(';')));
+        // Option stubs are present.
+        assert!(t.contains("set-option \"border-style\""));
+    }
+
+    #[test]
+    fn set_option_parsed_from_config() {
+        use crate::script::SchemeSession;
+        let session = SchemeSession::spawn();
+        session.wait_ready(Duration::from_secs(600));
+        let printed = session
+            .eval("(quote ((set-option \"border-style\" \"rounded\") (set-option \"content-auto-update\" \"#t\")))")
+            .unwrap();
+        let datum = crate::script::sexpr::parse(&printed).unwrap();
+        let (binds, opts) = parse_user_config(&datum).unwrap();
+        assert!(binds.is_empty());
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0], ("border-style".into(), "rounded".into()));
+        assert_eq!(opts[1], ("content-auto-update".into(), "#t".into()));
+        let defs = {
+            let outer = crate::script::sexpr::parse(CORE_OPTIONS_SCHEME).unwrap();
+            let inner = outer.as_list().unwrap()[1].clone();
+            crate::script::config::parse_option_config(&inner).unwrap()
+        };
+        let store = OptionStore::new(defs);
+        for (k, v) in &opts {
+            apply_option(&store, k, v);
+        }
+        assert_eq!(store.get_str("border-style"), "rounded");
+        assert!(store.get_bool("content-auto-update"));
     }
 
     #[test]

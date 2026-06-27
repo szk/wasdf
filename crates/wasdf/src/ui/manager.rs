@@ -65,12 +65,17 @@ impl UiManager {
     }
 
     /// Render the whole UI from the read-only state.
-    pub fn render(&mut self, frame: &mut Frame, state: &AppState, extensions: &ExtensionRegistry) {
-        // `live_notice` borrows `&self`; resolve it before the `&mut self.scroll`
-        // borrow below.
+    pub fn render(
+        &mut self,
+        frame: &mut Frame,
+        state: &AppState,
+        extensions: &ExtensionRegistry,
+        vfs: &crate::vfs::Vfs,
+        opts: &crate::ui::top::TopOptions,
+    ) {
         let notice = self.notice.as_ref().and_then(|(n, at)| {
             (at.elapsed() < NOTICE_TTL).then_some(n)
         });
-        crate::ui::render::render(frame, state, extensions, &mut self.scroll, notice);
+        crate::ui::render::render(frame, state, extensions, &mut self.scroll, notice, vfs, opts);
     }
 }

@@ -21,8 +21,9 @@ use crate::ui::content;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
-use crate::core::{AppState, ExtensionIntent, Intent, Mode, ReadResult};
+use crate::core::{AppState, ExtensionIntent, Intent, Mode, OptionStore, ReadResult};
 use crate::extension::{Extension, FunctionDraw, FunctionRenderCtx};
 use crate::script::condition::Conditions;
 
@@ -39,6 +40,7 @@ const LOOKAHEAD: usize = 256;
 /// Layer priority (Extension > Core) makes these win over the core Enter/Esc/n
 /// bindings while a search is active.
 const KEYMAP_SCHEME: &str = include_str!("preview_keymap.scm");
+const OPTIONS_SCHEME: &str = include_str!("preview_options.scm");
 
 /// The preview extension. Holds its decoded content and the chunk-load
 /// bookkeeping internally (main-thread `RefCell`; the worker never touches this
@@ -49,6 +51,8 @@ pub struct PreviewExtension {
     content: RefCell<Option<Decoded>>,
     target: RefCell<Option<PathBuf>>,
     load: RefCell<Load>,
+    /// Set once from boot via `bind_store`; read in `accept_content` for tab width.
+    store: OnceLock<Arc<OptionStore>>,
 }
 
 /// The current window's chunk-load state: which file it covers, how it streams
@@ -69,7 +73,7 @@ impl PreviewExtension {
     /// first chunk's MIME class fixes the kind; images decode whole); later chunks
     /// for the same path append `tail ++ bytes`, decoding the completed units and
     /// keeping the new tail.
-    fn accept_chunk(&self, path: &Path, offset: u64, bytes: &[u8], eof: bool) {
+    fn accept_chunk(&self, path: &Path, offset: u64, bytes: &[u8], eof: bool, tab_width: usize) {
         let mut load = self.load.borrow_mut();
         let mut content = self.content.borrow_mut();
         if offset == 0 {
@@ -86,7 +90,7 @@ impl PreviewExtension {
         let mut buf = std::mem::take(&mut load.tail);
         buf.extend_from_slice(bytes);
         if let Some(dec) = content.as_mut() {
-            load.tail = decode::append(path, kind, dec, &buf, eof);
+            load.tail = decode::append(path, kind, dec, &buf, eof, tab_width);
         }
         load.next_offset = offset + bytes.len() as u64;
         load.eof = eof;
@@ -106,6 +110,28 @@ impl PreviewExtension {
             _ => None,
         }
     }
+
+    /// Whether the panel is currently *following the cursor* — i.e. the panel is
+    /// meant to preview whatever is under the cursor. Distinct from
+    /// [`Self::cursor_target`] returning `Some`: here we are following even when
+    /// there is nothing under the cursor (an empty directory), which is exactly
+    /// the case where a stale preview must be dropped.
+    fn following(&self, state: &AppState) -> bool {
+        match state.mode() {
+            Mode::File => state.function.visible,
+            Mode::Select(spec) => spec.id == "file-search",
+            _ => false,
+        }
+    }
+
+    /// Drop the stashed content so the panel renders nothing. Called when the
+    /// cursor moves onto "no target" (empty directory) so the previous file's
+    /// preview does not linger.
+    fn clear(&self) {
+        *self.content.borrow_mut() = None;
+        *self.target.borrow_mut() = None;
+        *self.load.borrow_mut() = Load::default();
+    }
 }
 
 impl Extension for PreviewExtension {
@@ -122,21 +148,37 @@ impl Extension for PreviewExtension {
         c.register("function-has-matches", Box::new(|s| !s.function.search.matches.is_empty()));
     }
 
+    fn bind_store(&self, store: &Arc<OptionStore>) {
+        let _ = self.store.set(store.clone());
+    }
+
     fn scheme_source(&self) -> Option<String> {
         Some(KEYMAP_SCHEME.to_string())
+    }
+
+    fn option_scheme(&self) -> Option<String> {
+        Some(OPTIONS_SCHEME.to_string())
     }
 
     /// Decode a read chunk (core fetched the bytes/entries off-thread) and fold it
     /// into the stash. The first chunk (offset 0) fixes the content kind and
     /// resets the window; later chunks append. Runs on the main thread.
     fn accept_content(&self, path: &Path, result: &ReadResult) {
+        let tab_width = self
+            .store
+            .get()
+            .map(|s| s.get_u32("preview.tab-width") as usize)
+            .unwrap_or(4)
+            .max(1);
         match result {
             ReadResult::Dir { entries } => {
                 *self.content.borrow_mut() = Some(Decoded::Dir { entries: entries.clone() });
                 *self.load.borrow_mut() =
                     Load { path: Some(path.to_path_buf()), eof: true, ..Default::default() };
             }
-            ReadResult::Bytes { offset, bytes, eof } => self.accept_chunk(path, *offset, bytes, *eof),
+            ReadResult::Bytes { offset, bytes, eof } => {
+                self.accept_chunk(path, *offset, bytes, *eof, tab_width)
+            }
         }
         *self.target.borrow_mut() = Some(path.to_path_buf());
     }
@@ -205,7 +247,15 @@ impl Extension for PreviewExtension {
     /// "cursor → preview" wiring, owned by the extension — the kernel only
     /// broadcasts the event and runs the returned `LoadContent`.
     fn on_cursor_changed(&self, state: &AppState) -> Vec<Intent> {
-        let Some(path) = self.cursor_target(state) else { return Vec::new() };
+        let Some(path) = self.cursor_target(state) else {
+            // Following the cursor but nothing is under it (e.g. an empty
+            // directory): drop any stale preview so the panel stops showing the
+            // previous file's content and title.
+            if self.following(state) {
+                self.clear();
+            }
+            return Vec::new();
+        };
         let load = self.load.borrow();
         let offset = if load.path.as_deref() != Some(path.as_path()) {
             0 // a new target: load its first chunk
@@ -296,9 +346,53 @@ mod tests {
             created: None,
             accessed: None,
             symlink_target: None,
+            activation: None,
         }];
         s.function.visible = visible;
         s
+    }
+
+    #[test]
+    fn empty_directory_clears_the_stale_preview() {
+        // Preview a file, then navigate into an empty directory (no entries while
+        // the panel keeps following): the stash must be dropped so the panel does
+        // not keep rendering the previous file's content/title.
+        let ext = PreviewExtension::default();
+        ext.accept_content(
+            Path::new("/d/a.txt"),
+            &ReadResult::Bytes { offset: 0, bytes: b"hello\nworld\n".to_vec(), eof: true },
+        );
+        let ctx_state = state_with_file(true);
+        let ctx = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &ctx_state.function };
+        assert!(ext.render_function(&ctx).is_some(), "precondition: content is stashed");
+
+        // Empty directory: function visible, but no entries → no cursor target.
+        let mut empty = AppState::new(std::path::PathBuf::from("/d/empty"));
+        empty.entries = Vec::new();
+        empty.function.visible = true;
+        assert!(ext.on_cursor_changed(&empty).is_empty(), "no load when nothing is under the cursor");
+
+        let ctx2 = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &empty.function };
+        assert!(
+            ext.render_function(&ctx2).is_none(),
+            "stale preview must be cleared on entering an empty directory",
+        );
+    }
+
+    #[test]
+    fn hidden_panel_does_not_clear_the_stash() {
+        // When the panel is simply not following (hidden in File mode), a missing
+        // target must NOT wipe the stash — toggling visibility back should still
+        // show the same content without a forced reload.
+        let ext = PreviewExtension::default();
+        ext.accept_content(
+            Path::new("/d/a.txt"),
+            &ReadResult::Bytes { offset: 0, bytes: b"hello\n".to_vec(), eof: true },
+        );
+        let s = state_with_file(false); // function hidden → not following
+        assert!(ext.on_cursor_changed(&s).is_empty());
+        let ctx = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &s.function };
+        assert!(ext.render_function(&ctx).is_some(), "hidden panel keeps its stash");
     }
 
     #[test]
@@ -352,5 +446,110 @@ mod tests {
         );
         s.function.scroll = 999;
         assert!(ext.on_cursor_changed(&s).is_empty(), "fully loaded → no re-read");
+    }
+}
+
+// ── Phase 5 acceptance tests ──────────────────────────────────────────────────
+// Zero-edit check: these tests live only in preview*.{rs,scm}; no kernel.rs or
+// settings.rs was edited to add preview.tab-width.
+
+#[cfg(test)]
+mod option_acceptance {
+    use super::*;
+    use std::sync::Mutex;
+    use crate::core::{ExtensionValue, KEY_ITEM, OptionStore};
+    use crate::extension::settings::SettingsExtension;
+    use crate::services::MatcherConfig;
+
+    fn preview_store() -> Arc<OptionStore> {
+        let outer = crate::script::sexpr::parse(OPTIONS_SCHEME).expect("parse preview_options.scm");
+        let inner = outer.as_list().expect("outer list")[1].clone();
+        let defs = crate::script::config::parse_option_config(&inner).expect("parse defs");
+        Arc::new(OptionStore::new(defs))
+    }
+
+    #[test]
+    fn preview_tab_width_appears_under_preview_category() {
+        let store = preview_store();
+        let def = store.def("preview.tab-width").expect("preview.tab-width defined");
+        assert_eq!(def.category, "Preview");
+        assert_eq!(def.default, "4");
+        let cats = store.categories();
+        let (_, defs) = cats.iter().find(|(c, _)| c == "Preview").expect("Preview category");
+        assert!(defs.iter().any(|d| d.key == "preview.tab-width"));
+    }
+
+    #[test]
+    fn set_preview_tab_width_applies_live_via_settings_extension() {
+        let store = preview_store();
+        let ext = SettingsExtension::new(
+            store.clone(),
+            Arc::new(Mutex::new(MatcherConfig::default())),
+            None,
+        );
+        let state = AppState::new(std::path::PathBuf::from("/tmp"));
+        let intent = ExtensionIntent {
+            extension: "settings".into(),
+            intent: "set".into(),
+            data: ExtensionValue::Nil
+                .with("field", ExtensionValue::String("preview.tab-width".into()))
+                .with(KEY_ITEM, ExtensionValue::String("2".into())),
+        };
+        let result = ext.handle_intent(&intent, &state);
+        assert_eq!(result, vec![Intent::Refresh]);
+        assert_eq!(store.get_u32("preview.tab-width"), 2, "store updated live");
+    }
+
+    #[test]
+    fn set_preview_tab_width_persists_to_config() {
+        let store = preview_store();
+        let config = std::env::temp_dir().join(format!(
+            "wasdf-preview-test-{}.scm",
+            std::process::id()
+        ));
+        let ext = SettingsExtension::new(
+            store.clone(),
+            Arc::new(Mutex::new(MatcherConfig::default())),
+            Some(config.clone()),
+        );
+        let state = AppState::new(std::path::PathBuf::from("/tmp"));
+        let intent = ExtensionIntent {
+            extension: "settings".into(),
+            intent: "set".into(),
+            data: ExtensionValue::Nil
+                .with("field", ExtensionValue::String("preview.tab-width".into()))
+                .with(KEY_ITEM, ExtensionValue::String("8".into())),
+        };
+        ext.handle_intent(&intent, &state);
+        let written = std::fs::read_to_string(&config).unwrap_or_default();
+        let _ = std::fs::remove_file(&config);
+        assert!(
+            written.contains("(set-option \"preview.tab-width\" \"8\")"),
+            "writer persisted: {written:?}"
+        );
+    }
+
+    #[test]
+    fn tab_width_from_store_expands_tabs_in_content() {
+        let store = preview_store();
+        store.set("preview.tab-width", "2");
+
+        let ext = PreviewExtension::default();
+        ext.bind_store(&store);
+        ext.accept_content(
+            Path::new("/x/indented.txt"),
+            &ReadResult::Bytes {
+                offset: 0,
+                bytes: b"\thello\n".to_vec(),
+                eof: true,
+            },
+        );
+        let s = AppState::new(std::env::temp_dir());
+        let ctx = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &s.function };
+        let draw = ext.render_function(&ctx).expect("has content");
+        // tab-width=2 → '\t' becomes "  " (2 spaces) → line is "  hello"
+        let first_line = draw.lines.first().expect("has first line");
+        let text: String = first_line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        assert_eq!(text, "  hello", "tab expanded to 2 spaces: {text:?}");
     }
 }

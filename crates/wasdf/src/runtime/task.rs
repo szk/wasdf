@@ -15,7 +15,8 @@ use crate::core::{
     AppEvent, AsyncResult, AsyncStatus, Entry, ExecOutput, Payload, Plan, Purpose, ReadResult,
 };
 use crate::script::SchemeSession;
-use crate::services::{MatcherBackend, ResolverChain, rank_paths};
+use crate::services::{MatcherBackend, MatcherConfig, RankedEntry, ResolverChain, rank_paths};
+use crate::vfs::Vfs;
 
 /// Bytes read for file content, bounded so huge files stay responsive.
 const READ_LIMIT: usize = 64 * 1024;
@@ -25,6 +26,10 @@ pub struct TaskManager {
     resolver: Arc<ResolverChain>,
     matcher: Arc<dyn MatcherBackend>,
     scheme: Option<Arc<SchemeSession>>,
+    vfs: Arc<Vfs>,
+    /// Shared with `Options.matcher` in the kernel; the settings extension
+    /// updates it via `Options::set`, and the Search worker snapshots it.
+    matcher_cfg: Arc<Mutex<MatcherConfig>>,
     next_id: AtomicU64,
     cancels: Mutex<HashMap<Purpose, Arc<AtomicBool>>>,
     /// Cancel flag of the most recent Execute, so KillProcess can stop it.
@@ -37,12 +42,16 @@ impl TaskManager {
         resolver: Arc<ResolverChain>,
         matcher: Arc<dyn MatcherBackend>,
         scheme: Option<Arc<SchemeSession>>,
+        vfs: Arc<Vfs>,
+        matcher_cfg: Arc<Mutex<MatcherConfig>>,
     ) -> Self {
         TaskManager {
             tx,
             resolver,
             matcher,
             scheme,
+            vfs,
+            matcher_cfg,
             next_id: AtomicU64::new(1),
             cancels: Mutex::new(HashMap::new()),
             execute_cancel: Mutex::new(None),
@@ -73,9 +82,11 @@ impl TaskManager {
         let resolver = self.resolver.clone();
         let matcher = self.matcher.clone();
         let scheme = self.scheme.clone();
+        let vfs = self.vfs.clone();
+        let matcher_cfg = self.matcher_cfg.clone();
 
         std::thread::spawn(move || {
-            let (status, payload) = run_plan(&plan, &resolver, matcher.as_ref(), scheme.as_deref(), &cwd);
+            let (status, payload) = run_plan(&plan, &resolver, matcher.as_ref(), scheme.as_deref(), &vfs, &cwd, &matcher_cfg);
             let status = if cancel.load(Ordering::Relaxed) {
                 AsyncStatus::Cancelled
             } else {
@@ -123,30 +134,34 @@ fn run_plan(
     resolver: &ResolverChain,
     matcher: &dyn MatcherBackend,
     scheme: Option<&SchemeSession>,
+    vfs: &Vfs,
     cwd: &std::path::Path,
+    matcher_cfg: &Arc<Mutex<MatcherConfig>>,
 ) -> (AsyncStatus, Payload) {
     match plan {
-        Plan::ReadDir { path, show_hidden } => match crate::fs::read_directory(path, *show_hidden) {
+        Plan::ReadDir { path, show_hidden } => match vfs.list(path, *show_hidden) {
             Ok(entries) => (AsyncStatus::Ok, Payload::Entries { path: path.clone(), entries }),
             Err(e) => (AsyncStatus::Failed(format!("read {}: {e}", path.display())), Payload::None),
         },
         Plan::Search { root, query, show_hidden } => {
+            // Snapshot config before the walk so weight edits don't race mid-search.
+            let cfg = matcher_cfg.lock().unwrap().clone();
             let walked = crate::fs::walk(root, *show_hidden, 20_000);
-            let ranked = rank_paths(matcher, root, walked, query);
+            let ranked: Vec<RankedEntry> = rank_paths(matcher, root, walked, query, &cfg);
             let entries: Vec<Entry> = ranked
                 .into_iter()
-                .map(|p| {
-                    let name = p
+                .map(|re| {
+                    let name = re.path
                         .strip_prefix(root)
-                        .unwrap_or(&p)
+                        .unwrap_or(&re.path)
                         .to_string_lossy()
                         .into_owned();
-                    crate::fs::make_entry(p, name)
+                    crate::fs::make_entry_from(re.path, name, re.meta)
                 })
                 .collect();
             (AsyncStatus::Ok, Payload::Entries { path: root.clone(), entries })
         }
-        Plan::Read { owner, path, offset } => read_content(owner, path, *offset),
+        Plan::Read { owner, path, offset } => read_content(owner, path, *offset, vfs),
         Plan::ResolveAndRun { request } => match resolver.resolve(request, cwd) {
             Ok(cmd) => {
                 let done = crate::exec::run_background(&cmd.label, &cmd.argv, cwd);
@@ -242,8 +257,20 @@ fn stream_execute(
 /// byte chunk from `offset` (the owning extension pages further chunks by
 /// re-issuing with a new offset). The extension decodes the result (MIME,
 /// highlight, image, hexdump) on the main thread; core stays content-agnostic.
-fn read_content(owner: &str, path: &std::path::Path, offset: u64) -> (AsyncStatus, Payload) {
-    let result = if path.is_dir() {
+/// Virtual leaf paths return empty-EOF so preview is a harmless no-op.
+fn read_content(owner: &str, path: &std::path::Path, offset: u64, vfs: &Vfs) -> (AsyncStatus, Payload) {
+    let result = if crate::vfs::is_virtual(path) {
+        if path.is_relative() && path.components().count() > 1 {
+            // Virtual directory: list via VFS.
+            match vfs.list(path, true) {
+                Ok(entries) => ReadResult::Dir { entries },
+                Err(e) => return (AsyncStatus::Failed(format!("{e}")), Payload::None),
+            }
+        } else {
+            // Virtual leaf: empty-EOF so preview is a no-op.
+            ReadResult::Bytes { offset, bytes: Vec::new(), eof: true }
+        }
+    } else if path.is_dir() {
         match crate::fs::read_directory(path, true) {
             Ok(entries) => ReadResult::Dir { entries },
             Err(e) => return (AsyncStatus::Failed(format!("{e}")), Payload::None),

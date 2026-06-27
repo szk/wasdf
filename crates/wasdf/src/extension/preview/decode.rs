@@ -45,11 +45,19 @@ pub fn classify_first(path: &Path, bytes: &[u8]) -> (Decoded, Option<Kind>) {
 /// Append a chunk into the streamed content, decoding only the newly completed
 /// units and returning the undecoded trailing bytes (`tail`) to prepend to the
 /// next chunk. `buf` is the previous tail followed by the new chunk's bytes.
-/// With `eof`, everything is flushed and the tail is empty.
-pub fn append(path: &Path, kind: Kind, content: &mut Decoded, buf: &[u8], eof: bool) -> Vec<u8> {
+/// With `eof`, everything is flushed and the tail is empty. `tab_width` controls
+/// how many spaces a `\t` character expands to.
+pub fn append(
+    path: &Path,
+    kind: Kind,
+    content: &mut Decoded,
+    buf: &[u8],
+    eof: bool,
+    tab_width: usize,
+) -> Vec<u8> {
     match (kind, content) {
         (Kind::Text, Decoded::Text { lines, styles }) => {
-            let (new_lines, tail) = split_lines(buf, eof);
+            let (new_lines, tail) = split_lines(buf, eof, tab_width);
             let new_styles = highlight_lines(path, &new_lines);
             lines.extend(new_lines);
             styles.extend(new_styles);
@@ -64,18 +72,42 @@ pub fn append(path: &Path, kind: Kind, content: &mut Decoded, buf: &[u8], eof: b
     }
 }
 
+/// Replace control characters that ratatui's cell-width calculator rejects.
+/// `\t` expands to `tab_width` spaces; other control chars become `·` (U+00B7).
+/// `\n` and `\r` are already stripped by `.lines()` so they never arrive here.
+fn sanitize_line(s: &str, tab_width: usize) -> String {
+    let tab = " ".repeat(tab_width.max(1));
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch == '\t' {
+            out.push_str(&tab);
+        } else if ch.is_control() {
+            out.push('·');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Split `buf` into complete lines up to the last newline plus the trailing
 /// remainder (a partial line carried to the next chunk). Cutting at `\n` keeps
 /// the boundary off any multibyte char, so the lossy decode stays valid. With
 /// `eof`, the whole buffer is decoded and the tail is empty.
-fn split_lines(buf: &[u8], eof: bool) -> (Vec<String>, Vec<u8>) {
+fn split_lines(buf: &[u8], eof: bool, tab_width: usize) -> (Vec<String>, Vec<u8>) {
     if eof {
-        let lines = String::from_utf8_lossy(buf).lines().map(|l| l.to_string()).collect();
+        let lines = String::from_utf8_lossy(buf)
+            .lines()
+            .map(|l| sanitize_line(l, tab_width))
+            .collect();
         return (lines, Vec::new());
     }
     match buf.iter().rposition(|&b| b == b'\n') {
         Some(nl) => {
-            let lines = String::from_utf8_lossy(&buf[..nl]).lines().map(|l| l.to_string()).collect();
+            let lines = String::from_utf8_lossy(&buf[..nl])
+                .lines()
+                .map(|l| sanitize_line(l, tab_width))
+                .collect();
             (lines, buf[nl + 1..].to_vec())
         }
         None => (Vec::new(), buf.to_vec()),
@@ -146,7 +178,7 @@ mod tests {
     fn text_classifies_then_appends_with_highlight() {
         let (mut content, kind) = classify_first(Path::new("x.rs"), b"fn main() {}\n");
         assert_eq!(kind, Some(Kind::Text));
-        let tail = append(Path::new("x.rs"), Kind::Text, &mut content, b"fn main() {}\n", true);
+        let tail = append(Path::new("x.rs"), Kind::Text, &mut content, b"fn main() {}\n", true, 4);
         assert!(tail.is_empty());
         match content {
             Decoded::Text { lines, styles } => {
@@ -161,12 +193,12 @@ mod tests {
     fn text_append_carries_a_partial_line_across_chunks() {
         let mut content = Decoded::Text { lines: Vec::new(), styles: Vec::new() };
         // First chunk ends mid-line: only the complete line decodes; the rest tails.
-        let tail = append(Path::new("a.txt"), Kind::Text, &mut content, b"alpha\nbe", false);
+        let tail = append(Path::new("a.txt"), Kind::Text, &mut content, b"alpha\nbe", false, 4);
         assert_eq!(tail, b"be");
         // The tail is prepended to the next chunk.
         let mut buf = tail;
         buf.extend_from_slice(b"ta\ngamma");
-        let tail = append(Path::new("a.txt"), Kind::Text, &mut content, &buf, true);
+        let tail = append(Path::new("a.txt"), Kind::Text, &mut content, &buf, true, 4);
         assert!(tail.is_empty());
         match content {
             Decoded::Text { lines, .. } => assert_eq!(lines, vec!["alpha", "beta", "gamma"]),
@@ -179,12 +211,12 @@ mod tests {
         let mut content = Decoded::Binary { lines: Vec::new() };
         // 18 bytes, not eof: one full 16-byte row, 2 bytes tail.
         let chunk: Vec<u8> = (0..18u8).collect();
-        let tail = append(Path::new("b.bin"), Kind::Hex, &mut content, &chunk, false);
+        let tail = append(Path::new("b.bin"), Kind::Hex, &mut content, &chunk, false, 4);
         assert_eq!(tail.len(), 2);
         // Next chunk (tail + 16 bytes), eof: row addressed at 0x10, then 0x20 remainder.
         let mut buf = tail;
         buf.extend((18..34u8).collect::<Vec<_>>());
-        append(Path::new("b.bin"), Kind::Hex, &mut content, &buf, true);
+        append(Path::new("b.bin"), Kind::Hex, &mut content, &buf, true, 4);
         match content {
             Decoded::Binary { lines } => {
                 assert_eq!(lines.len(), 3);

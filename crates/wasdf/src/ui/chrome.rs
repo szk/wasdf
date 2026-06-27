@@ -36,6 +36,12 @@ pub struct PanelFrame {
     /// wrapped as `[ title ]`.
     pub bracket: bool,
     pub info: Option<String>,
+    /// Left-aligned text embedded in the bottom border (path, possibly up to ╦).
+    /// Ignored when `open_bottom` is true (no bottom border).
+    pub bottom_info: Option<String>,
+    /// Right-segment text starting at an explicit X column (filename after ╦).
+    /// Only rendered when `open_bottom` is false.
+    pub bottom_right: Option<(u16, String)>,
     pub focused: bool,
     pub scroll: Option<ScrollInfo>,
     /// When true, the panel has no bottom border: the side borders run down
@@ -57,6 +63,8 @@ impl PanelFrame {
             title: None,
             bracket: true,
             info: None,
+            bottom_info: None,
+            bottom_right: None,
             focused: false,
             scroll: None,
             open_bottom: false,
@@ -75,6 +83,16 @@ impl PanelFrame {
     }
     pub fn info(mut self, t: impl Into<String>) -> Self {
         self.info = Some(t.into());
+        self
+    }
+    /// Left-aligned text in the bottom border (path up to ╦, or full path+name).
+    pub fn bottom_info(mut self, t: impl Into<String>) -> Self {
+        self.bottom_info = Some(t.into());
+        self
+    }
+    /// Right-segment text starting at absolute column `x` (filename after ╦).
+    pub fn bottom_right(mut self, x: u16, t: impl Into<String>) -> Self {
+        self.bottom_right = Some((x, t.into()));
         self
     }
     pub fn focused(mut self, f: bool) -> Self {
@@ -117,28 +135,49 @@ pub fn inner_open_bottom(rect: Rect) -> Rect {
     }
 }
 
-fn glyph(mask: u8) -> char {
+/// Track and thumb symbols for the right-border scrollbar, matched to the
+/// border style so the track is the same glyph as the side border.
+fn scrollbar_symbols(style: &str) -> (&'static str, &'static str) {
+    // (track, thumb)
+    match style {
+        "double" => ("║", "█"),
+        "ascii"  => ("|", "#"),
+        _        => ("│", "█"), // single, rounded, and any unrecognised value
+    }
+}
+
+fn glyph(mask: u8, style: &str) -> char {
     // bits: N=1 S=2 E=4 W=8
-    match mask {
-        3 => '│',
-        12 => '─',
-        6 => '┌',
-        10 => '┐',
-        5 => '└',
-        9 => '┘',
-        7 => '├',
-        11 => '┤',
-        14 => '┬',
-        13 => '┴',
-        15 => '┼',
-        1 | 2 => '│',
-        4 | 8 => '─',
-        _ => ' ',
+    match style {
+        "rounded" => match mask {
+            6 => '╭', 10 => '╮', 5 => '╰', 9 => '╯',
+            3 | 1 | 2 => '│', 12 | 4 | 8 => '─',
+            7 => '├', 11 => '┤', 14 => '┬', 13 => '┴', 15 => '┼',
+            _ => ' ',
+        },
+        "double" => match mask {
+            3 | 1 | 2 => '║', 12 | 4 | 8 => '═',
+            6 => '╔', 10 => '╗', 5 => '╚', 9 => '╝',
+            7 => '╠', 11 => '╣', 14 => '╦', 13 => '╩', 15 => '╬',
+            _ => ' ',
+        },
+        "ascii" => match mask {
+            3 | 1 | 2 | 7 | 11 => '|',
+            12 | 4 | 8 | 14 | 13 => '-',
+            6 | 10 | 5 | 9 | 15 => '+',
+            _ => ' ',
+        },
+        _ => match mask { // "single" and any unrecognised value
+            3 | 1 | 2 => '│', 12 | 4 | 8 => '─',
+            6 => '┌', 10 => '┐', 5 => '└', 9 => '┘',
+            7 => '├', 11 => '┤', 14 => '┬', 13 => '┴', 15 => '┼',
+            _ => ' ',
+        },
     }
 }
 
 /// Render the connected border, titles, and scrollbars for all panels.
-pub fn render(frame: &mut Frame, panels: &[PanelFrame]) {
+pub fn render(frame: &mut Frame, panels: &[PanelFrame], border_style: &str) {
     let area = frame.area();
     let (w, h) = (area.width as usize, area.height as usize);
     if w == 0 || h == 0 {
@@ -216,7 +255,7 @@ pub fn render(frame: &mut Frame, panels: &[PanelFrame]) {
                 let x = area.x + cx as u16;
                 let y = area.y + cy as u16;
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_char(glyph(m));
+                    cell.set_char(glyph(m, border_style));
                     cell.set_style(style);
                 }
             }
@@ -240,9 +279,11 @@ pub fn render(frame: &mut Frame, panels: &[PanelFrame]) {
             let y = p.rect.y;
             for ch in label.chars() {
                 let (cx, cy) = ((x - area.x) as usize, (y - area.y) as usize);
-                // Leave junction cells (a divider meeting this row from above or
-                // below) intact so a long title flows around them.
-                let junction = cx < w && cy < h && mask[cy * w + cx] & (N | S) != 0;
+                // Only skip cells where a vertical border continues southward
+                // into this panel's content (S bit set). An N-only junction (a
+                // divider from an adjacent panel above terminating here) is safe
+                // to overwrite — the title should remain readable.
+                let junction = cx < w && cy < h && mask[cy * w + cx] & S != 0;
                 if !junction {
                     if let Some(cell) = buf.cell_mut((x, y)) {
                         cell.set_char(ch);
@@ -267,7 +308,7 @@ pub fn render(frame: &mut Frame, panels: &[PanelFrame]) {
             let style = Style::default().fg(Color::Gray);
             for ch in label.chars() {
                 let (cx, cy) = ((x - area.x) as usize, (y - area.y) as usize);
-                let junction = cx < w && cy < h && mask[cy * w + cx] & (N | S) != 0;
+                let junction = cx < w && cy < h && mask[cy * w + cx] & S != 0;
                 if !junction {
                     if let Some(cell) = buf.cell_mut((x, y)) {
                         cell.set_char(ch);
@@ -276,6 +317,76 @@ pub fn render(frame: &mut Frame, panels: &[PanelFrame]) {
                 }
                 x += 1;
             }
+        }
+
+        // Bottom-border left-aligned text (path, or path+filename combined).
+        //
+        // This row is the top area's bottom border *and* the main panels' shared
+        // top border, so a function-panel title may already have been painted here.
+        // Three outcomes per cell, in priority order:
+        //
+        //   1. A real label character (anything but a horizontal rule) always wins.
+        //      It overwrites the border glyph and any bled title, so the path and
+        //      filename stay intact even where a divider or a title char sits.
+        //   2. A rule/padding character (`═` etc.) over a *junction* cell (any
+        //      vertical stem, N or S) repaints the **junction glyph**. The rule
+        //      yields to the connected chrome — and, crucially, this erases any
+        //      function title that bled here, so a `┴`/`╦` shows, never a stray
+        //      letter (e.g. `[ debug ]e[ examples ]`).
+        //   3. A rule character over a plain cell paints the rule.
+        //
+        // The text belongs to the whole connected bottom line, so it is clamped to
+        // the frame's right edge (the closing corner), not the carrier panel's own
+        // width — a path may flow rightward across neighbouring panel sections.
+        let frame_right = area.x + area.width - 1;
+        let paint_bottom = |buf: &mut ratatui::buffer::Buffer, mut x: u16, y: u16, text: &str| {
+            let label_style = Style::default().fg(Color::Gray);
+            for ch in text.chars() {
+                if x >= frame_right {
+                    x += 1;
+                    continue;
+                }
+                let (cx, cy) = ((x - area.x) as usize, (y - area.y) as usize);
+                let m = if cx < w && cy < h { mask[cy * w + cx] } else { 0 };
+                let is_rule = matches!(ch, '═' | '─' | '-');
+                let stem = m & (N | S) != 0;
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    if is_rule && stem {
+                        // Restore the connected junction glyph, overwriting any
+                        // title that bled onto this shared row.
+                        let gstyle = if cx < w && cy < h && focus[cy * w + cx] {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        };
+                        cell.set_char(glyph(m, border_style));
+                        cell.set_style(gstyle);
+                    } else {
+                        cell.set_char(ch);
+                        cell.set_style(label_style);
+                    }
+                }
+                x += 1;
+            }
+        };
+        for p in panels {
+            let Some(bottom_text) = &p.bottom_info else { continue };
+            if p.open_bottom || p.rect.height < 2 || p.rect.width < 4 {
+                continue;
+            }
+            let y = p.rect.y + p.rect.height - 1;
+            paint_bottom(buf, p.rect.x + 2, y, bottom_text);
+        }
+
+        // Bottom-border right-segment text: filename after the ╦ junction. Starts
+        // at the explicit column stored in bottom_right (func_x + 1); same rule.
+        for p in panels {
+            let Some((start_x, right_text)) = &p.bottom_right else { continue };
+            if p.open_bottom || p.rect.height < 2 {
+                continue;
+            }
+            let y = p.rect.y + p.rect.height - 1;
+            paint_bottom(buf, *start_x, y, right_text);
         }
     }
 
@@ -309,11 +420,12 @@ pub fn render(frame: &mut Frame, panels: &[PanelFrame]) {
         let mut state = ScrollbarState::new(positions)
             .viewport_content_length(s.viewport)
             .position(s.position.min(positions - 1));
+        let (track_sym, thumb_sym) = scrollbar_symbols(border_style);
         let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None)
-            .track_symbol(Some("│"))
-            .thumb_symbol("█")
+            .track_symbol(Some(track_sym))
+            .thumb_symbol(thumb_sym)
             .style(style);
         frame.render_stateful_widget(bar, track, &mut state);
     }
@@ -327,13 +439,17 @@ mod tests {
 
     /// Render one framed panel and return the glyphs down its right-border
     /// (scrollbar) column, top to bottom.
-    fn scrollbar_column(scroll: ScrollInfo) -> Vec<char> {
+    fn scrollbar_column_style(scroll: ScrollInfo, style: &str) -> Vec<char> {
         let rect = Rect { x: 0, y: 0, width: 10, height: 12 };
         let mut t = Terminal::new(TestBackend::new(10, 12)).unwrap();
-        t.draw(|f| render(f, &[PanelFrame::new(rect).scroll(scroll)])).unwrap();
+        t.draw(|f| render(f, &[PanelFrame::new(rect).scroll(scroll)], style)).unwrap();
         let buf = t.backend().buffer();
         let x = rect.x + rect.width - 1;
         (1..rect.height - 1).map(|y| buf[(x, y)].symbol().chars().next().unwrap()).collect()
+    }
+
+    fn scrollbar_column(scroll: ScrollInfo) -> Vec<char> {
+        scrollbar_column_style(scroll, "single")
     }
 
     // doc/UI.md, point 1: when the bottom of the scroll range is at the bottom of
@@ -357,5 +473,21 @@ mod tests {
     fn content_that_fits_is_a_full_thumb() {
         let col = scrollbar_column(ScrollInfo { total: 5, viewport: 10, position: 0 });
         assert!(col.iter().all(|&c| c == '█'), "full-height thumb when content fits: {col:?}");
+    }
+
+    #[test]
+    fn ascii_style_uses_pipe_track_and_hash_thumb() {
+        let s = ScrollInfo { total: 100, viewport: 10, position: 0 };
+        let col = scrollbar_column_style(s, "ascii");
+        assert_eq!(col[0], '#', "ascii thumb is '#': {col:?}");
+        assert_eq!(*col.last().unwrap(), '|', "ascii track is '|': {col:?}");
+    }
+
+    #[test]
+    fn double_style_uses_double_bar_track() {
+        let s = ScrollInfo { total: 100, viewport: 10, position: 0 };
+        let col = scrollbar_column_style(s, "double");
+        assert_eq!(col[0], '█', "double thumb is block: {col:?}");
+        assert_eq!(*col.last().unwrap(), '║', "double track is double-bar: {col:?}");
     }
 }

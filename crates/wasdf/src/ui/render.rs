@@ -46,12 +46,33 @@ pub(crate) fn ratio_left(width: u16, lw: u32, rw: u32) -> u16 {
     ((width as u32 * lw) / (lw + rw)) as u16
 }
 
+/// Pre-compute the absolute X column of the function panel's left border for the
+/// current frame so `render_top` can place the bottom border path/filename labels.
+/// Returns `None` when the function panel is not visible this frame.
+fn compute_func_x(state: &AppState, main: Rect) -> Option<u16> {
+    use crate::core::Mode;
+    let show = match state.mode() {
+        Mode::Select(spec) => spec.function_hint.is_some(),
+        _ => state.function.visible,
+    };
+    if !show {
+        return None;
+    }
+    let (lw, rw) = state.function.ratio.weights();
+    // Replicate split_h's clamped left_w to find the shared column.
+    let target = ratio_left(main.width, lw, rw);
+    let left_w = target.clamp(2, main.width.saturating_sub(2).max(2));
+    Some(main.x + left_w - 1)
+}
+
 pub fn render(
     frame: &mut Frame,
     state: &AppState,
     extensions: &ExtensionRegistry,
     scroll: &mut ScrollMemory,
     notice: Option<&Notice>,
+    vfs: &crate::vfs::Vfs,
+    opts: &crate::ui::top::TopOptions,
 ) {
     let area = frame.area();
     if area.width < 4 || area.height < 4 {
@@ -74,13 +95,14 @@ pub fn render(
     // when it draws a scrollable frame this pass.
     scroll.reset_function_bounds();
     let mut panels: Vec<PanelFrame> = Vec::new();
-    crate::ui::top::render_top(frame, top, state, &mut panels);
+    let func_x = compute_func_x(state, main);
+    crate::ui::top::render_top(frame, top, state, vfs, &mut panels, opts, func_x);
     match state.mode() {
         Mode::Select(_) => crate::ui::middle::render_select_main(frame, main, state, extensions, scroll, &mut panels),
         _ => crate::ui::middle::render_file_main(frame, main, state, extensions, scroll, &mut panels),
     }
 
-    chrome::render(frame, &panels);
+    chrome::render(frame, &panels, &opts.border_style);
     crate::ui::bottom::render_bottom(frame, help, state);
 
     if let Some(n) = notice {
@@ -142,8 +164,13 @@ mod tests {
     use super::*;
     use crate::core::AppState;
     use crate::extension::ExtensionRegistry;
+    use crate::ui::top::TopOptions;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    fn top_opts() -> TopOptions {
+        TopOptions::default()
+    }
 
     fn exts() -> ExtensionRegistry {
         let mut e = ExtensionRegistry::new();
@@ -151,6 +178,10 @@ mod tests {
             e.register(x);
         }
         e
+    }
+
+    fn vfs() -> crate::vfs::Vfs {
+        crate::vfs::Vfs::default()
     }
 
     #[test]
@@ -170,7 +201,7 @@ mod tests {
         let mut state = AppState::new(std::env::temp_dir());
         state.function.visible = true;
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        terminal.draw(|f| render(f, &state, &exts, &mut ScrollMemory::default(), None)).unwrap();
+        terminal.draw(|f| render(f, &state, &exts, &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
         let buf = terminal.backend().buffer();
         let rgb_cells = buf.content.iter().filter(|c| matches!(c.fg, Color::Rgb(..))).count();
         assert!(rgb_cells > 0, "image content rendered no truecolor cells");
@@ -186,7 +217,7 @@ mod tests {
             Some(PanelContent::Lines { lines: vec!["EXTLINE".into()], styles: vec![Vec::new()] });
         state.function.content_owner = Some("example".into());
         let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None)).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
         let b = t.backend().buffer();
         let text: String = (0..b.area.height)
             .flat_map(|y| (0..b.area.width).map(move |x| (x, y)))
@@ -207,7 +238,7 @@ mod tests {
         state.function.search.matches = vec![(0, 0, 3)]; // "foo"
         state.function.search.current = 0;
         let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None)).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
         let buf = t.backend().buffer();
         // The current match renders on a LightCyan background (unique to the
         // search highlight; the nav uses plain Cyan).
@@ -229,7 +260,7 @@ mod tests {
 
         let mut mem = ScrollMemory::default();
         let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut mem, None)).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut mem, None, &vfs(), &top_opts())).unwrap();
 
         // The render measured a finite bound (content rows − viewport rows), well
         // below the over-scrolled value; the kernel's post-draw clamp pins to it so
@@ -254,7 +285,7 @@ mod tests {
 
         let mut mem = ScrollMemory::default();
         let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut mem, None)).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut mem, None, &vfs(), &top_opts())).unwrap();
 
         // The render measured a finite horizontal bound (content cols − viewport
         // cols); the kernel's post-draw clamp pins hscroll to it so the line never
@@ -284,12 +315,13 @@ mod tests {
                 created: None,
                 accessed: None,
                 symlink_target: None,
+                activation: None,
             })
             .collect();
         state.cursor = 0;
         let mut mem = ScrollMemory::default();
         let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut mem, None)).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut mem, None, &vfs(), &top_opts())).unwrap();
         // End-to-end: the render path measures multi-column geometry and reports
         // it back through list_geom() (what the kernel copies into AppState).
         let geom = mem.list_geom();
@@ -311,7 +343,7 @@ mod tests {
             label: "delete".into(),
         }))));
         let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None)).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
         let buf = t.backend().buffer();
         let text: String = (0..buf.area.height)
             .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
@@ -322,10 +354,147 @@ mod tests {
     }
 
     #[test]
+    fn bottom_border_padding_follows_border_style() {
+        // The padding/separators woven into the bottom border must match the active
+        // border style: a `rounded` frame uses `─`, never the double `═`.
+        use crate::core::Entry;
+        let cwd = std::path::PathBuf::from("/Users/szk/src/app");
+        let mut state = AppState::new(cwd.clone());
+        state.entries = vec![Entry {
+            path: cwd.join("kernel.rs"),
+            name: "kernel.rs".into(),
+            is_dir: false,
+            is_symlink: false,
+            size: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            modified: None,
+            created: None,
+            accessed: None,
+            symlink_target: None,
+            activation: None,
+        }];
+        state.cursor = 0;
+        state.function.visible = true;
+        let opts = TopOptions { border_style: "rounded".into(), ..TopOptions::default() };
+        let mut t = Terminal::new(TestBackend::new(90, 14)).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &opts)).unwrap();
+        let b = t.backend().buffer();
+        let y = 4; // divider row
+        let row: String = (0..b.area.width).map(|x| b[(x, y)].symbol()).collect();
+        assert!(!row.contains('═'), "rounded style must not emit double-rule `═`: {row:?}");
+        assert!(row.contains('─'), "rounded divider uses the single rule `─`: {row:?}");
+        assert!(row.contains("[ kernel.rs ]"), "filename still present: {row:?}");
+    }
+
+    #[test]
+    fn divider_separator_never_bleeds_function_title() {
+        // The function panel's title shares the divider row with the path/filename.
+        // When the `═` separator between the path and the filename lands exactly on
+        // the nav↔prop `┴` junction, the rule character yields to the junction —
+        // and the function title underneath must NOT show through (it used to bleed,
+        // e.g. `[ debug ]e[ examples ]`). The cell must carry the junction glyph.
+        use crate::core::{Entry, ReadResult};
+        use crate::core::state::Ratio;
+        let cwd = std::path::PathBuf::from("/Users/szk/src/github/wasdf/target/debug");
+        let mk = |n: &str| Entry {
+            path: cwd.join(n),
+            name: n.into(),
+            is_dir: true,
+            is_symlink: false,
+            size: 64,
+            mode: 0o40755,
+            uid: 501,
+            gid: 20,
+            modified: None,
+            created: None,
+            accessed: None,
+            symlink_target: None,
+            activation: None,
+        };
+        let mut state = AppState::new(cwd.clone());
+        state.entries = vec![mk("build"), mk("deps"), mk("examples"), mk("incremental")];
+        state.cursor = 2; // examples — its title equals the filename
+        state.function.visible = true;
+        let exts = exts();
+        exts.provider()
+            .unwrap()
+            .accept_content(&cwd.join("examples"), &ReadResult::Dir { entries: vec![] });
+
+        for ratio in [Ratio::R2_1, Ratio::R1_1, Ratio::R1_2] {
+            state.function.ratio = ratio;
+            for w in 78u16..=96 {
+                let mut t = Terminal::new(TestBackend::new(w, 14)).unwrap();
+                t.draw(|f| render(f, &state, &exts, &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
+                let b = t.backend().buffer();
+                let row: String = (0..b.area.width).map(|x| b[(x, 4)].symbol()).collect();
+                // The label `[ examples ]` must always be intact, and there must be
+                // no stray title letter wedged just before it (the separator slot is
+                // either a rule char or a junction glyph, never a letter).
+                assert!(row.contains("[ examples ]"), "{ratio:?} w={w}: filename broken: {row:?}");
+                if let Some(i) = row.find("[ examples ]") {
+                    // The char just before the label must be the path's `]`, a rule,
+                    // or a junction glyph — never a stray letter bled from the title.
+                    let prev = row[..i].chars().last().unwrap();
+                    assert!(
+                        matches!(prev, '═' | '─' | '-' | '┬' | '┴' | '┼' | '╦' | '╩' | '╬' | '┤' | '╣' | ']'),
+                        "{ratio:?} w={w}: stray '{prev}' bled before the filename: {row:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn divider_filename_survives_junction_overlap() {
+        // Regression: the bottom-border filename shares its row with the function
+        // panel's title (the shared top↔main divider). Where a top-area divider
+        // (`┴`/`╩`) lands inside the filename, the title used to bleed through —
+        // e.g. "command.scm" rendered as "comeand.scm" (the `e` from "[ content ]").
+        // The label's real characters must win over both the junction glyph and any
+        // bled title, so the filename stays intact at every width that fits it.
+        use crate::core::Entry;
+        let mut state = AppState::new(std::path::PathBuf::from(
+            "/Users/szk/src/github/wasdf/crates/wasdf/src/app",
+        ));
+        state.entries = vec![Entry {
+            path: std::path::PathBuf::from(
+                "/Users/szk/src/github/wasdf/crates/wasdf/src/app/command.scm",
+            ),
+            name: "command.scm".into(),
+            is_dir: false,
+            is_symlink: false,
+            size: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            modified: None,
+            created: None,
+            accessed: None,
+            symlink_target: None,
+            activation: None,
+        }];
+        state.cursor = 0;
+        state.function.visible = true;
+        // These widths all place a prop/monitor `┴` inside the filename region.
+        for w in [80u16, 81, 91, 100, 105, 108] {
+            let mut t = Terminal::new(TestBackend::new(w, 30)).unwrap();
+            t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
+            let b = t.backend().buffer();
+            let row: String = (0..b.area.width).map(|x| b[(x, 6)].symbol()).collect();
+            assert!(
+                row.contains("command.scm"),
+                "filename corrupted by junction/title overlap at width {w}: {row:?}",
+            );
+        }
+    }
+
+    #[test]
     fn help_is_negative_colored() {
         let state = AppState::new(std::env::temp_dir());
         let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None)).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
         let buf = t.backend().buffer();
         let y = buf.area.height - 1; // help row
         let reversed = (0..buf.area.width)
@@ -350,6 +519,7 @@ mod tests {
                 created: None,
                 accessed: None,
                 symlink_target: None,
+                activation: None,
             })
             .collect();
         // Count reverse-video cells (the help row reverses in both, so it cancels).
@@ -362,7 +532,7 @@ mod tests {
                 s.focused_panel = "function".into();
             }
             let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-            t.draw(|f| render(f, &s, &exts(), &mut ScrollMemory::default(), None)).unwrap();
+            t.draw(|f| render(f, &s, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
             let buf = t.backend().buffer();
             buf.content.iter().filter(|c| c.modifier.contains(Modifier::REVERSED)).count()
         };
@@ -376,7 +546,7 @@ mod tests {
     fn nav_renders_breadcrumb_columns() {
         let state = AppState::new(std::env::temp_dir().join("a").join("b"));
         let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None)).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
         let b = t.backend().buffer();
         let text: String = (0..b.area.height)
             .flat_map(|y| (0..b.area.width).map(move |x| (x, y)))
@@ -394,7 +564,7 @@ mod tests {
         let mut state = AppState::new(std::env::temp_dir());
         state.function.visible = true;
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None)).unwrap();
+        terminal.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
         let buf = terminal.backend().buffer();
         let (w, h) = (buf.area.width, buf.area.height);
         let row = |y: u16| -> String { (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>() };
@@ -416,7 +586,7 @@ mod tests {
         let mut state = AppState::new(std::env::temp_dir());
         state.function.visible = true;
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        terminal.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None)).unwrap();
+        terminal.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
         let buf = terminal.backend().buffer();
         let h = buf.area.height;
         // The corner where the top panel meets the main area: `└`, not `├`.
@@ -434,7 +604,7 @@ mod tests {
     fn borders_are_connected_with_junctions() {
         let state = AppState::new(std::env::temp_dir());
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        terminal.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None)).unwrap();
+        terminal.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
         let buf = terminal.backend().buffer();
         let (w, h) = (buf.area.width, buf.area.height);
         let row = |y: u16| -> String {

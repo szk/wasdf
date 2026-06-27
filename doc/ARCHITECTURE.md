@@ -24,8 +24,17 @@ are no per-service plugin traits.
 
 The only service trait is MatcherBackend (fuzzy ranking; one shipped
 implementation, SkimMatcher — the trait is a test seam, not an extension
-point). Services are defined by the embedded Scheme defaults and extended
-through the Extension trait ([EXTENSION.md](EXTENSION.md)).
+point). `rank_paths` applies a two-stage affinity re-rank on top of the skim
+base score: stage 1 scores all candidates using a tail-biased fuzzy pass (no
+I/O); stage 2 stats the top `RERANK_N` (800) survivors and applies configurable
+affinity adjustments (tail bonus, depth penalty, length penalty, exec bonus,
+preferred/noise extension lists, noise-directory penalty). Only the final 500
+results are returned, each carrying the already-read symlink metadata to avoid
+double-statting. Weights and lists are tunable under `@/settings/Matcher`; the
+`MatcherConfig` struct lives in `services/matcher.rs` so the worker thread can
+import it without creating a `runtime → app` circular dependency. Services are
+defined by the embedded Scheme defaults and extended through the Extension trait
+([EXTENSION.md](EXTENSION.md)).
 
 ## The Intent Pipeline
 
@@ -121,7 +130,7 @@ extension's function-panel content is loaded by the generic Read plan.
 | Plan | Representative intents | purpose | Execution | payload |
 |------|------------------------|---------|-----------|---------|
 | ReadDir | CursorRight on a directory, CursorLeft, NavigateTo, Refresh, ToggleDotFiles | refresh | async directory read | Entries |
-| Search | the file-search walk; the kernel applies matcher ranking in a blocking task | search | walk + rank | Entries (ranked) |
+| Search | the file-search walk; the kernel applies matcher ranking in a blocking task | search | walk + two-stage affinity re-rank | Entries (ranked) |
 | Read | cursor-follow content load (any function-panel content provider) | content | async read of a path: one **bounded byte chunk from an offset** (the owner pages further chunks by re-issuing `LoadContent` with a new offset), or a directory's entries | Read (owner + path + offset; ReadResult::Bytes{offset,bytes,eof} / Dir) |
 | ResolveAndRun | RunResolver (copy/move/rename/mkdir/touch/delete), Open, extension plans | resolver | Background: detached process, no output capture, completion notification only | OpDone |
 | Execute | Execute | execute | Captured: stdout streamed line-by-line into the Exec frame, stderr appended at exit | ExecOutput |

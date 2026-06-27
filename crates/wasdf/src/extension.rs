@@ -4,20 +4,24 @@
 //! directory matches only this list).
 
 pub mod archive;
+pub mod bookmarks;
 pub mod loader;
 pub mod preview;
 pub mod registry;
+pub mod settings;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use ratatui::text::Line;
 
 use crate::core::state::FunctionPanelState;
-use crate::core::{AppState, ExtensionIntent, Intent, ReadResult};
+use crate::core::{AppState, ExtensionIntent, Intent, OptionStore, ReadResult};
 use crate::script::condition::Conditions;
 use crate::script::keymap::Binding;
 use crate::services::command::CommandDef;
 use crate::services::resolver::ResolverEntry;
+use crate::vfs::VfsProvider;
 
 pub use registry::ExtensionRegistry;
 
@@ -69,6 +73,11 @@ pub trait Extension: Send {
         Vec::new()
     }
 
+    /// Called once after the option store is fully built (all extensions registered).
+    /// Extensions that need to read their own options stash the store here; the
+    /// default no-op leaves existing extensions unaffected.
+    fn bind_store(&self, _store: &Arc<OptionStore>) {}
+
     /// The extension's declarative Scheme source, evaluated in the resident Scheme session
     /// at registration. The `what/when` of the extension — keymaps and the like
     /// declared as data — as opposed to `keymaps()`, the native `how`. Returns a
@@ -78,8 +87,30 @@ pub trait Extension: Send {
         None
     }
 
+    /// Scheme source declaring this extension's options. Returns a quoted list of
+    /// `(option key category kind default label)` forms:
+    ///
+    /// ```scheme
+    /// (quote (
+    ///   (option "ext.tab-width" "Ext" (int 1 8) "4" "tab-width")))
+    /// ```
+    ///
+    /// Each declared option automatically appears in SETTINGS, persists to
+    /// `config.scm`, and is readable via the shared `OptionStore` — with zero
+    /// edits to core. Default `None` leaves no options (existing extensions are
+    /// unaffected).
+    fn option_scheme(&self) -> Option<String> {
+        None
+    }
+
     /// Resolver entries appended to the chain.
     fn resolver_entries(&self) -> Vec<ResolverEntry> {
+        Vec::new()
+    }
+
+    /// VFS providers contributed by this extension. Added after the embedded
+    /// defaults (filesystem, bookmarks), before the user layer.
+    fn vfs_providers(&self) -> Vec<Box<dyn VfsProvider>> {
         Vec::new()
     }
 
@@ -125,6 +156,8 @@ pub trait Extension: Send {
 }
 
 /// Construct the bundled extensions. The only place they are named.
+/// Note: `BookmarksExtension` is built separately in the kernel so it can share
+/// its `Arc` with the VFS bookmarks provider; it is registered there.
 pub fn bundled() -> Vec<Box<dyn Extension>> {
     vec![Box::new(preview::PreviewExtension::default()), Box::new(archive::ArchiveExtension)]
 }

@@ -525,7 +525,13 @@ fn render_function(
                 // The owning extension renders its content; core only blits it.
                 draw_function(frame, area, inner, draw, focused, mem, panels);
             } else {
-                let msg = if extensions.has_function_content() {
+                // No content to draw. Distinguish "nothing under the cursor"
+                // (an empty directory — there is nothing to preview) from a
+                // genuine in-flight load, so the panel never sits on a false
+                // "(loading…)" forever (doc/UI.md: empty-directory rule).
+                let msg = if state.current_entry().is_none() {
+                    "(empty)"
+                } else if extensions.has_function_content() {
                     "(loading…)"
                 } else {
                     "(no content)"
@@ -752,6 +758,7 @@ mod tests {
                 created: None,
                 accessed: None,
                 symlink_target: None,
+                activation: None,
             })
             .collect();
         s
@@ -798,6 +805,7 @@ mod tests {
                 created: None,
                 accessed: None,
                 symlink_target: None,
+                activation: None,
             })
             .collect();
         let (cols, _rows, widths) = list_geometry(&s.entries, s.list_layout, &s.selection,40);

@@ -56,7 +56,18 @@ pub fn run(cwd: PathBuf) -> io::Result<()> {
     });
 
     let result = loop {
-        if let Err(e) = term.draw(|f| app.ui.render(f, &app.state, &app.extensions)) {
+        let top_opts = {
+            let s = &app.store;
+            crate::ui::top::TopOptions {
+                border_style: s.get_str("border-style"),
+                nav_weight: s.get_u32("top.nav-weight").max(1),
+                prop_visible: s.get_bool("top.prop-visible"),
+                prop_weight: s.get_u32("top.prop-weight").max(1),
+                monitor_visible: s.get_bool("top.monitor-visible"),
+                monitor_weight: s.get_u32("top.monitor-weight").max(1),
+            }
+        };
+        if let Err(e) = term.draw(|f| app.ui.render(f, &app.state, &app.extensions, &app.vfs, &top_opts)) {
             break Err(e);
         }
         // The reducer advances function scroll/hscroll blindly (it can't see the

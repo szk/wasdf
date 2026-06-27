@@ -9,6 +9,7 @@ use crate::core::event::{AsyncResult, AsyncStatus, Payload, Plan, Purpose, Resol
 use crate::core::intent::{Intent, Key, KeyCode};
 use crate::core::mode::{Mode, SelectInput, SelectSource, SubLayout};
 use crate::core::state::{AppState, Ratio, SelectPhase, SelectState};
+use crate::vfs;
 
 /// A user-facing notice produced by the reducer for the event loop to display.
 #[derive(Debug, Clone, PartialEq)]
@@ -578,8 +579,26 @@ fn enter_dir(state: &mut AppState) -> Effects {
 }
 
 /// Escape to the parent directory, landing the cursor on the directory we left.
+///
+/// VFS climb-out rules (§4.3 of plan/vfs.md):
+/// - From real `/` → go to the VFS root `@`, landing on the `filesystem` entry.
+/// - From the VFS root `@` → no-op (already at the top).
+/// - Otherwise → lexical `parent()` as usual (works for both real and `@/…` paths).
 fn parent_dir(state: &mut AppState) -> Effects {
+    // Bridge: real root → VFS root (filesystem is the landing cursor).
+    if state.cwd == std::path::Path::new("/") {
+        state.pending_focus = Some(PathBuf::from("/"));
+        return enter_directory(state, vfs::vfs_root());
+    }
+    // No-op: already at the VFS root.
+    if state.cwd == vfs::vfs_root() {
+        return Effects::none();
+    }
     if let Some(parent) = state.cwd.parent().map(PathBuf::from) {
+        // Guard against the empty-path parent of a single-component relative path.
+        if parent.as_os_str().is_empty() {
+            return Effects::none();
+        }
         state.pending_focus = Some(state.cwd.clone());
         enter_directory(state, parent)
     } else {
@@ -587,13 +606,17 @@ fn parent_dir(state: &mut AppState) -> Effects {
     }
 }
 
-/// Activate the cursor entry (Enter): enter the directory, or **open the file**
-/// via the resolver (R2.3). Showing content is no longer an Enter behavior — that is `d`
-/// (cycle_content) / `,`. "d = look, Enter = do."
+/// Activate the cursor entry (Enter): forward a declared virtual intent, enter
+/// the directory, or **open the file** via the resolver (R2.3). "d = look,
+/// Enter = do."
 fn activate(state: &mut AppState) -> Effects {
     let Some(entry) = state.current_entry() else {
         return Effects::none();
     };
+    // Virtual leaf: forward the activation intent without interpreting it.
+    if let Some(ei) = entry.activation.clone() {
+        return Effects::emit(vec![Intent::Extension(ei)]);
+    }
     if entry.is_dir {
         enter_dir(state)
     } else {
@@ -603,8 +626,10 @@ fn activate(state: &mut AppState) -> Effects {
 }
 
 fn navigate_to(state: &mut AppState, path: PathBuf) -> Effects {
-    // A directory: enter it. A file: enter its parent and focus the file.
-    let (dir, focus) = if path.is_dir() {
+    // Virtual paths and real directories: enter directly.
+    // Real files: enter the parent and focus the file.
+    let is_dir = vfs::is_virtual(&path) || path.is_dir();
+    let (dir, focus) = if is_dir {
         (path.clone(), Some(path))
     } else {
         (path.parent().map(PathBuf::from).unwrap_or(path.clone()), Some(path))
@@ -1386,6 +1411,7 @@ mod tests {
                 created: None,
                 accessed: None,
                 symlink_target: None,
+                activation: None,
             })
             .collect()
     }
@@ -1542,6 +1568,78 @@ mod tests {
         assert_eq!(s.focused_panel, "function");
         mv(&mut s, Intent::FunctionSearchCancel);
         assert_eq!(s.focused_panel, "file");
+    }
+
+    // --- VFS virtual navigation -------------------------------------------
+
+    #[test]
+    fn navigate_to_virtual_path_treated_as_directory() {
+        let mut s = AppState::new(std::path::PathBuf::from("/d"));
+        let fx = apply_intent(&mut s, Intent::NavigateTo(PathBuf::from("@/settings")), &NoCommands);
+        // Emits ReadDir for the virtual location, not NavigateTo a parent.
+        assert!(matches!(fx.plans.as_slice(), [Plan::ReadDir { path, .. }] if path == &PathBuf::from("@/settings")));
+        assert_eq!(s.cwd, PathBuf::from("@/settings"));
+    }
+
+    #[test]
+    fn navigate_to_vfs_root_treated_as_directory() {
+        let mut s = AppState::new(std::path::PathBuf::from("/d"));
+        let fx = apply_intent(&mut s, Intent::NavigateTo(PathBuf::from("@")), &NoCommands);
+        assert!(matches!(fx.plans.as_slice(), [Plan::ReadDir { path, .. }] if path == &PathBuf::from("@")));
+        assert_eq!(s.cwd, PathBuf::from("@"));
+    }
+
+    #[test]
+    fn parent_from_real_root_goes_to_vfs_root() {
+        let mut s = AppState::new(std::path::PathBuf::from("/"));
+        let fx = apply_intent(&mut s, Intent::CursorLeft, &NoCommands);
+        assert!(matches!(fx.plans.as_slice(), [Plan::ReadDir { path, .. }] if path == &PathBuf::from("@")));
+        assert_eq!(s.cwd, PathBuf::from("@"));
+        // Landing cursor: the filesystem entry (path = "/").
+        assert_eq!(s.pending_focus.as_deref(), Some(std::path::Path::new("/")));
+    }
+
+    #[test]
+    fn parent_from_vfs_root_is_noop() {
+        let mut s = AppState::new(PathBuf::from("@"));
+        let fx = apply_intent(&mut s, Intent::CursorLeft, &NoCommands);
+        assert!(fx.plans.is_empty(), "CursorLeft at VFS root is a no-op");
+        assert_eq!(s.cwd, PathBuf::from("@"), "cwd unchanged");
+    }
+
+    #[test]
+    fn activate_virtual_leaf_forwards_extension_intent() {
+        use crate::core::{Entry, ExtensionIntent};
+        let mut s = AppState::new(PathBuf::from("@/bookmarks"));
+        let leaf = Entry {
+            path: PathBuf::from("@/bookmarks/0"),
+            name: "mydir".into(),
+            is_dir: false,
+            is_symlink: false,
+            size: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            modified: None,
+            created: None,
+            accessed: None,
+            symlink_target: None,
+            activation: Some(ExtensionIntent {
+                extension: "bookmarks".into(),
+                intent: "goto".into(),
+                data: crate::core::ExtensionValue::Nil,
+            }),
+        };
+        s.entries = vec![leaf];
+        s.cursor = 0;
+        let fx = apply_intent(&mut s, Intent::Activate, &NoCommands);
+        match fx.intents.as_slice() {
+            [Intent::Extension(ei)] => {
+                assert_eq!(ei.extension, "bookmarks");
+                assert_eq!(ei.intent, "goto");
+            }
+            other => panic!("expected Intent::Extension, got {other:?}"),
+        }
     }
 
     // --- cmdops: target + options + run ----------------------------------

@@ -5,10 +5,15 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::core::event::{ExecOutput, PanelContent};
+use crate::core::intent::ExtensionIntent;
 use crate::core::mode::{Mode, SubLayout};
 
 /// A single directory entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is intentionally absent: `activation` carries `ExtensionValue` which
+/// contains a `BTreeMap` that is only `PartialEq`. Nothing in the codebase
+/// requires `Entry: Eq` (selection uses `HashSet<PathBuf>` keyed on paths).
+#[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub path: PathBuf,
     pub name: String,
@@ -22,19 +27,61 @@ pub struct Entry {
     pub created: Option<SystemTime>,
     pub accessed: Option<SystemTime>,
     pub symlink_target: Option<PathBuf>,
+    /// What activating this virtual leaf does. `Some` → `Activate` forwards
+    /// this as `Intent::Extension` without interpreting it. `None` for all
+    /// real-FS entries and for virtual directory nodes.
+    pub activation: Option<ExtensionIntent>,
 }
 
 impl Entry {
     pub fn is_hidden(&self) -> bool {
         self.name.starts_with('.')
     }
+
+    /// Construct a virtual directory entry (no real I/O metadata).
+    pub fn virtual_dir(path: PathBuf, name: String) -> Self {
+        Entry {
+            path,
+            name,
+            is_dir: true,
+            is_symlink: false,
+            size: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            modified: None,
+            created: None,
+            accessed: None,
+            symlink_target: None,
+            activation: None,
+        }
+    }
+
+    /// Construct a virtual leaf entry (no real I/O metadata; caller sets `activation`).
+    pub fn virtual_leaf(path: PathBuf, name: String) -> Self {
+        Entry {
+            path,
+            name,
+            is_dir: false,
+            is_symlink: false,
+            size: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            modified: None,
+            created: None,
+            accessed: None,
+            symlink_target: None,
+            activation: None,
+        }
+    }
 }
 
 /// A navigable list of entries with a cursor: the single "entry list + cursor"
 /// value shared by the file panel (the current directory) and any path-valued
 /// Select (e.g. file-search results). Both render and navigate through the same
-/// code, so a future Virtual File System only has to produce an `EntryList`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// code, so a Virtual File System only has to produce an `EntryList`.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EntryList {
     pub entries: Vec<Entry>,
     pub cursor: usize,

@@ -182,6 +182,22 @@ no Scheme round trip at render time. Loading a different file resets the scroll
 positions and any active search (`ResetContentView`, dispatched when new content
 arrives).
 
+**Empty directory (no entry under the cursor).** When the directory is empty (or
+nothing is otherwise under the cursor) while the panel is following, there is
+nothing to preview: the provider **drops its stashed content** so the previous
+file's content and title do not linger, and the content frame shows the `(empty)`
+placeholder (matching the prop panel). This is a property of *following with no
+target*, not of hiding the panel — a panel that is merely hidden keeps its stash,
+so toggling it back does not force a reload. The file panel itself simply shows
+no rows.
+
+A content read that was already **in flight** when the cursor left its target
+(e.g. it was loading the previous file when you stepped into the empty directory)
+is **dropped on arrival**: the kernel discards any content completion whose path
+is no longer under the cursor, so a late read cannot re-populate the preview the
+clear just emptied. This is the same stale-result discipline the async round-trip
+contract applies elsewhere (doc/ARCHITECTURE.md).
+
 ### Renderers
 
 The content frame draws one of these. Extension content (whether a bundled

@@ -2,6 +2,7 @@
 //! types: resolver entries, palette commands, and keymap bindings. Shared by
 //! the embedded-default loader (kernel boot) and the optional-extension loader.
 
+use crate::core::{OptionDef, OptionKind};
 use crate::script::codec;
 use crate::script::condition::Cond;
 use crate::script::keymap::{Binding, Layer};
@@ -92,6 +93,77 @@ pub fn parse_command_config(datum: &Datum) -> Result<Vec<CommandDef>, String> {
     Ok(out)
 }
 
+/// Map an option-config datum (the inner list of a `(quote (…))` form) into
+/// `OptionDef` records. Each element must be an `(option key category kind
+/// default label)` form as documented in `plan/scm_setting.md §4`.
+pub fn parse_option_config(datum: &Datum) -> Result<Vec<OptionDef>, String> {
+    let forms = datum.as_list().ok_or("option config is not a list")?;
+    let mut out = Vec::new();
+    for form in forms {
+        let parts = form.as_list().ok_or("option form is not a list")?;
+        let head =
+            parts.first().and_then(|d| d.as_sym()).ok_or("option form missing head symbol")?;
+        if head != "option" {
+            return Err(format!("expected 'option' form, got '{head}'"));
+        }
+        let key =
+            parts.get(1).and_then(|d| d.as_str()).ok_or("option missing key")?.to_string();
+        let category = parts
+            .get(2)
+            .and_then(|d| d.as_str())
+            .ok_or("option missing category")?
+            .to_string();
+        let kind_datum = parts.get(3).ok_or("option missing kind")?;
+        let kind = parse_option_kind(kind_datum)?;
+        let default =
+            parts.get(4).and_then(|d| d.as_str()).ok_or("option missing default")?.to_string();
+        let label =
+            parts.get(5).and_then(|d| d.as_str()).ok_or("option missing label")?.to_string();
+        out.push(OptionDef { key, category, label, kind, default });
+    }
+    Ok(out)
+}
+
+fn parse_option_kind(datum: &Datum) -> Result<OptionKind, String> {
+    match datum {
+        Datum::Sym(s) => match s.as_str() {
+            "bool" => Ok(OptionKind::Bool),
+            "text" => Ok(OptionKind::Text),
+            "list" => Ok(OptionKind::List),
+            other => Err(format!("unknown option kind symbol: {other}")),
+        },
+        Datum::List(items) => {
+            let head = items
+                .first()
+                .and_then(|d| d.as_sym())
+                .ok_or("kind list missing head symbol")?;
+            match head {
+                "int" => {
+                    let min = match items.get(1) {
+                        Some(Datum::Int(n)) => *n,
+                        _ => return Err("int kind missing or non-integer min".into()),
+                    };
+                    let max = match items.get(2) {
+                        Some(Datum::Int(n)) => *n,
+                        _ => return Err("int kind missing or non-integer max".into()),
+                    };
+                    Ok(OptionKind::Int { min, max })
+                }
+                "choice" => {
+                    let choices: Vec<String> =
+                        items[1..].iter().filter_map(|d| d.as_str().map(String::from)).collect();
+                    if choices.is_empty() {
+                        return Err("choice kind has no options".into());
+                    }
+                    Ok(OptionKind::Choice(choices))
+                }
+                other => Err(format!("unknown kind form head: {other}")),
+            }
+        }
+        _ => Err("option kind must be a symbol or list".into()),
+    }
+}
+
 /// Map a keymap-config datum (a list of groups) into bindings at `layer`.
 pub fn parse_keymap_config(datum: &Datum, layer: Layer) -> Result<Vec<Binding>, String> {
     let groups = datum.as_list().ok_or("keymap config is not a list")?;
@@ -121,4 +193,92 @@ pub fn parse_keymap_config(datum: &Datum, layer: Layer) -> Result<Vec<Binding>, 
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::script::sexpr::parse;
+
+    fn eval_quote(src: &str) -> Datum {
+        // Parse `(quote (...))` and extract the inner list (the second element).
+        let outer = parse(src).expect("parse failed");
+        let list = outer.as_list().expect("outer is not a list");
+        list.get(1).cloned().expect("quote has no inner datum")
+    }
+
+    #[test]
+    fn parse_bool_option() {
+        let d = eval_quote(r##"(quote ((option "x" "Cat" bool "#f" "x-label")))"##);
+        let defs = parse_option_config(&d).unwrap();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].key, "x");
+        assert_eq!(defs[0].category, "Cat");
+        assert_eq!(defs[0].label, "x-label");
+        assert_eq!(defs[0].kind, OptionKind::Bool);
+        assert_eq!(defs[0].default, "#f");
+    }
+
+    #[test]
+    fn parse_int_option() {
+        let d = eval_quote(r#"(quote ((option "n" "C" (int 1 99) "5" "n-label")))"#);
+        let defs = parse_option_config(&d).unwrap();
+        assert_eq!(defs[0].kind, OptionKind::Int { min: 1, max: 99 });
+        assert_eq!(defs[0].default, "5");
+    }
+
+    #[test]
+    fn parse_choice_option() {
+        let d = eval_quote(
+            r#"(quote ((option "c" "C" (choice "a" "b" "c") "a" "c-label")))"#,
+        );
+        let defs = parse_option_config(&d).unwrap();
+        assert_eq!(
+            defs[0].kind,
+            OptionKind::Choice(vec!["a".into(), "b".into(), "c".into()])
+        );
+    }
+
+    #[test]
+    fn parse_list_and_text_options() {
+        let d = eval_quote(
+            r#"(quote (
+              (option "l" "C" list "" "l-label")
+              (option "t" "C" text "" "t-label")))"#,
+        );
+        let defs = parse_option_config(&d).unwrap();
+        assert_eq!(defs[0].kind, OptionKind::List);
+        assert_eq!(defs[1].kind, OptionKind::Text);
+    }
+
+    #[test]
+    fn parse_multiple_options() {
+        let d = eval_quote(
+            r##"(quote (
+              (option "a" "Display" bool "#t" "a-label")
+              (option "b" "Matcher" (int 0 100) "16" "b-label")))"##,
+        );
+        let defs = parse_option_config(&d).unwrap();
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].category, "Display");
+        assert_eq!(defs[1].category, "Matcher");
+    }
+
+    #[test]
+    fn parse_option_missing_key_is_error() {
+        let d = eval_quote(r#"(quote ((option)))"#);
+        assert!(parse_option_config(&d).is_err());
+    }
+
+    #[test]
+    fn parse_option_unknown_kind_is_error() {
+        let d = eval_quote(r#"(quote ((option "k" "C" weird "x" "l")))"#);
+        assert!(parse_option_config(&d).is_err());
+    }
+
+    #[test]
+    fn parse_option_empty_choice_is_error() {
+        let d = eval_quote(r#"(quote ((option "k" "C" (choice) "x" "l")))"#);
+        assert!(parse_option_config(&d).is_err());
+    }
 }

@@ -413,6 +413,7 @@ mod tests {
             created: None,
             accessed: None,
             symlink_target: None,
+            activation: None,
         }];
         match ext.on_cursor_changed(&cursor_state).as_slice() {
             [Intent::ShowFunctionContent { owner, content: crate::core::PanelContent::Lines { lines, .. } }] => {

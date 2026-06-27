@@ -17,6 +17,7 @@ mod runtime;
 mod script;
 mod services;
 mod ui;
+mod vfs;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

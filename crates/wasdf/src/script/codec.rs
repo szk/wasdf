@@ -128,6 +128,11 @@ pub fn intent_from_datum(d: &Datum) -> Option<Intent> {
                     let spec = SelectSpec::command(template, ResolveFill::Path, Vec::new(), None);
                     Some(Intent::PushMode(Box::new(Mode::Select(spec))))
                 }
+                // (navigate-to "path") — navigate to a real or virtual path.
+                "navigate-to" => {
+                    let path = items.get(1)?.text()?.to_string();
+                    Some(Intent::NavigateTo(std::path::PathBuf::from(path)))
+                }
                 // (ext "extension-id" "intent-id" [data]) — an extension intent.
                 "ext" => {
                     let extension = items.get(1)?.text()?.to_string();
