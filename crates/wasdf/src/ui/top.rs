@@ -14,11 +14,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::core::AppState;
+use crate::core::{AppState, Role, Theme};
 use crate::ui::chrome::{self, PanelFrame};
 use crate::ui::render::split_h;
 
@@ -38,6 +38,10 @@ pub struct TopOptions {
     pub monitor_visible: bool,
     /// Relative width weight for the monitor panel (default 2).
     pub monitor_weight: u32,
+    /// Per-metric monitor customization.
+    pub monitor: MonitorOptions,
+    /// Scrollbar glyphs.
+    pub scrollbar: crate::ui::chrome::ScrollbarChars,
 }
 
 impl Default for TopOptions {
@@ -49,6 +53,74 @@ impl Default for TopOptions {
             prop_weight: 2,
             monitor_visible: true,
             monitor_weight: 2,
+            monitor: MonitorOptions::default(),
+            scrollbar: crate::ui::chrome::ScrollbarChars::default(),
+        }
+    }
+}
+
+/// Per-metric monitor display customization (CPU / Memory / Disk / Network).
+#[derive(Clone)]
+pub struct MetricCfg {
+    /// Show this metric's row at all.
+    pub visible: bool,
+    /// Show the gauge.
+    pub bar: bool,
+    /// Show the value (label) text.
+    pub label: bool,
+    /// Columns always reserved for the value at the right edge of the row.
+    pub label_max: u32,
+    /// Resample interval in seconds.
+    pub refresh: u64,
+    /// Window (seconds) over which the graph's full-scale peak is taken.
+    pub graph_window: u64,
+    /// Gauge style: `bar` (horizontal fill) | `blocks` | `braille` (sparklines).
+    pub bar_kind: String,
+}
+
+impl Default for MetricCfg {
+    fn default() -> Self {
+        MetricCfg {
+            visible: true,
+            bar: true,
+            label: true,
+            label_max: 24,
+            refresh: 2,
+            graph_window: 600,
+            bar_kind: "bar".into(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct MonitorOptions {
+    pub cpu: MetricCfg,
+    pub mem: MetricCfg,
+    pub dsk: MetricCfg,
+    pub net: MetricCfg,
+}
+
+impl MonitorOptions {
+    /// Build per-metric config from the option store (`monitor.<metric>.*`).
+    pub fn from_store(s: &crate::core::OptionStore) -> Self {
+        let cfg = |m: &str| MetricCfg {
+            visible: s.get_bool(&format!("monitor.{m}.visible")),
+            bar: s.get_bool(&format!("monitor.{m}.bar")),
+            label: s.get_bool(&format!("monitor.{m}.label")),
+            label_max: s.get_u32(&format!("monitor.{m}.label-max")),
+            refresh: s.get_i64(&format!("monitor.{m}.refresh")).max(1) as u64,
+            graph_window: s.get_i64(&format!("monitor.{m}.graph-window")).max(1) as u64,
+            bar_kind: s.get_str(&format!("monitor.{m}.bar-kind")),
+        };
+        MonitorOptions { cpu: cfg("cpu"), mem: cfg("mem"), dsk: cfg("dsk"), net: cfg("net") }
+    }
+
+    fn get(&self, id: &str) -> &MetricCfg {
+        match id {
+            "cpu" => &self.cpu,
+            "mem" => &self.mem,
+            "dsk" => &self.dsk,
+            _ => &self.net,
         }
     }
 }
@@ -70,6 +142,7 @@ pub fn render_top(
     panels: &mut Vec<PanelFrame>,
     opts: &TopOptions,
     func_x: Option<u16>,
+    theme: &Theme,
 ) {
     let (nav_r, prop_r, mon_r) = layout_panels(area, opts);
 
@@ -83,12 +156,12 @@ pub fn render_top(
     let sep = h_rule(&opts.border_style);
     let (nav_bottom, nav_bottom_right) = plan_bottom_labels(&cwd_str, name, area, func_x, sep);
 
-    render_nav(frame, nav_r, state, vfs, panels, nav_bottom, nav_bottom_right);
+    render_nav(frame, nav_r, state, vfs, panels, nav_bottom, nav_bottom_right, theme);
     if let Some(r) = prop_r {
-        render_prop(frame, r, state, panels);
+        render_prop(frame, r, state, panels, theme);
     }
     if let Some(r) = mon_r {
-        render_monitor(frame, r, state, panels, &opts.border_style);
+        render_monitor(frame, r, state, panels, &opts.border_style, &opts.monitor, theme);
     }
 }
 
@@ -319,8 +392,9 @@ fn render_nav(
     panels: &mut Vec<PanelFrame>,
     nav_bottom: String,
     nav_bottom_right: Option<(u16, String)>,
+    theme: &Theme,
 ) {
-    let banner = format!("/ wasdf ver.{} /", env!("CARGO_PKG_VERSION"));
+    let banner = format!("/ wasdf v{} /", env!("CARGO_PKG_VERSION"));
     let mut pf = PanelFrame::new(area).banner(banner).bottom_info(nav_bottom);
     if let Some((x, text)) = nav_bottom_right {
         pf = pf.bottom_right(x, text);
@@ -375,10 +449,10 @@ fn render_nav(
     let total_w = col_x.last().copied().unwrap_or(0) + widths.last().copied().unwrap_or(0);
     let scroll_x: u16 = total_w.saturating_sub(avail);
 
-    let path_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
-    let cwd_style = Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD);
-    let sib_style = Style::default().fg(Color::DarkGray);
-    let link_style = Style::default().fg(Color::DarkGray);
+    let path_style = Style::default().fg(theme.role(Role::PathActive)).add_modifier(Modifier::BOLD);
+    let cwd_style = Style::default().fg(theme.role(Role::NavCursorFg)).bg(theme.role(Role::NavCursorBg)).add_modifier(Modifier::BOLD);
+    let sib_style = Style::default().fg(theme.role(Role::PathMuted));
+    let link_style = Style::default().fg(theme.role(Role::PathMuted));
 
     let buf = frame.buffer_mut();
     let center_y = inner.y + mid as u16;
@@ -508,7 +582,7 @@ fn nav_put(buf: &mut Buffer, inner: Rect, x: u16, y: u16, ch: char, style: Style
 // ── Prop panel ────────────────────────────────────────────────────────────────
 
 /// The prop panel: SIZE / OWNR / PERM / TIME / INFO.
-fn render_prop(frame: &mut Frame, area: Rect, state: &AppState, panels: &mut Vec<PanelFrame>) {
+fn render_prop(frame: &mut Frame, area: Rect, state: &AppState, panels: &mut Vec<PanelFrame>, theme: &Theme) {
     let inner = chrome::inner(area);
     let w = inner.width as usize;
 
@@ -517,16 +591,19 @@ fn render_prop(frame: &mut Frame, area: Rect, state: &AppState, panels: &mut Vec
             prop_line(
                 "SIZE",
                 &format!("{} ({} B)", wasdf_sdk::format_size(e.size), e.size),
-                w,
+                w, Role::PropSizeLabel, Role::PropSizeValue, theme,
             ),
             prop_line(
                 "OWNR",
                 &format!("{}  {}", uid_name(e.uid), gid_name(e.gid)),
-                w,
+                w, Role::PropOwnerLabel, Role::PropOwnerValue, theme,
             ),
-            prop_line("PERM", &wasdf_sdk::format_permissions(e.mode), w),
-            prop_line("TIME", &fmt_time(e.modified, true), w),
-            prop_line("INFO", &file_info(e), w),
+            prop_line("PERM", &wasdf_sdk::format_permissions(e.mode), w,
+                Role::PropPermLabel, Role::PropPermValue, theme),
+            prop_line("TIME", &fmt_time(e.modified, true), w,
+                Role::PropTimeLabel, Role::PropTimeValue, theme),
+            prop_line("INFO", &file_info(e), w,
+                Role::PropInfoLabel, Role::PropInfoValue, theme),
         ],
         None => vec![Line::from("(empty)")],
     };
@@ -536,63 +613,47 @@ fn render_prop(frame: &mut Frame, area: Rect, state: &AppState, panels: &mut Vec
 
 // ── Monitor panel ─────────────────────────────────────────────────────────────
 
-/// The monitor panel: CPU load, memory, disk, network interfaces.
+/// The monitor panel: CPU load, memory, disk, network throughput. Each metric's
+/// visibility, gauge/value, ratio, refresh cadence, and gauge style are driven by
+/// its `MetricCfg` (configured under `@/settings/Layout/Monitor/<Metric>`).
 fn render_monitor(
     frame: &mut Frame,
     area: Rect,
     state: &AppState,
     panels: &mut Vec<PanelFrame>,
     border_style: &str,
+    mon: &MonitorOptions,
+    theme: &Theme,
 ) {
     let inner = chrome::inner(area);
     let w = inner.width as usize;
 
     let mut lines: Vec<Line> = Vec::new();
-    // BAR_OVERHEAD: "▐" + "▌ " = 3 chars wrapping the bar; LABEL_W: "XYZ " = 4 chars.
-    const BAR_OVERHEAD: usize = 3;
-    const LABEL_W: usize = 4;
-
-    // CPU: load averages
-    if let Some([la1, la5, la15]) = loadavg() {
-        let ratio = (la1 / 4.0_f64).clamp(0.0, 1.0);
-        let val = format!("{la1:.2} {la5:.2} {la15:.2}");
-        let bar_w = w.saturating_sub(LABEL_W + BAR_OVERHEAD + val.chars().count());
-        if bar_w >= 1 {
-            lines.push(monitor_row("CPU", &mini_bar(ratio, bar_w), &val, w));
-        } else {
-            lines.push(monitor_row("CPU", "", &format!("{la1:.2}"), w));
+    // (id, display name, label/bar/value roles).
+    let metrics: [(&str, &str, Role, Role, Role); 4] = [
+        ("cpu", "CPU", Role::MonitorCpuLabel, Role::MonitorCpuBar, Role::MonitorCpuValue),
+        ("mem", "MEM", Role::MonitorMemLabel, Role::MonitorMemBar, Role::MonitorMemValue),
+        ("dsk", "DSK", Role::MonitorDskLabel, Role::MonitorDskBar, Role::MonitorDskValue),
+        ("net", "NET", Role::MonitorNetLabel, Role::MonitorNetBar, Role::MonitorNetValue),
+    ];
+    for (id, name, lbl_role, bar_role, val_role) in metrics {
+        let cfg = mon.get(id);
+        if !cfg.visible {
+            continue;
         }
-    }
-
-    // MEM
-    if let Some((mem_total, mem_used)) = mem_info() {
-        let ratio = if mem_total > 0 { mem_used as f64 / mem_total as f64 } else { 0.0 };
-        let val = format!("{}/{}", wasdf_sdk::format_size(mem_used), wasdf_sdk::format_size(mem_total));
-        let bar_w = w.saturating_sub(LABEL_W + BAR_OVERHEAD + val.chars().count());
-        if bar_w >= 1 {
-            lines.push(monitor_row("MEM", &mini_bar(ratio, bar_w), &val, w));
-        } else {
-            lines.push(monitor_row("MEM", "", &wasdf_sdk::format_size(mem_used), w));
+        // Disk is special: it shows read/write operation rates as two gauges.
+        if id == "dsk" {
+            let ds = disk_runtime(cfg.refresh, cfg.graph_window);
+            lines.push(disk_row(&cfg, &ds, w, lbl_role, bar_role, val_role, theme));
+            continue;
         }
-    }
-
-    // DSK: disk usage of the current directory's filesystem
-    if let Some((dsk_total, dsk_avail)) = disk_info(&state.cwd) {
-        let dsk_used = dsk_total.saturating_sub(dsk_avail);
-        let ratio = if dsk_total > 0 { dsk_used as f64 / dsk_total as f64 } else { 0.0 };
-        let val = format!("{} free", wasdf_sdk::format_size(dsk_avail));
-        let bar_w = w.saturating_sub(LABEL_W + BAR_OVERHEAD + val.chars().count());
-        if bar_w >= 1 {
-            lines.push(monitor_row("DSK", &mini_bar(ratio, bar_w), &val, w));
-        } else {
-            lines.push(monitor_row("DSK", "", &wasdf_sdk::format_size(dsk_avail), w));
+        if let Some((ratio, value, history)) =
+            metric_runtime(id, cfg.refresh, cfg.graph_window, &state.cwd)
+        {
+            lines.push(metric_row(
+                name, &cfg, ratio, &value, &history, w, lbl_role, bar_role, val_role, theme,
+            ));
         }
-    }
-
-    // NET: active non-loopback interfaces
-    let ifaces = active_interfaces();
-    if !ifaces.is_empty() {
-        lines.push(monitor_row("NET", "", &ifaces.join(" "), w));
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -622,21 +683,210 @@ fn render_monitor(
 /// A filled-░ progress bar of `width` characters representing `ratio` ∈ [0,1].
 fn mini_bar(ratio: f64, width: usize) -> String {
     let filled = (ratio.clamp(0.0, 1.0) * width as f64).round() as usize;
-    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+    format!("{}{}", "█".repeat(filled), "░".repeat(width.saturating_sub(filled)))
 }
 
-/// One monitor row: `LABEL ▐bar▌ value` (all truncated to `width`).
-fn monitor_row(label: &str, bar: &str, value: &str, width: usize) -> Line<'static> {
-    let lbl = format!("{label} ");
-    let bar_part: String = if bar.is_empty() { String::new() } else { format!("▐{bar}▌ ") };
-    let used = lbl.chars().count() + bar_part.chars().count();
-    let avail = width.saturating_sub(used);
-    let val: String = value.chars().take(avail).collect();
-    Line::from(vec![
-        Span::styled(lbl, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(bar_part, Style::default().fg(Color::Green)),
-        Span::raw(val),
-    ])
+/// A block-character sparkline of `width` columns over the most recent history
+/// (`▁▂▃▄▅▆▇█`), left-padded with spaces when there are fewer samples than columns.
+fn block_sparkline(history: &[f64], width: usize) -> String {
+    const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let recent = &history[history.len().saturating_sub(width)..];
+    let mut s = String::new();
+    for _ in 0..width.saturating_sub(recent.len()) {
+        s.push(' ');
+    }
+    for &r in recent {
+        let level = (r.clamp(0.0, 1.0) * 8.0).round() as usize;
+        s.push(BLOCKS[level.min(8)]);
+    }
+    s
+}
+
+/// A braille sparkline of `width` characters (each cell packs two samples × four
+/// dot rows) over the most recent history, left-padded with blanks.
+fn braille_sparkline(history: &[f64], width: usize) -> String {
+    // Per-column dot bits, bottom→top: left col [dot7,dot3,dot2,dot1], right col
+    // [dot8,dot6,dot5,dot4]. A value of height h fills the bottom h dots.
+    const LEFT: [u8; 4] = [0x40, 0x04, 0x02, 0x01];
+    const RIGHT: [u8; 4] = [0x80, 0x20, 0x10, 0x08];
+    let needed = width * 2;
+    let recent = &history[history.len().saturating_sub(needed)..];
+    // Left-pad the sample window so the latest sample sits at the right edge.
+    let mut samples: Vec<f64> = std::iter::repeat(0.0)
+        .take(needed.saturating_sub(recent.len()))
+        .chain(recent.iter().copied())
+        .collect();
+    samples.truncate(needed);
+
+    let height = |r: f64| (r.clamp(0.0, 1.0) * 4.0).round() as usize;
+    let mut s = String::new();
+    for col in 0..width {
+        let lh = height(samples[col * 2]);
+        let rh = height(samples[col * 2 + 1]);
+        let mut bits = 0u8;
+        for b in LEFT.iter().take(lh) {
+            bits |= b;
+        }
+        for b in RIGHT.iter().take(rh) {
+            bits |= b;
+        }
+        s.push(char::from_u32(0x2800 + bits as u32).unwrap_or(' '));
+    }
+    s
+}
+
+/// Render one metric row honoring its `MetricCfg`: the name, an optional gauge
+/// (style per `bar_kind`), and an optional value. `label_max` columns are always
+/// reserved for the value at the right edge, so the gauge width stays stable
+/// regardless of how the value's text length changes.
+#[allow(clippy::too_many_arguments)]
+fn metric_row(
+    name: &str,
+    cfg: &MetricCfg,
+    ratio: f64,
+    value: &str,
+    history: &[f64],
+    width: usize,
+    label_role: Role,
+    bar_role: Role,
+    value_role: Role,
+    theme: &Theme,
+) -> Line<'static> {
+    let name_str = format!("{name} ");
+    let avail = width.saturating_sub(name_str.chars().count());
+    // The value field: a fixed `label_max` columns reserved at the right edge.
+    let value_w = if cfg.label { (cfg.label_max as usize).min(avail) } else { 0 };
+    let sep = usize::from(value_w > 0); // one column between gauge and value
+    let bar_w = avail.saturating_sub(value_w + sep);
+
+    let val_style = Style::default().fg(cascade_fg(theme, value_role));
+    let mut spans = vec![Span::styled(
+        name_str,
+        Style::default().fg(theme.role(label_role)).add_modifier(Modifier::BOLD),
+    )];
+    if bar_w >= 1 {
+        if cfg.bar {
+            // Sparklines auto-range to the window's min..max so movement shows
+            // even for a near-constant signal; the fill bar shows the absolute ratio.
+            let (mn, mx) = range(history);
+            let bar = match cfg.bar_kind.as_str() {
+                "blocks" => block_sparkline(&scale_minmax(history, mn, mx), bar_w),
+                "braille" => braille_sparkline(&scale_minmax(history, mn, mx), bar_w),
+                _ => mini_bar(ratio, bar_w), // "bar" and any unknown value
+            };
+            spans.push(Span::styled(bar, Style::default().fg(theme.role(bar_role))));
+        } else {
+            // Keep the value at the right edge even with the gauge hidden.
+            spans.push(Span::styled(" ".repeat(bar_w), val_style));
+        }
+    }
+    if value_w > 0 {
+        spans.push(Span::styled(" ".repeat(sep), val_style));
+        spans.push(Span::styled(fit_right(value, value_w), val_style));
+    }
+    Line::from(spans)
+}
+
+/// Right-align `s` in `w` columns (truncate the tail when too long, pad left).
+fn fit_right(s: &str, w: usize) -> String {
+    if w == 0 {
+        return String::new();
+    }
+    let t: String = s.chars().take(w).collect();
+    format!("{t:>w$}")
+}
+
+/// Left-align `s` in `w` columns (truncate the tail when too long, pad right).
+fn fit_left(s: &str, w: usize) -> String {
+    if w == 0 {
+        return String::new();
+    }
+    let t: String = s.chars().take(w).collect();
+    format!("{t:<w$}")
+}
+
+/// Sample one metric: its current gauge ratio (0..1) and value text. CPU/MEM may
+/// be `None` on unsupported platforms; NET always yields a value. (Disk is
+/// handled separately by `disk_runtime` — it shows read/write op rates.)
+fn sample_metric(id: &str, _cwd: &std::path::Path) -> Option<(f64, String)> {
+    match id {
+        "cpu" => loadavg().map(|[la1, _, _]| ((la1 / 4.0).clamp(0.0, 1.0), format!("{la1:.2}"))),
+        "mem" => mem_info().map(|(total, used)| {
+            // Show available memory only (Linux MemAvailable; the free-memory
+            // equivalent on macOS) — the total/max is intentionally not shown.
+            // The gauge still tracks used pressure.
+            let ratio = if total > 0 { used as f64 / total as f64 } else { 0.0 };
+            let available = total.saturating_sub(used);
+            (ratio, wasdf_sdk::format_size(available))
+        }),
+        "net" => {
+            let (avg5, avg60) = net_stats();
+            let ratio = if avg60 > 0 { (avg5 as f64 / avg60 as f64).clamp(0.0, 1.0) } else { 0.0 };
+            Some((ratio, format!("{}/s", wasdf_sdk::format_size(avg5))))
+        }
+        _ => None,
+    }
+}
+
+/// The number of samples spanning `window` seconds at the `refresh` cadence — the
+/// rolling history length, so the graph's full-scale peak is the max over the
+/// configured window.
+fn window_samples(refresh: u64, window: u64) -> usize {
+    (window / refresh.max(1)).max(1) as usize
+}
+
+/// Per-metric runtime: throttles resampling to the configured `refresh` cadence
+/// and keeps a `graph_window`-long rolling ratio history for the sparkline gauges.
+/// Returns the cached `(ratio, value, history)` or `None` if the metric has never
+/// produced a sample.
+fn metric_runtime(id: &'static str, refresh: u64, graph_window: u64, cwd: &std::path::Path)
+    -> Option<(f64, String, Vec<f64>)>
+{
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    #[derive(Default)]
+    struct MetricState {
+        last: Option<Instant>,
+        ratio: f64,
+        value: String,
+        history: VecDeque<f64>,
+        have: bool,
+    }
+    static RT: OnceLock<Mutex<HashMap<&'static str, MetricState>>> = OnceLock::new();
+
+    let cap = window_samples(refresh, graph_window);
+    let now = Instant::now();
+    let mut map = RT.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
+    let st = map.entry(id).or_default();
+    let due = st.last.map(|t| now.duration_since(t).as_secs() >= refresh).unwrap_or(true);
+    if due {
+        if let Some((ratio, value)) = sample_metric(id, cwd) {
+            st.ratio = ratio;
+            st.value = value;
+            st.history.push_back(ratio);
+            st.last = Some(now);
+            st.have = true;
+        } else if !st.have {
+            return None;
+        }
+    }
+    while st.history.len() > cap {
+        st.history.pop_front();
+    }
+    if !st.have {
+        return None;
+    }
+    Some((st.ratio, st.value.clone(), st.history.iter().copied().collect()))
+}
+
+/// `Fg`-cascade: if the specific role resolves to Reset, fall back to the
+/// global `Fg` role, which itself defaults to Reset (terminal default).
+#[inline]
+fn cascade_fg(theme: &Theme, role: Role) -> ratatui::style::Color {
+    let c = theme.role(role);
+    if c == ratatui::style::Color::Reset { theme.role(Role::Fg) } else { c }
 }
 
 /// Total and used physical memory in bytes.
@@ -696,45 +946,415 @@ fn mem_info() -> Option<(u64, u64)> {
     { None }
 }
 
-/// Total and available bytes on the filesystem containing `path`.
-fn disk_info(path: &std::path::Path) -> Option<(u64, u64)> {
-    let cstr = std::ffi::CString::new(
-        path.as_os_str().to_string_lossy().as_bytes()
-    ).ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(cstr.as_ptr(), &mut st) } != 0 {
-        return None;
+/// Cumulative (reads, writes) operation counts across all connected block
+/// devices, via IOKit's `IOBlockStorageDriver` statistics.
+#[cfg(target_os = "macos")]
+fn disk_ops_total() -> (u64, u64) {
+    use std::ffi::c_void;
+    type CFRef = *const c_void;
+    type IoObject = u32;
+    const KERN_SUCCESS: i32 = 0;
+    const UTF8: u32 = 0x0800_0100;
+    const SINT64: i32 = 4;
+
+    #[link(name = "IOKit", kind = "framework")]
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn IOServiceMatching(name: *const libc::c_char) -> CFRef;
+        fn IOServiceGetMatchingServices(port: u32, matching: CFRef, iter: *mut IoObject) -> i32;
+        fn IOIteratorNext(iter: IoObject) -> IoObject;
+        fn IOObjectRelease(obj: IoObject) -> i32;
+        fn IORegistryEntryCreateCFProperties(
+            entry: IoObject, props: *mut CFRef, allocator: CFRef, options: u32,
+        ) -> i32;
+        fn CFStringCreateWithCString(alloc: CFRef, s: *const libc::c_char, enc: u32) -> CFRef;
+        fn CFDictionaryGetValue(dict: CFRef, key: CFRef) -> CFRef;
+        fn CFNumberGetValue(num: CFRef, ty: i32, value: *mut c_void) -> u8;
+        fn CFRelease(cf: CFRef);
     }
-    let bs = if st.f_frsize > 0 { st.f_frsize } else { st.f_bsize } as u64;
-    Some((st.f_blocks as u64 * bs, st.f_bavail as u64 * bs))
+
+    let (mut reads, mut writes) = (0u64, 0u64);
+    unsafe {
+        let matching = IOServiceMatching(c"IOBlockStorageDriver".as_ptr());
+        if matching.is_null() {
+            return (0, 0);
+        }
+        let mut iter: IoObject = 0;
+        if IOServiceGetMatchingServices(0, matching, &mut iter) != KERN_SUCCESS {
+            return (0, 0);
+        }
+        let null: CFRef = std::ptr::null();
+        let k_stats = CFStringCreateWithCString(null, c"Statistics".as_ptr(), UTF8);
+        let k_read = CFStringCreateWithCString(null, c"Operations (Read)".as_ptr(), UTF8);
+        let k_write = CFStringCreateWithCString(null, c"Operations (Write)".as_ptr(), UTF8);
+        loop {
+            let entry = IOIteratorNext(iter);
+            if entry == 0 {
+                break;
+            }
+            let mut props: CFRef = std::ptr::null();
+            if IORegistryEntryCreateCFProperties(entry, &mut props, null, 0) == KERN_SUCCESS
+                && !props.is_null()
+            {
+                let stats = CFDictionaryGetValue(props, k_stats);
+                if !stats.is_null() {
+                    let mut v: i64 = 0;
+                    let r = CFDictionaryGetValue(stats, k_read);
+                    if !r.is_null() && CFNumberGetValue(r, SINT64, &mut v as *mut i64 as *mut c_void) != 0 {
+                        reads += v as u64;
+                    }
+                    v = 0;
+                    let wv = CFDictionaryGetValue(stats, k_write);
+                    if !wv.is_null() && CFNumberGetValue(wv, SINT64, &mut v as *mut i64 as *mut c_void) != 0 {
+                        writes += v as u64;
+                    }
+                }
+                CFRelease(props);
+            }
+            IOObjectRelease(entry);
+        }
+        CFRelease(k_stats);
+        CFRelease(k_read);
+        CFRelease(k_write);
+        IOObjectRelease(iter);
+    }
+    (reads, writes)
 }
 
-/// Names of UP non-loopback network interfaces.
-fn active_interfaces() -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
+/// Cumulative (reads, writes) completed across all whole block devices, from
+/// `/proc/diskstats` (field 4 = reads completed, field 8 = writes completed).
+#[cfg(target_os = "linux")]
+fn disk_ops_total() -> (u64, u64) {
+    let (mut reads, mut writes) = (0u64, 0u64);
+    if let Ok(content) = std::fs::read_to_string("/proc/diskstats") {
+        for line in content.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 8 {
+                continue;
+            }
+            let name = f[2];
+            if name.starts_with("loop") || name.starts_with("ram") || is_partition(name) {
+                continue;
+            }
+            reads += f[3].parse::<u64>().unwrap_or(0);
+            writes += f[7].parse::<u64>().unwrap_or(0);
+        }
+    }
+    (reads, writes)
+}
+
+/// Heuristic: is this `/proc/diskstats` device name a partition (skip, to avoid
+/// double-counting its whole disk)? e.g. `sda1`, `nvme0n1p2`, `mmcblk0p1`.
+#[cfg(target_os = "linux")]
+fn is_partition(name: &str) -> bool {
+    let ends_digit = name.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false);
+    if !ends_digit {
+        return false;
+    }
+    // nvme/mmcblk whole disks end in a digit (nvme0n1); their partitions carry a `p`.
+    if name.starts_with("nvme") || name.starts_with("mmcblk") {
+        return name.contains('p');
+    }
+    // sd*/hd*/vd*/xvd*: a trailing digit marks a partition (sda1).
+    true
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn disk_ops_total() -> (u64, u64) {
+    (0, 0)
+}
+
+/// Compact count formatter for op rates: `999`, `1K`, `12M`.
+fn fmt_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000 {
+        format!("{}K", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Disk read/write op-rate sample: current per-second rates and their rolling
+/// rate histories (for the sparkline gauges).
+struct DiskSample {
+    r_rate: f64,
+    w_rate: f64,
+    r_hist: Vec<f64>,
+    w_hist: Vec<f64>,
+}
+
+/// Per-disk runtime: throttles op-counter sampling to `refresh`, diffs the
+/// cumulative counters into read/write rates (ops/sec), and keeps rolling
+/// histories for the gauges.
+fn disk_runtime(refresh: u64, graph_window: u64) -> DiskSample {
+    use std::collections::VecDeque;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    #[derive(Default)]
+    struct DiskState {
+        last: Option<Instant>,
+        prev: Option<(u64, u64)>,
+        r_rate: f64,
+        w_rate: f64,
+        r_hist: VecDeque<f64>,
+        w_hist: VecDeque<f64>,
+    }
+    static RT: OnceLock<Mutex<DiskState>> = OnceLock::new();
+
+    let now = Instant::now();
+    let st_mutex = RT.get_or_init(|| Mutex::new(DiskState::default()));
+    let Ok(mut st) = st_mutex.lock() else {
+        return DiskSample { r_rate: 0.0, w_rate: 0.0, r_hist: vec![], w_hist: vec![] };
+    };
+    let due = st.last.map(|t| now.duration_since(t).as_secs() >= refresh).unwrap_or(true);
+    if due {
+        let (reads, writes) = disk_ops_total();
+        if let Some((pr, pw)) = st.prev {
+            let dt = st.last.map(|t| now.duration_since(t).as_secs_f64()).unwrap_or(0.0);
+            if dt > 0.0 {
+                let r = reads.saturating_sub(pr) as f64 / dt;
+                let w = writes.saturating_sub(pw) as f64 / dt;
+                st.r_rate = r;
+                st.w_rate = w;
+                st.r_hist.push_back(r);
+                st.w_hist.push_back(w);
+            }
+        }
+        st.prev = Some((reads, writes));
+        st.last = Some(now);
+    }
+    let cap = window_samples(refresh, graph_window);
+    while st.r_hist.len() > cap {
+        st.r_hist.pop_front();
+    }
+    while st.w_hist.len() > cap {
+        st.w_hist.pop_front();
+    }
+    DiskSample {
+        r_rate: st.r_rate,
+        w_rate: st.w_rate,
+        r_hist: st.r_hist.iter().copied().collect(),
+        w_hist: st.w_hist.iter().copied().collect(),
+    }
+}
+
+/// Render one gauge of `width` chars per the `bar_kind`. `cur` is the current
+/// ratio (for the fill bar); `hist` is the normalized history (for sparklines).
+fn gauge_str(bar_kind: &str, cur: f64, hist: &[f64], width: usize) -> String {
+    match bar_kind {
+        "blocks" => block_sparkline(hist, width),
+        "braille" => braille_sparkline(hist, width),
+        _ => mini_bar(cur, width),
+    }
+}
+
+/// The `(min, max)` of a history window. Empty → a degenerate range that
+/// `scale_minmax` / `lerp_minmax` treat as flat.
+fn range(hist: &[f64]) -> (f64, f64) {
+    hist.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(mn, mx), &v| (mn.min(v), mx.max(v)))
+}
+
+/// Auto-range a history to `0..1` over `[mn, mx]`: the window trough maps to empty
+/// and the window peak to full, so a graph shows movement even when the absolute
+/// signal is nearly constant (e.g. memory pressure). A flat window → all zero.
+fn scale_minmax(hist: &[f64], mn: f64, mx: f64) -> Vec<f64> {
+    let span = mx - mn;
+    if !span.is_finite() || span <= 1e-9 {
+        return vec![0.0; hist.len()];
+    }
+    hist.iter().map(|v| ((v - mn) / span).clamp(0.0, 1.0)).collect()
+}
+
+/// Auto-range a single value to `0..1` over `[mn, mx]` (the current-sample
+/// counterpart of `scale_minmax`, for the fill-bar gauge).
+fn lerp_minmax(v: f64, mn: f64, mx: f64) -> f64 {
+    let span = mx - mn;
+    if !span.is_finite() || span <= 1e-9 {
+        0.0
+    } else {
+        ((v - mn) / span).clamp(0.0, 1.0)
+    }
+}
+
+/// The disk row: `DSK R<gauge>W<gauge> r:w`. `label_max` columns are reserved at
+/// the right for the value, whose `:` is centered so its column does not shift as
+/// the read/write counts (`r`/`w`) change width. The two gauges share the rest.
+#[allow(clippy::too_many_arguments)]
+fn disk_row(
+    cfg: &MetricCfg,
+    ds: &DiskSample,
+    width: usize,
+    label_role: Role,
+    bar_role: Role,
+    value_role: Role,
+    theme: &Theme,
+) -> Line<'static> {
+    let name_str = "DSK ".to_string();
+    let avail = width.saturating_sub(name_str.chars().count());
+    // Fixed value field at the right edge; `:` centered within it.
+    let value_w = if cfg.label { (cfg.label_max as usize).min(avail) } else { 0 };
+    let sep = usize::from(value_w > 0);
+    let gauge_area = avail.saturating_sub(value_w + sep);
+
+    let lbl = Style::default().fg(theme.role(label_role)).add_modifier(Modifier::BOLD);
+    let bar = Style::default().fg(theme.role(bar_role));
+    let val = Style::default().fg(cascade_fg(theme, value_role));
+    let mut spans = vec![Span::styled(name_str, lbl)];
+
+    // The gauge area holds: "R" + gauge + " W" + gauge → 3 decoration chars (a
+    // space precedes W so the read gauge does not run into the W label).
+    let drew_gauges = if cfg.bar && gauge_area >= 5 {
+        let each = (gauge_area - 3) / 2;
+        // Shared auto-range across both series over the graph window.
+        let (rmn, rmx) = range(&ds.r_hist);
+        let (wmn, wmx) = range(&ds.w_hist);
+        let (mn, mx) = (rmn.min(wmn), rmx.max(wmx));
+        let r_g = gauge_str(&cfg.bar_kind, lerp_minmax(ds.r_rate, mn, mx), &scale_minmax(&ds.r_hist, mn, mx), each);
+        let w_g = gauge_str(&cfg.bar_kind, lerp_minmax(ds.w_rate, mn, mx), &scale_minmax(&ds.w_hist, mn, mx), each);
+        spans.push(Span::styled("R", lbl));
+        spans.push(Span::styled(r_g, bar));
+        spans.push(Span::styled(" W", lbl));
+        spans.push(Span::styled(w_g, bar));
+        true
+    } else {
+        false
+    };
+    if value_w > 0 {
+        // Keep the value at the right edge even if the gauges were not drawn.
+        if !drew_gauges && gauge_area >= 1 {
+            spans.push(Span::styled(" ".repeat(gauge_area), val));
+        }
+        spans.push(Span::styled(" ".repeat(sep), val));
+        spans.push(Span::styled(
+            disk_value(ds.r_rate as u64, ds.w_rate as u64, value_w),
+            val,
+        ));
+    }
+    Line::from(spans)
+}
+
+/// A fixed-width `r:w` field of `width` columns with the colon centered: the read
+/// count is right-aligned in the left half, the write count left-aligned in the
+/// right half, so the colon's column is stable regardless of the digit counts.
+fn disk_value(reads: u64, writes: u64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return ":".into();
+    }
+    let left = (width - 1) / 2;
+    let right = width - 1 - left;
+    format!("{}:{}", fit_right(&fmt_count(reads), left), fit_left(&fmt_count(writes), right))
+}
+
+/// Cumulative bytes (rx + tx) across all UP non-loopback interfaces.
+#[cfg(target_os = "macos")]
+fn net_total_bytes() -> u64 {
+    let mut total: u64 = 0;
     unsafe {
         let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut ifap) != 0 || ifap.is_null() {
-            return names;
+            return 0;
         }
         let mut ifa = ifap;
         while !ifa.is_null() {
             let flags = (*ifa).ifa_flags as u32;
             let up = flags & (libc::IFF_UP as u32) != 0;
             let loopback = flags & (libc::IFF_LOOPBACK as u32) != 0;
-            if up && !loopback {
-                if let Ok(name) = std::ffi::CStr::from_ptr((*ifa).ifa_name).to_str() {
-                    let s = name.to_string();
-                    if !names.contains(&s) {
-                        names.push(s);
-                    }
-                }
+            let addr = (*ifa).ifa_addr;
+            // Link-level rows (AF_LINK) carry the per-interface byte counters in
+            // their ifa_data as a `struct if_data`.
+            if up && !loopback && !addr.is_null()
+                && (*addr).sa_family as i32 == libc::AF_LINK
+                && !(*ifa).ifa_data.is_null()
+            {
+                let data = (*ifa).ifa_data as *const libc::if_data;
+                total += (*data).ifi_ibytes as u64 + (*data).ifi_obytes as u64;
             }
             ifa = (*ifa).ifa_next;
         }
         libc::freeifaddrs(ifap);
     }
-    names
+    total
+}
+
+/// Cumulative bytes (rx + tx) across all non-loopback interfaces, from
+/// `/proc/net/dev`.
+#[cfg(target_os = "linux")]
+fn net_total_bytes() -> u64 {
+    let mut total: u64 = 0;
+    if let Ok(content) = std::fs::read_to_string("/proc/net/dev") {
+        for line in content.lines() {
+            let Some((name, rest)) = line.split_once(':') else { continue };
+            if name.trim() == "lo" { continue; }
+            let cols: Vec<&str> = rest.split_whitespace().collect();
+            // rx bytes = column 0, tx bytes = column 8.
+            let rx = cols.first().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            let tx = cols.get(8).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            total += rx + tx;
+        }
+    }
+    total
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn net_total_bytes() -> u64 {
+    0
+}
+
+/// Network throughput stats, summed over all non-loopback devices: the average
+/// byte/second rate over the last ~5 seconds and over the last ~60 seconds.
+/// Keeps a rolling 60-second history of cumulative-byte samples, one per frame.
+fn net_stats() -> (u64, u64) {
+    use std::collections::VecDeque;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+    static HIST: OnceLock<Mutex<VecDeque<(Instant, u64)>>> = OnceLock::new();
+
+    let total = net_total_bytes();
+    let now = Instant::now();
+    let Ok(mut hist) = HIST.get_or_init(|| Mutex::new(VecDeque::new())).lock() else {
+        return (0, 0);
+    };
+    hist.push_back((now, total));
+    // Drop samples older than the 60-second window.
+    while let Some(&(t, _)) = hist.front() {
+        if now.duration_since(t).as_secs_f64() > 60.0 {
+            hist.pop_front();
+        } else {
+            break;
+        }
+    }
+    (window_rate(&hist, now, total, 5.0), window_rate(&hist, now, total, 60.0))
+}
+
+/// Average byte/second rate over roughly the last `min_age` seconds: diff the
+/// current cumulative byte count against the newest sample at least `min_age`
+/// old (or the oldest available if the history is shorter than the window).
+fn window_rate(
+    hist: &std::collections::VecDeque<(std::time::Instant, u64)>,
+    now: std::time::Instant,
+    total: u64,
+    min_age: f64,
+) -> u64 {
+    let mut base: Option<&(std::time::Instant, u64)> = None;
+    for s in hist.iter() {
+        if now.duration_since(s.0).as_secs_f64() >= min_age {
+            base = Some(s);
+        } else {
+            break;
+        }
+    }
+    match base.or_else(|| hist.front()) {
+        Some(&(t0, b0)) => {
+            let dt = now.duration_since(t0).as_secs_f64();
+            if dt > 0.0 { (total.saturating_sub(b0) as f64 / dt) as u64 } else { 0 }
+        }
+        None => 0,
+    }
 }
 
 // ── Prop helpers ──────────────────────────────────────────────────────────────
@@ -763,8 +1383,15 @@ fn file_info(e: &crate::core::Entry) -> String {
     }
 }
 
-/// `LABEL: value` line, value truncated to fit `width`. Label is dimmed.
-fn prop_line(label: &str, value: &str, width: usize) -> Line<'static> {
+/// `LABEL: value` line, value truncated to fit `width`.
+fn prop_line(
+    label: &str,
+    value: &str,
+    width: usize,
+    label_role: Role,
+    value_role: Role,
+    theme: &Theme,
+) -> Line<'static> {
     let prefix = format!("{label} ");
     let avail = width.saturating_sub(prefix.chars().count());
     let value: String = if value.chars().count() > avail && avail > 1 {
@@ -773,8 +1400,8 @@ fn prop_line(label: &str, value: &str, width: usize) -> Line<'static> {
         value.to_string()
     };
     Line::from(vec![
-        Span::styled(prefix, Style::default().fg(Color::DarkGray)),
-        Span::raw(value),
+        Span::styled(prefix, Style::default().fg(theme.role(label_role))),
+        Span::styled(value, Style::default().fg(cascade_fg(theme, value_role))),
     ])
 }
 

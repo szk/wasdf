@@ -293,6 +293,8 @@ pub struct AppState {
     /// A path to place the cursor on after the next listing loads (e.g. the
     /// directory we came from on CursorLeft, or a navigated-to file).
     pub pending_focus: Option<PathBuf>,
+    /// Where to return to when toggling back out of the VFS root via `@`.
+    pub root_return: Option<PathBuf>,
 }
 
 impl AppState {
@@ -312,6 +314,7 @@ impl AppState {
             next_generation: 1,
             quit: false,
             pending_focus: None,
+            root_return: None,
         }
     }
 

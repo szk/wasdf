@@ -11,7 +11,7 @@ use std::path::Path;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::core::{Entry, PanelSearch, StyleRun};
+use crate::core::{Entry, PanelSearch, Role, StyleRun, Theme};
 
 /// The panel title for the displayed file: its file name (not a fixed label), with
 /// the match position appended while a search is active.
@@ -29,7 +29,7 @@ pub fn title(target: Option<&Path>, search: &PanelSearch) -> String {
 
 /// The `/` search prompt line, shown on the panel's bottom row while the input
 /// is open; `None` when it is not.
-pub fn prompt_line(search: &PanelSearch) -> Option<Line<'static>> {
+pub fn prompt_line(search: &PanelSearch, theme: &Theme) -> Option<Line<'static>> {
     search.input_active.then(|| {
         // Block cursor at the real caret (the search input is the focused form →
         // reverse video).
@@ -42,7 +42,7 @@ pub fn prompt_line(search: &PanelSearch) -> Option<Line<'static>> {
         let mut rest = q[caret..].chars();
         let under = rest.next().map(|c| c.to_string()).unwrap_or_else(|| " ".into());
         Line::from(vec![
-            Span::styled("/", Style::default().fg(Color::Yellow)),
+            Span::styled("/", Style::default().fg(theme.role(Role::PathSeparator))),
             Span::raw(q[..caret].to_string()),
             Span::styled(under, Style::default().add_modifier(Modifier::REVERSED)),
             Span::raw(rest.collect::<String>()),
@@ -61,17 +61,18 @@ pub fn text_lines(
     hscroll: usize,
     show_line_numbers: bool,
     truncated: bool,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line> = lines
         .iter()
         .enumerate()
         .map(|(i, text)| {
             let runs = styles.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
-            build_line(text, runs, hscroll, i, search, show_line_numbers)
+            build_line(text, runs, hscroll, i, search, show_line_numbers, theme)
         })
         .collect();
     if truncated {
-        out.push(Line::from(Span::styled("… truncated", Style::default().fg(Color::DarkGray))));
+        out.push(Line::from(Span::styled("… truncated", Style::default().fg(theme.role(Role::Muted)))));
     }
     out
 }
@@ -85,11 +86,11 @@ pub fn content_width(lines: &[String]) -> usize {
 }
 
 /// Styled lines for a directory listing (directories blue, with a trailing `/`).
-pub fn dir_lines(entries: &[Entry]) -> Vec<Line<'static>> {
+pub fn dir_lines(entries: &[Entry], theme: &Theme) -> Vec<Line<'static>> {
     entries
         .iter()
         .map(|e| {
-            let style = if e.is_dir { Style::default().fg(Color::Blue) } else { Style::default() };
+            let style = if e.is_dir { Style::default().fg(theme.role(Role::EntryDir)) } else { Style::default() };
             Line::from(Span::styled(format!("{}{}", e.name, if e.is_dir { "/" } else { "" }), style))
         })
         .collect()
@@ -104,12 +105,13 @@ fn build_line(
     line_idx: usize,
     search: &PanelSearch,
     show_line_numbers: bool,
+    theme: &Theme,
 ) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     if show_line_numbers {
         spans.push(Span::styled(
             format!("{:>4} ", line_idx + 1),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.role(Role::Muted)),
         ));
     }
     // Match byte ranges on this line, flagged when current.
@@ -133,8 +135,8 @@ fn build_line(
         let m = line_matches.iter().find(|(s, e, _)| b >= *s && b < *e);
         let style = match m {
             // Search highlight overrides the run's own colors.
-            Some((_, _, true)) => Style::default().fg(Color::Black).bg(Color::LightCyan),
-            Some(_) => Style::default().fg(Color::Black).bg(Color::Yellow),
+            Some((_, _, true)) => Style::default().fg(theme.role(Role::MatchCurrentFg)).bg(theme.role(Role::MatchCurrentBg)),
+            Some(_) => Style::default().fg(theme.role(Role::MatchFg)).bg(theme.role(Role::MatchBg)),
             None => match runs.get(run_idx) {
                 Some(r) => {
                     let mut st = Style::default().fg(Color::Rgb(r.fg.0, r.fg.1, r.fg.2));
@@ -231,8 +233,9 @@ mod tests {
 
     #[test]
     fn horizontal_scroll_drops_leading_columns() {
+        let theme = crate::core::Theme::default();
         let search = PanelSearch::default();
-        let l = text_lines(&["hello".to_string()], &[], &search, 2, false, false);
+        let l = text_lines(&["hello".to_string()], &[], &search, 2, false, false, &theme);
         let text: String = l[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "llo");
     }

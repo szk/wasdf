@@ -65,9 +65,16 @@ pub fn run(cwd: PathBuf) -> io::Result<()> {
                 prop_weight: s.get_u32("top.prop-weight").max(1),
                 monitor_visible: s.get_bool("top.monitor-visible"),
                 monitor_weight: s.get_u32("top.monitor-weight").max(1),
+                monitor: crate::ui::top::MonitorOptions::from_store(s),
+                scrollbar: crate::ui::chrome::ScrollbarChars {
+                    thumb: s.get_str("scrollbar-thumb"),
+                    rail: s.get_str("scrollbar-rail"),
+                    disabled: s.get_str("scrollbar-disabled"),
+                },
             }
         };
-        if let Err(e) = term.draw(|f| app.ui.render(f, &app.state, &app.extensions, &app.vfs, &top_opts)) {
+        let theme = app.theme_registry.read().unwrap().resolve_active();
+        if let Err(e) = term.draw(|f| app.ui.render(f, &app.state, &app.extensions, &app.vfs, &top_opts, &theme)) {
             break Err(e);
         }
         // The reducer advances function scroll/hscroll blindly (it can't see the

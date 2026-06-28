@@ -193,7 +193,7 @@ impl Extension for PreviewExtension {
         let f = ctx.func;
         let target = self.target.borrow();
         let title = content::title(target.as_deref(), &f.search);
-        let prompt = content::prompt_line(&f.search);
+        let prompt = content::prompt_line(&f.search, ctx.theme);
         // Clamp h-scroll to the content width so the text never scrolls off into
         // blank columns (the kernel applies the same bound to the stored hscroll
         // after the draw, so over-scroll input is discarded). Core owns the
@@ -204,17 +204,17 @@ impl Extension for PreviewExtension {
         let (lines, scroll, width) = match decoded {
             Decoded::Text { lines, styles } => {
                 let w = content::content_width(lines);
-                (content::text_lines(lines, styles, &f.search, hclamp(w), f.show_line_numbers, more), f.scroll, w)
+                (content::text_lines(lines, styles, &f.search, hclamp(w), f.show_line_numbers, more, ctx.theme), f.scroll, w)
             }
             Decoded::Binary { lines } => {
                 let w = content::content_width(lines);
-                (content::text_lines(lines, &[], &f.search, hclamp(w), f.show_line_numbers, more), f.scroll, w)
+                (content::text_lines(lines, &[], &f.search, hclamp(w), f.show_line_numbers, more, ctx.theme), f.scroll, w)
             }
             // Images do not scroll (vertically or horizontally); they fill the viewport.
             Decoded::Image { width, height, rgb } => {
                 (content::image_cells(*width, *height, rgb, ctx.width, ctx.height), 0, 0)
             }
-            Decoded::Dir { entries } => (content::dir_lines(entries), f.scroll, 0),
+            Decoded::Dir { entries } => (content::dir_lines(entries, ctx.theme), f.scroll, 0),
         };
         let total = lines.len();
         Some(FunctionDraw { lines, title, scroll, total, width, prompt })
@@ -295,7 +295,7 @@ mod tests {
             &ReadResult::Bytes { offset: 0, bytes: b"hello\nworld\n".to_vec(), eof: true },
         );
         let s = AppState::new(std::env::temp_dir());
-        let ctx = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &s.function };
+        let ctx = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &s.function, theme: &crate::core::Theme::default() };
         let draw = ext.render_function(&ctx).expect("draws the stashed content");
         assert_eq!(draw.title, "notes.txt");
         assert_eq!(draw.total, 2);
@@ -305,7 +305,7 @@ mod tests {
     fn render_is_none_without_accepted_content() {
         let ext = PreviewExtension::default();
         let s = AppState::new(std::env::temp_dir());
-        let ctx = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &s.function };
+        let ctx = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &s.function, theme: &crate::core::Theme::default() };
         assert!(ext.render_function(&ctx).is_none());
     }
 
@@ -363,7 +363,7 @@ mod tests {
             &ReadResult::Bytes { offset: 0, bytes: b"hello\nworld\n".to_vec(), eof: true },
         );
         let ctx_state = state_with_file(true);
-        let ctx = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &ctx_state.function };
+        let ctx = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &ctx_state.function, theme: &crate::core::Theme::default() };
         assert!(ext.render_function(&ctx).is_some(), "precondition: content is stashed");
 
         // Empty directory: function visible, but no entries → no cursor target.
@@ -372,7 +372,7 @@ mod tests {
         empty.function.visible = true;
         assert!(ext.on_cursor_changed(&empty).is_empty(), "no load when nothing is under the cursor");
 
-        let ctx2 = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &empty.function };
+        let ctx2 = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &empty.function, theme: &crate::core::Theme::default() };
         assert!(
             ext.render_function(&ctx2).is_none(),
             "stale preview must be cleared on entering an empty directory",
@@ -391,7 +391,7 @@ mod tests {
         );
         let s = state_with_file(false); // function hidden → not following
         assert!(ext.on_cursor_changed(&s).is_empty());
-        let ctx = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &s.function };
+        let ctx = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &s.function, theme: &crate::core::Theme::default() };
         assert!(ext.render_function(&ctx).is_some(), "hidden panel keeps its stash");
     }
 
@@ -485,6 +485,7 @@ mod option_acceptance {
         let ext = SettingsExtension::new(
             store.clone(),
             Arc::new(Mutex::new(MatcherConfig::default())),
+            Vec::new(),
             None,
         );
         let state = AppState::new(std::path::PathBuf::from("/tmp"));
@@ -510,6 +511,7 @@ mod option_acceptance {
         let ext = SettingsExtension::new(
             store.clone(),
             Arc::new(Mutex::new(MatcherConfig::default())),
+            Vec::new(),
             Some(config.clone()),
         );
         let state = AppState::new(std::path::PathBuf::from("/tmp"));
@@ -545,7 +547,7 @@ mod option_acceptance {
             },
         );
         let s = AppState::new(std::env::temp_dir());
-        let ctx = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &s.function };
+        let ctx = FunctionRenderCtx { width: 40, height: 10, focused: true, func: &s.function, theme: &crate::core::Theme::default() };
         let draw = ext.render_function(&ctx).expect("has content");
         // tab-width=2 → '\t' becomes "  " (2 spaces) → line is "  hello"
         let first_line = draw.lines.first().expect("has first line");

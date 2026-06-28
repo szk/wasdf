@@ -9,6 +9,7 @@ pub mod loader;
 pub mod preview;
 pub mod registry;
 pub mod settings;
+pub mod theme; // bundled id: "theme"
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use std::sync::Arc;
 use ratatui::text::Line;
 
 use crate::core::state::FunctionPanelState;
-use crate::core::{AppState, ExtensionIntent, Intent, OptionStore, ReadResult};
+use crate::core::{AppState, ExtensionIntent, Intent, OptionStore, ReadResult, Theme};
 use crate::script::condition::Conditions;
 use crate::script::keymap::Binding;
 use crate::services::command::CommandDef;
@@ -33,6 +34,7 @@ pub struct FunctionRenderCtx<'a> {
     pub height: u16,
     pub focused: bool,
     pub func: &'a FunctionPanelState,
+    pub theme: &'a Theme,
 }
 
 /// The drawable an extension returns for the function panel. Core owns only the
@@ -141,6 +143,13 @@ pub trait Extension: Send {
 
     /// Handle an extension intent addressed to this extension.
     fn handle_intent(&self, _intent: &ExtensionIntent, _state: &AppState) -> Vec<Intent> {
+        Vec::new()
+    }
+
+    /// Subtrees grafted under `@/settings/<category>`. The `SettingsProvider`
+    /// appends one virtual dir per node under the matching category listing and
+    /// delegates any deeper path to the owning node. Default: none.
+    fn settings_nodes(&self) -> Vec<Arc<dyn crate::extension::settings::SettingsNode>> {
         Vec::new()
     }
 

@@ -94,6 +94,10 @@ pub enum Intent {
     /// do" — viewing a file is `d` (cycle the content panel) / `,`, not Activate.
     Activate,
     NavigateTo(PathBuf),
+    /// Toggle between the current real directory and the VFS root (`@`). The
+    /// first press from a real path jumps to `@` and remembers where it came
+    /// from; pressing it again returns there.
+    ToggleVfsRoot,
 
     // Function cursor (operate the function panel from the file panel)
     FuncUp,

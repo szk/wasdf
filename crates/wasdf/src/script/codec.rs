@@ -240,6 +240,7 @@ fn intent_from_name(s: &str) -> Option<Intent> {
         "focus-next-panel" => FocusNextPanel,
         "focus-prev-panel" => FocusPrevPanel,
         "kill-process" => KillProcess,
+        "toggle-vfs-root" => ToggleVfsRoot,
         "refresh" => Refresh,
         "quit" => Quit,
         "noop" => Noop,

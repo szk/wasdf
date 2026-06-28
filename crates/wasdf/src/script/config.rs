@@ -195,6 +195,91 @@ pub fn parse_keymap_config(datum: &Datum, layer: Layer) -> Result<Vec<Binding>, 
     Ok(out)
 }
 
+// ── Theme config parsers ───────────────────────────────────────────────────────
+
+/// Parse a `(quote ((theme "name" (role color) …) …))` datum (as produced by
+/// `theme_presets.scm`) into a list of `NamedTheme` presets.
+///
+/// Unknown role tokens and unparseable colors are silently skipped.
+pub fn parse_theme_config(datum: &Datum) -> Vec<crate::extension::theme::NamedTheme> {
+    let forms = match datum.as_list() {
+        Some(l) => l,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for form in forms {
+        let parts = match form.as_list() {
+            Some(p) => p,
+            None => continue,
+        };
+        let head = parts.first().and_then(|d| d.as_sym());
+        if head != Some("theme") {
+            continue;
+        }
+        let name = match parts.get(1).and_then(|d| d.as_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let overrides = parse_role_overrides(&parts[2..]);
+        out.push(crate::extension::theme::NamedTheme { name, preset: true, overrides });
+    }
+    out
+}
+
+/// Parse a single `(define-theme "name" (role color) …)` datum into a custom
+/// `NamedTheme`. Returns `None` if the form is malformed.
+pub fn parse_define_theme(datum: &Datum) -> Option<crate::extension::theme::NamedTheme> {
+    let parts = datum.as_list()?;
+    let head = parts.first().and_then(|d| d.as_sym());
+    if head != Some("define-theme") {
+        return None;
+    }
+    let name = parts.get(1).and_then(|d| d.as_str())?.to_string();
+    let overrides = parse_role_overrides(&parts[2..]);
+    Some(crate::extension::theme::NamedTheme { name, preset: false, overrides })
+}
+
+/// Parse the active theme selection from a `(set-theme "name")` datum.
+/// Returns the name string if valid, else `None`.
+pub fn parse_set_theme(datum: &Datum) -> Option<String> {
+    let parts = datum.as_list()?;
+    if parts.first().and_then(|d| d.as_sym()) != Some("set-theme") {
+        return None;
+    }
+    parts.get(1).and_then(|d| d.as_str()).map(String::from)
+}
+
+fn parse_role_overrides(pairs: &[Datum]) -> Vec<(crate::core::Role, ratatui::style::Color)> {
+    let mut out = Vec::new();
+    for pair in pairs {
+        let pl = match pair.as_list() {
+            Some(l) => l,
+            None => continue,
+        };
+        let role_tok = match pl.first().and_then(|d| d.as_sym()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let color_tok = match pl.get(1).and_then(|d| d.text()) {
+            Some(s) => s,
+            None => continue,
+        };
+        // Unknown role tokens / unparseable colors are skipped silently: this
+        // parser runs after the TUI has taken the alternate screen, so an
+        // eprintln would corrupt the display. (disable, continue.)
+        let role = match crate::core::Role::from_token(role_tok) {
+            Some(r) => r,
+            None => continue,
+        };
+        let color = match crate::core::parse_color(color_tok) {
+            Some(c) => c,
+            None => continue,
+        };
+        out.push((role, color));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +365,39 @@ mod tests {
     fn parse_option_empty_choice_is_error() {
         let d = eval_quote(r#"(quote ((option "k" "C" (choice) "x" "l")))"#);
         assert!(parse_option_config(&d).is_err());
+    }
+
+    #[test]
+    fn parse_theme_config_reads_name_and_overrides() {
+        use crate::core::Role;
+        let d = eval_quote(r##"(quote ((theme "x" (border "#102030"))))"##);
+        let themes = parse_theme_config(&d);
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].name, "x");
+        assert!(themes[0].preset);
+        assert_eq!(themes[0].overrides.len(), 1);
+        let (role, color) = themes[0].overrides[0];
+        assert_eq!(role, Role::Border);
+        assert_eq!(color, ratatui::style::Color::Rgb(0x10, 0x20, 0x30));
+    }
+
+    #[test]
+    fn parse_define_theme_reads_a_custom() {
+        use crate::core::Role;
+        let d = crate::script::sexpr::parse(r#"(define-theme "y" (cursor-bg "blue"))"#)
+            .expect("parse failed");
+        let nt = parse_define_theme(&d).expect("should parse");
+        assert_eq!(nt.name, "y");
+        assert!(!nt.preset);
+        assert_eq!(nt.overrides[0].0, Role::CursorBg);
+        assert_eq!(nt.overrides[0].1, ratatui::style::Color::Blue);
+    }
+
+    #[test]
+    fn parse_theme_skips_unknown_role() {
+        let d = eval_quote(r##"(quote ((theme "t" (nonexistent-role "#ff0000") (border "red"))))"##);
+        let themes = parse_theme_config(&d);
+        assert_eq!(themes[0].overrides.len(), 1, "unknown role is dropped, known one kept");
+        assert_eq!(themes[0].overrides[0].0, crate::core::Role::Border);
     }
 }

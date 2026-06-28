@@ -12,11 +12,11 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::core::{AppState, FunctionHint, Mode, PanelContent, SelectInput, SelectPhase, SubLayout};
+use crate::core::{AppState, FunctionHint, Mode, PanelContent, Role, SelectInput, SelectPhase, SubLayout, Theme};
 use crate::extension::{ExtensionRegistry, FunctionDraw, FunctionRenderCtx};
 use crate::ui::chrome::{self, PanelFrame, ScrollInfo};
 use crate::ui::content;
@@ -118,14 +118,15 @@ pub fn render_file_main(
     extensions: &ExtensionRegistry,
     scroll: &mut ScrollMemory,
     panels: &mut Vec<PanelFrame>,
+    theme: &Theme,
 ) {
     if state.function.visible {
         let (lw, rw) = state.function.ratio.weights();
         let (file, func) = split_h(area, ratio_left(area.width, lw, rw));
-        render_file_list(frame, file, state, scroll, panels);
-        render_function(frame, func, state, extensions, None, scroll, panels);
+        render_file_list(frame, file, state, scroll, panels, theme);
+        render_function(frame, func, state, extensions, None, scroll, panels, theme);
     } else {
-        render_file_list(frame, area, state, scroll, panels);
+        render_file_list(frame, area, state, scroll, panels, theme);
     }
 }
 
@@ -214,6 +215,7 @@ fn build_list_lines(
     cols: usize,
     rows: usize,
     widths: &[usize],
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     let n = entries.len();
     let mut lines = Vec::with_capacity(rows);
@@ -231,9 +233,9 @@ fn build_list_lines(
             let cw = widths.get(c).copied().unwrap_or(0);
             let mut style = Style::default();
             if e.is_dir {
-                style = style.fg(Color::Blue).add_modifier(Modifier::BOLD);
+                style = style.fg(theme.role(Role::EntryDir)).add_modifier(Modifier::BOLD);
             } else if e.is_symlink {
-                style = style.fg(Color::Magenta);
+                style = style.fg(theme.role(Role::EntrySymlink));
             }
             if idx == cursor {
                 // Focused cursor → reverse video; unfocused → underline.
@@ -256,6 +258,7 @@ fn render_file_list(
     state: &AppState,
     scroll: &mut ScrollMemory,
     panels: &mut Vec<PanelFrame>,
+    theme: &Theme,
 ) {
     let focused = state.focused_panel == "file";
     render_entry_grid(
@@ -270,6 +273,7 @@ fn render_file_list(
         scroll,
         true,
         panels,
+        theme,
     );
 }
 
@@ -293,6 +297,7 @@ fn render_entry_grid(
     scroll: &mut ScrollMemory,
     is_file: bool,
     panels: &mut Vec<PanelFrame>,
+    theme: &Theme,
 ) {
     let inner = chrome::inner_open_bottom(area);
     let n = entries.len();
@@ -302,7 +307,7 @@ fn render_entry_grid(
     scroll.list_cols = cols;
     scroll.list_rows = rows;
 
-    let lines = build_list_lines(entries, cursor, selection, focused, cols, rows, &widths);
+    let lines = build_list_lines(entries, cursor, selection, focused, cols, rows, &widths, theme);
 
     // Window over visual rows: the cursor's row drives the persistent offset.
     let off = if is_file { &mut scroll.file } else { &mut scroll.candidates };
@@ -337,6 +342,7 @@ pub fn render_select_main(
     extensions: &ExtensionRegistry,
     scroll: &mut ScrollMemory,
     panels: &mut Vec<PanelFrame>,
+    theme: &Theme,
 ) {
     let Mode::Select(spec) = state.mode() else { return };
     let (left, right) = if spec.function_hint.is_some() {
@@ -349,17 +355,17 @@ pub fn render_select_main(
 
     if !matches!(spec.input, SelectInput::None) {
         let (input, cands) = split_v(left, 3);
-        render_select_input(frame, input, state, panels);
-        render_select_candidates(frame, cands, state, scroll, panels);
+        render_select_input(frame, input, state, panels, theme);
+        render_select_candidates(frame, cands, state, scroll, panels, theme);
     } else {
-        render_select_candidates(frame, left, state, scroll, panels);
+        render_select_candidates(frame, left, state, scroll, panels, theme);
     }
     if let Some(r) = right {
-        render_function(frame, r, state, extensions, spec.function_hint.clone(), scroll, panels);
+        render_function(frame, r, state, extensions, spec.function_hint.clone(), scroll, panels, theme);
     }
 }
 
-fn render_select_input(frame: &mut Frame, area: Rect, state: &AppState, panels: &mut Vec<PanelFrame>) {
+fn render_select_input(frame: &mut Frame, area: Rect, state: &AppState, panels: &mut Vec<PanelFrame>, theme: &Theme) {
     let (query, caret, phase) = match &state.select {
         Some(s) => (s.query.clone(), s.caret.min(s.query.len()), s.phase),
         None => return,
@@ -379,14 +385,14 @@ fn render_select_input(frame: &mut Frame, area: Rect, state: &AppState, panels: 
         let under = rest.next().map(|c| c.to_string()).unwrap_or_else(|| " ".into());
         let after: String = rest.collect();
         Line::from(vec![
-            Span::styled(marker, Style::default().fg(Color::Green)),
+            Span::styled(marker, Style::default().fg(theme.role(Role::SelectionMarker))),
             Span::raw(before),
             Span::styled(under, Style::default().add_modifier(Modifier::REVERSED)),
             Span::raw(after),
         ])
     } else {
         Line::from(vec![
-            Span::styled(marker, Style::default().fg(Color::Green)),
+            Span::styled(marker, Style::default().fg(theme.role(Role::SelectionMarker))),
             Span::raw(query.clone()),
         ])
     };
@@ -403,6 +409,7 @@ fn render_select_candidates(
     state: &AppState,
     scroll: &mut ScrollMemory,
     panels: &mut Vec<PanelFrame>,
+    theme: &Theme,
 ) {
     let Some(sel) = &state.select else { return };
     let navigate = sel.phase == SelectPhase::Navigate;
@@ -422,6 +429,7 @@ fn render_select_candidates(
             scroll,
             false,
             panels,
+            theme,
         );
         return;
     }
@@ -483,6 +491,7 @@ fn render_function(
     hint: Option<FunctionHint>,
     mem: &mut ScrollMemory,
     panels: &mut Vec<PanelFrame>,
+    theme: &Theme,
 ) {
     let inner = chrome::inner_open_bottom(area);
     let focused = state.focused_panel == "function";
@@ -495,11 +504,11 @@ fn render_function(
         let mut lines: Vec<Line> =
             state.function.exec.lines.iter().map(|l| Line::from(l.clone())).collect();
         if !state.function.exec.finished {
-            lines.push(Line::from(Span::styled("… running", Style::default().fg(Color::Yellow))));
+            lines.push(Line::from(Span::styled("… running", Style::default().fg(theme.role(Role::ExecRunning)))));
         } else if let Some(code) = state.function.exec.exit {
             lines.push(Line::from(Span::styled(
                 format!("[exit {code}]"),
-                Style::default().fg(if code == 0 { Color::Green } else { Color::Red }),
+                Style::default().fg(if code == 0 { theme.role(Role::ExecOk) } else { theme.role(Role::ExecFail) }),
             )));
         }
         let total = lines.len();
@@ -513,14 +522,14 @@ fn render_function(
 
     // Content frame: dispatch by hint (Select) or by the content provider (File).
     match hint {
-        Some(FunctionHint::CommandSummary) => render_command_summary(frame, area, inner, state, focused, panels),
-        Some(FunctionHint::DirListing) => render_dir_listing(frame, area, inner, state, extensions, focused, mem, panels),
+        Some(FunctionHint::CommandSummary) => render_command_summary(frame, area, inner, state, focused, panels, theme),
+        Some(FunctionHint::DirListing) => render_dir_listing(frame, area, inner, state, extensions, focused, mem, panels, theme),
         Some(FunctionHint::Extension(_)) | None => {
-            let ctx = FunctionRenderCtx { width: inner.width, height: inner.height, focused, func: &state.function };
+            let ctx = FunctionRenderCtx { width: inner.width, height: inner.height, focused, func: &state.function, theme };
             if let Some(content) = &state.function.content {
                 // Pushed content (ShowFunctionContent) takes precedence over the
                 // provider's own pull render.
-                render_panel_content(frame, area, inner, state, content, focused, mem, panels);
+                render_panel_content(frame, area, inner, state, content, focused, mem, panels, theme);
             } else if let Some(draw) = extensions.provider().and_then(|p| p.render_function(&ctx)) {
                 // The owning extension renders its content; core only blits it.
                 draw_function(frame, area, inner, draw, focused, mem, panels);
@@ -537,7 +546,7 @@ fn render_function(
                     "(no content)"
                 };
                 frame.render_widget(
-                    Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray))),
+                    Paragraph::new(Span::styled(msg, Style::default().fg(theme.role(Role::Muted)))),
                     inner,
                 );
                 panels.push(PanelFrame::new(area).title("content").focused(focused).open_bottom(true));
@@ -608,6 +617,7 @@ fn render_panel_content(
     focused: bool,
     mem: &mut ScrollMemory,
     panels: &mut Vec<PanelFrame>,
+    theme: &Theme,
 ) {
     let f = &state.function;
     let title = f.content_owner.clone().unwrap_or_else(|| "content".into());
@@ -616,7 +626,7 @@ fn render_panel_content(
             // Clamp h-scroll to the content width (no over-scroll into blank).
             let width = content::content_width(lines);
             let hscroll = f.hscroll.min(width.saturating_sub(inner.width as usize));
-            let out = content::text_lines(lines, styles, &f.search, hscroll, f.show_line_numbers, false);
+            let out = content::text_lines(lines, styles, &f.search, hscroll, f.show_line_numbers, false, theme);
             let total = out.len();
             FunctionDraw {
                 lines: out,
@@ -624,7 +634,7 @@ fn render_panel_content(
                 scroll: f.scroll,
                 total,
                 width,
-                prompt: content::prompt_line(&f.search),
+                prompt: content::prompt_line(&f.search, theme),
             }
         }
         PanelContent::Image { width, height, rgb } => {
@@ -645,8 +655,9 @@ fn render_dir_listing(
     focused: bool,
     mem: &mut ScrollMemory,
     panels: &mut Vec<PanelFrame>,
+    theme: &Theme,
 ) {
-    let ctx = FunctionRenderCtx { width: inner.width, height: inner.height, focused, func: &state.function };
+    let ctx = FunctionRenderCtx { width: inner.width, height: inner.height, focused, func: &state.function, theme };
     if let Some(draw) = extensions.provider().and_then(|p| p.render_function(&ctx)) {
         draw_function(frame, area, inner, draw, focused, mem, panels);
         return;
@@ -665,7 +676,7 @@ fn is_command_select(state: &AppState) -> bool {
     matches!(state.mode(), Mode::Select(s) if s.id == "command")
 }
 
-fn render_command_summary(frame: &mut Frame, area: Rect, inner: Rect, state: &AppState, focused: bool, panels: &mut Vec<PanelFrame>) {
+fn render_command_summary(frame: &mut Frame, area: Rect, inner: Rect, state: &AppState, focused: bool, panels: &mut Vec<PanelFrame>, theme: &Theme) {
     let mut lines: Vec<Line> = Vec::new();
     if let Mode::Select(spec) = state.mode() {
         if let crate::core::OnConfirm::Resolve { template, fill } = &spec.on_confirm {
@@ -727,7 +738,7 @@ fn render_command_summary(frame: &mut Frame, area: Rect, inner: Rect, state: &Ap
             } else {
                 "Enter runs"
             };
-            lines.push(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(hint, Style::default().fg(theme.role(Role::Muted)))));
         }
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);

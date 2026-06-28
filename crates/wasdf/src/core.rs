@@ -9,6 +9,7 @@ pub mod mode;
 pub mod option;
 pub mod reducer;
 pub mod state;
+pub mod theme;
 
 pub use event::{
     AppEvent, AsyncResult, AsyncStatus, ExecOutput, OpDone, PanelContent, Payload, Plan, Purpose,
@@ -21,5 +22,6 @@ pub use mode::{
     SelectSpec, SubLayout,
 };
 pub use option::{OptionDef, OptionKind, OptionStore};
+pub use theme::{color_token, parse_color, Role, Theme};
 pub use reducer::{CommandLookup, Effects, Notice, apply_intent, apply_result};
 pub use state::{AppState, Entry, EntryList, ListGeom, ListLayout, PanelSearch, SelectPhase};

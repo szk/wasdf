@@ -15,7 +15,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use crate::core::{AppState, Mode, Notice};
+use crate::core::{AppState, Mode, Notice, Role, Theme};
 use crate::extension::ExtensionRegistry;
 use crate::ui::chrome::{self, PanelFrame};
 use crate::ui::middle::ScrollMemory;
@@ -73,11 +73,22 @@ pub fn render(
     notice: Option<&Notice>,
     vfs: &crate::vfs::Vfs,
     opts: &crate::ui::top::TopOptions,
+    theme: &Theme,
 ) {
     let area = frame.area();
     if area.width < 4 || area.height < 4 {
         return;
     }
+
+    // Global base colors: fg/bg paint the entire frame — including the cells
+    // behind the border and every panel — and are overridden per-cell wherever
+    // a more specific role sets its own fg/bg. Applied first so everything that
+    // follows composes on top of it.
+    frame.buffer_mut().set_style(
+        area,
+        Style::default().fg(theme.role(Role::Fg)).bg(theme.role(Role::Bg)),
+    );
+
     let tr = top_rows(area.height);
     // help on the last row (unboxed); the box spans the rest. Top and main
     // overlap by one row so their borders share a single divider line.
@@ -96,28 +107,28 @@ pub fn render(
     scroll.reset_function_bounds();
     let mut panels: Vec<PanelFrame> = Vec::new();
     let func_x = compute_func_x(state, main);
-    crate::ui::top::render_top(frame, top, state, vfs, &mut panels, opts, func_x);
+    crate::ui::top::render_top(frame, top, state, vfs, &mut panels, opts, func_x, theme);
     match state.mode() {
-        Mode::Select(_) => crate::ui::middle::render_select_main(frame, main, state, extensions, scroll, &mut panels),
-        _ => crate::ui::middle::render_file_main(frame, main, state, extensions, scroll, &mut panels),
+        Mode::Select(_) => crate::ui::middle::render_select_main(frame, main, state, extensions, scroll, &mut panels, theme),
+        _ => crate::ui::middle::render_file_main(frame, main, state, extensions, scroll, &mut panels, theme),
     }
 
-    chrome::render(frame, &panels, &opts.border_style);
-    crate::ui::bottom::render_bottom(frame, help, state);
+    chrome::render(frame, &panels, &opts.border_style, &opts.scrollbar, theme);
+    crate::ui::bottom::render_bottom(frame, help, state, theme);
 
     if let Some(n) = notice {
-        render_notice(frame, area, n);
+        render_notice(frame, area, n, theme);
     }
     if let Mode::Policy(pending) = state.mode() {
-        render_policy(frame, area, pending);
+        render_policy(frame, area, pending, theme);
     }
 }
 
-fn render_notice(frame: &mut Frame, area: Rect, notice: &Notice) {
+fn render_notice(frame: &mut Frame, area: Rect, notice: &Notice, theme: &Theme) {
     let style = if notice.error {
-        Style::default().fg(Color::White).bg(Color::Red)
+        Style::default().fg(theme.role(Role::NoticeErrorFg)).bg(theme.role(Role::NoticeErrorBg))
     } else {
-        Style::default().fg(Color::Black).bg(Color::Green)
+        Style::default().fg(theme.role(Role::NoticeInfoFg)).bg(theme.role(Role::NoticeInfoBg))
     };
     let w = (notice.text.len() as u16 + 2).min(area.width);
     let rect = Rect { x: area.width.saturating_sub(w), y: 0, width: w, height: 1 };
@@ -125,7 +136,7 @@ fn render_notice(frame: &mut Frame, area: Rect, notice: &Notice) {
     frame.render_widget(Paragraph::new(format!(" {} ", notice.text)).style(style), rect);
 }
 
-fn render_policy(frame: &mut Frame, area: Rect, pending: &crate::core::Intent) {
+fn render_policy(frame: &mut Frame, area: Rect, pending: &crate::core::Intent, theme: &Theme) {
     let summary = match pending {
         crate::core::Intent::RunResolver(r) => format!("{} {} item(s)?", r.op, r.paths.len()),
         crate::core::Intent::Extension(e) => format!("Run {}:{}?", e.extension, e.intent),
@@ -150,10 +161,13 @@ fn render_policy(frame: &mut Frame, area: Rect, pending: &crate::core::Intent) {
         Line::from(""),
         Line::from(Span::styled(keys, Style::default().fg(Color::DarkGray))),
     ];
-    let p = Paragraph::new(lines).alignment(Alignment::Center).block(
+    let overlay_style = Style::default()
+        .fg(theme.role(Role::OverlayDangerFg))
+        .bg(theme.role(Role::OverlayDangerBg));
+    let p = Paragraph::new(lines).alignment(Alignment::Center).style(overlay_style).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red))
+            .border_style(overlay_style)
             .title("Confirm"),
     );
     frame.render_widget(p, rect);
@@ -184,6 +198,10 @@ mod tests {
         crate::vfs::Vfs::default()
     }
 
+    fn theme() -> crate::core::Theme {
+        crate::core::Theme::default()
+    }
+
     #[test]
     fn image_content_paints_truecolor_cells() {
         // Hand a real PNG to the content provider, then render through its hook.
@@ -201,7 +219,7 @@ mod tests {
         let mut state = AppState::new(std::env::temp_dir());
         state.function.visible = true;
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        terminal.draw(|f| render(f, &state, &exts, &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
+        terminal.draw(|f| render(f, &state, &exts, &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
         let buf = terminal.backend().buffer();
         let rgb_cells = buf.content.iter().filter(|c| matches!(c.fg, Color::Rgb(..))).count();
         assert!(rgb_cells > 0, "image content rendered no truecolor cells");
@@ -217,7 +235,7 @@ mod tests {
             Some(PanelContent::Lines { lines: vec!["EXTLINE".into()], styles: vec![Vec::new()] });
         state.function.content_owner = Some("example".into());
         let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
         let b = t.backend().buffer();
         let text: String = (0..b.area.height)
             .flat_map(|y| (0..b.area.width).map(move |x| (x, y)))
@@ -238,7 +256,7 @@ mod tests {
         state.function.search.matches = vec![(0, 0, 3)]; // "foo"
         state.function.search.current = 0;
         let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
         let buf = t.backend().buffer();
         // The current match renders on a LightCyan background (unique to the
         // search highlight; the nav uses plain Cyan).
@@ -260,7 +278,7 @@ mod tests {
 
         let mut mem = ScrollMemory::default();
         let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut mem, None, &vfs(), &top_opts())).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut mem, None, &vfs(), &top_opts(), &theme())).unwrap();
 
         // The render measured a finite bound (content rows − viewport rows), well
         // below the over-scrolled value; the kernel's post-draw clamp pins to it so
@@ -285,7 +303,7 @@ mod tests {
 
         let mut mem = ScrollMemory::default();
         let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut mem, None, &vfs(), &top_opts())).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut mem, None, &vfs(), &top_opts(), &theme())).unwrap();
 
         // The render measured a finite horizontal bound (content cols − viewport
         // cols); the kernel's post-draw clamp pins hscroll to it so the line never
@@ -321,7 +339,7 @@ mod tests {
         state.cursor = 0;
         let mut mem = ScrollMemory::default();
         let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut mem, None, &vfs(), &top_opts())).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut mem, None, &vfs(), &top_opts(), &theme())).unwrap();
         // End-to-end: the render path measures multi-column geometry and reports
         // it back through list_geom() (what the kernel copies into AppState).
         let geom = mem.list_geom();
@@ -343,7 +361,7 @@ mod tests {
             label: "delete".into(),
         }))));
         let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
         let buf = t.backend().buffer();
         let text: String = (0..buf.area.height)
             .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
@@ -379,7 +397,7 @@ mod tests {
         state.function.visible = true;
         let opts = TopOptions { border_style: "rounded".into(), ..TopOptions::default() };
         let mut t = Terminal::new(TestBackend::new(90, 14)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &opts)).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &opts, &theme())).unwrap();
         let b = t.backend().buffer();
         let y = 4; // divider row
         let row: String = (0..b.area.width).map(|x| b[(x, y)].symbol()).collect();
@@ -426,7 +444,7 @@ mod tests {
             state.function.ratio = ratio;
             for w in 78u16..=96 {
                 let mut t = Terminal::new(TestBackend::new(w, 14)).unwrap();
-                t.draw(|f| render(f, &state, &exts, &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
+                t.draw(|f| render(f, &state, &exts, &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
                 let b = t.backend().buffer();
                 let row: String = (0..b.area.width).map(|x| b[(x, 4)].symbol()).collect();
                 // The label `[ examples ]` must always be intact, and there must be
@@ -480,7 +498,7 @@ mod tests {
         // These widths all place a prop/monitor `┴` inside the filename region.
         for w in [80u16, 81, 91, 100, 105, 108] {
             let mut t = Terminal::new(TestBackend::new(w, 30)).unwrap();
-            t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
+            t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
             let b = t.backend().buffer();
             let row: String = (0..b.area.width).map(|x| b[(x, 6)].symbol()).collect();
             assert!(
@@ -492,14 +510,18 @@ mod tests {
 
     #[test]
     fn help_is_negative_colored() {
+        let th = theme();
         let state = AppState::new(std::env::temp_dir());
         let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &th)).unwrap();
         let buf = t.backend().buffer();
         let y = buf.area.height - 1; // help row
-        let reversed = (0..buf.area.width)
-            .any(|x| buf[(x, y)].modifier.contains(Modifier::REVERSED));
-        assert!(reversed, "help line should be reverse-video");
+        // The bar fills with HelpBg edge to edge, and the trigger-key chips are a
+        // distinct (negative) HelpKeyBg — both colors must appear on the row.
+        let has_bar = (0..buf.area.width).any(|x| buf[(x, y)].bg == th.role(Role::HelpBg));
+        let has_chip = (0..buf.area.width).any(|x| buf[(x, y)].bg == th.role(Role::HelpKeyBg));
+        assert!(has_bar, "help bar fills the row with the bar background");
+        assert!(has_chip, "help bar shows negative key chips");
     }
 
     #[test]
@@ -532,7 +554,7 @@ mod tests {
                 s.focused_panel = "function".into();
             }
             let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-            t.draw(|f| render(f, &s, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
+            t.draw(|f| render(f, &s, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
             let buf = t.backend().buffer();
             buf.content.iter().filter(|c| c.modifier.contains(Modifier::REVERSED)).count()
         };
@@ -546,14 +568,14 @@ mod tests {
     fn nav_renders_breadcrumb_columns() {
         let state = AppState::new(std::env::temp_dir().join("a").join("b"));
         let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
+        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
         let b = t.backend().buffer();
         let text: String = (0..b.area.height)
             .flat_map(|y| (0..b.area.width).map(move |x| (x, y)))
             .map(|(x, y)| b[(x, y)].symbol().to_string())
             .collect();
         // The nav panel carries the app banner as its (unbracketed) title.
-        assert!(text.contains("wasdf ver"), "expected the nav banner title");
+        assert!(text.contains("wasdf v"), "expected the nav banner title");
     }
 
     #[test]
@@ -564,7 +586,7 @@ mod tests {
         let mut state = AppState::new(std::env::temp_dir());
         state.function.visible = true;
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
+        terminal.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
         let buf = terminal.backend().buffer();
         let (w, h) = (buf.area.width, buf.area.height);
         let row = |y: u16| -> String { (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>() };
@@ -586,7 +608,7 @@ mod tests {
         let mut state = AppState::new(std::env::temp_dir());
         state.function.visible = true;
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        terminal.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
+        terminal.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
         let buf = terminal.backend().buffer();
         let h = buf.area.height;
         // The corner where the top panel meets the main area: `└`, not `├`.
@@ -604,7 +626,7 @@ mod tests {
     fn borders_are_connected_with_junctions() {
         let state = AppState::new(std::env::temp_dir());
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        terminal.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts())).unwrap();
+        terminal.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
         let buf = terminal.backend().buffer();
         let (w, h) = (buf.area.width, buf.area.height);
         let row = |y: u16| -> String {

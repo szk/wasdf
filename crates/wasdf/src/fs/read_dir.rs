@@ -53,27 +53,7 @@ pub fn make_entry_from(path: PathBuf, name: String, symlink_meta: Option<std::fs
 /// the link nature and target.
 pub fn make_entry(path: PathBuf, name: String) -> Entry {
     let link_meta = std::fs::symlink_metadata(&path).ok();
-    let is_symlink = link_meta.as_ref().map(|m| m.file_type().is_symlink()).unwrap_or(false);
-    let symlink_target = if is_symlink {
-        std::fs::read_link(&path).ok()
-    } else {
-        None
-    };
-    let meta = std::fs::metadata(&path).ok().or(link_meta);
-    let (is_dir, size, mode, uid, gid, modified, created, accessed) = match &meta {
-        Some(m) => (
-            m.is_dir(),
-            m.len(),
-            m.permissions().mode(),
-            m.uid(),
-            m.gid(),
-            m.modified().ok(),
-            m.created().ok(),
-            m.accessed().ok(),
-        ),
-        None => (false, 0, 0, 0, 0, None, None, None),
-    };
-    Entry { path, name, is_dir, is_symlink, size, mode, uid, gid, modified, created, accessed, symlink_target, activation: None }
+    make_entry_from(path, name, link_meta)
 }
 
 /// A bounded recursive walk yielding file paths relative-friendly for ranking.

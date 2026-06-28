@@ -6,5 +6,5 @@ pub mod matcher;
 pub mod resolver;
 
 pub use command::CommandRegistry;
-pub use matcher::{FileKind, MatcherBackend, MatcherConfig, RankedEntry, SkimMatcher, rank_paths};
+pub use matcher::{MatcherBackend, MatcherConfig, RankedEntry, SkimMatcher, rank_paths};
 pub use resolver::ResolverChain;

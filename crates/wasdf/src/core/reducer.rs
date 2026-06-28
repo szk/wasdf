@@ -100,6 +100,7 @@ pub fn apply_intent(state: &mut AppState, intent: Intent, ctx: &dyn CommandLooku
         Intent::CursorRight => cursor_move(state, Dir::Right),
         Intent::Activate => activate(state),
         Intent::NavigateTo(path) => navigate_to(state, path),
+        Intent::ToggleVfsRoot => toggle_vfs_root(state),
 
         // --- Function cursor (operate the panel from the file panel) ----
         Intent::FuncUp => {
@@ -639,6 +640,21 @@ fn navigate_to(state: &mut AppState, path: PathBuf) -> Effects {
     state.selection.clear();
     state.pending_focus = focus;
     read_dir_effect(state)
+}
+
+/// Toggle between the current real directory and the VFS root (`@`). From a real
+/// path, remember it and jump to `@`; from anywhere virtual, return to the
+/// remembered path (falling back to the home directory if none was saved).
+fn toggle_vfs_root(state: &mut AppState) -> Effects {
+    if vfs::is_virtual(&state.cwd) {
+        let target = state.root_return.take().unwrap_or_else(|| {
+            std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+        });
+        navigate_to(state, target)
+    } else {
+        state.root_return = Some(state.cwd.clone());
+        navigate_to(state, vfs::vfs_root())
+    }
 }
 
 fn push_mode(state: &mut AppState, mode: Mode, ctx: &dyn CommandLookup) -> Effects {

@@ -4,7 +4,7 @@
 //! contains no intent-specific branches beyond the two structural gates the
 //! spec names (extension resolver key, destructive → Policy).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
@@ -38,6 +38,9 @@ pub struct App {
     pub vfs: Arc<crate::vfs::Vfs>,
     pub rx: Receiver<AppEvent>,
     pub tx: Sender<AppEvent>,
+    /// The shared theme registry. `event_loop` reads `resolve_active()` once per
+    /// frame; `ThemeExtension` holds a clone for authoring.
+    pub theme_registry: Arc<RwLock<crate::extension::theme::ThemeRegistry>>,
     pending_suspend: Option<Vec<String>>,
     /// The last cursor identity broadcast to extensions (target path + panel
     /// visibility), so the cursor-changed event fires only on an actual change.
@@ -120,9 +123,36 @@ impl App {
             noise_dirs: store.get_list("matcher.noise-dirs"),
         }));
 
+        // ── ThemeRegistry ──────────────────────────────────────────────────────
+        // Parse the bundled presets and build the registry. `ThemeExtension` is
+        // constructed before `SettingsExtension` so its `settings_nodes()` can be
+        // collected and passed into the settings constructor (plan §11, choice (b)).
+        let theme_presets = {
+            let datum = crate::script::sexpr::parse(extension::theme::PRESETS_SCHEME)
+                .unwrap_or(crate::script::sexpr::Datum::List(vec![]));
+            let inner = datum.as_list()
+                .and_then(|l| l.get(1))
+                .cloned()
+                .unwrap_or(crate::script::sexpr::Datum::List(vec![]));
+            crate::script::config::parse_theme_config(&inner)
+        };
+        let theme_registry: Arc<RwLock<extension::theme::ThemeRegistry>> =
+            Arc::new(RwLock::new(extension::theme::ThemeRegistry::with_presets(theme_presets)));
+
+        let theme_ext = extension::theme::ThemeExtension::new(
+            theme_registry.clone(),
+            config_dir().map(|d| d.join("config.scm")),
+        );
+
+        // Collect SettingsNode contributions from theme_ext before building
+        // settings_ext (plan §11 choice (b): no interior mutability needed).
+        let settings_nodes: Vec<std::sync::Arc<dyn extension::settings::SettingsNode>> =
+            theme_ext.settings_nodes();
+
         let settings_ext = extension::settings::SettingsExtension::new(
             store.clone(),
             matcher_cfg.clone(),
+            settings_nodes,
             config_dir().map(|d| d.join("config.scm")),
         );
 
@@ -138,12 +168,13 @@ impl App {
             ext.register_conditions(&mut conditions);
             extensions.register(ext);
         }
-        // Bookmarks and settings registered separately (they need shared Arcs).
+        // Bookmarks, settings, and theme registered separately (they need shared Arcs).
         // Settings is registered before optional extensions so its ID wins any
         // collision from an optional extension with the same name.
         extensions.register(Box::new(bookmarks_ext));
         vfs.extend(settings_ext.vfs_providers());
         extensions.register(Box::new(settings_ext));
+        extensions.register(Box::new(theme_ext));
 
         // Optional (dynamically loaded) extensions: in file-name order; an id
         // collision disables the later one.
@@ -212,6 +243,7 @@ impl App {
             vfs,
             rx,
             tx,
+            theme_registry,
             pending_suspend: None,
             last_cursor: (None, false, 0),
             option_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -593,23 +625,35 @@ fn scheme_keymaps(session: &crate::script::SchemeSession) -> Vec<Binding> {
     )
 }
 
-/// Parse the core option declarations (`options.scm`) into `OptionDef`s. Uses
-/// the session when ready; falls back to direct `sexpr::parse` on the quoted
-/// literal (same dual-path as keymaps).
+/// Shared dual-path Scheme evaluator: when the session is ready, evaluate `src`
+/// through it and re-parse the printed result; otherwise parse the quoted literal
+/// directly and unwrap the inner datum. Both paths return a `Datum` ready for a
+/// config parser. `kind_desc` names the source for error messages.
+fn eval_quoted_scheme(
+    session: &crate::script::SchemeSession,
+    ready: bool,
+    src: &str,
+    kind_desc: &str,
+) -> Result<crate::script::sexpr::Datum, String> {
+    if ready {
+        session.eval(src).and_then(|p| crate::script::sexpr::parse(&p))
+    } else {
+        crate::script::sexpr::parse(src).and_then(|d| {
+            d.as_list()
+                .and_then(|l| l.get(1).cloned())
+                .ok_or_else(|| format!("{kind_desc} is not a (quote …) form"))
+        })
+    }
+}
+
+/// Parse the core option declarations (`options.scm`) into `OptionDef`s.
 fn scheme_core_option_defs(
     session: &crate::script::SchemeSession,
     ready: bool,
 ) -> Vec<OptionDef> {
-    let inner = if ready {
-        session.eval(CORE_OPTIONS_SCHEME).and_then(|p| crate::script::sexpr::parse(&p))
-    } else {
-        crate::script::sexpr::parse(CORE_OPTIONS_SCHEME).and_then(|d| {
-            d.as_list()
-                .and_then(|l| l.get(1).cloned())
-                .ok_or_else(|| "core options source is not a (quote …) form".to_string())
-        })
-    };
-    match inner.and_then(|d| crate::script::config::parse_option_config(&d)) {
+    match eval_quoted_scheme(session, ready, CORE_OPTIONS_SCHEME, "core options source")
+        .and_then(|d| crate::script::config::parse_option_config(&d))
+    {
         Ok(defs) => defs,
         Err(e) => {
             eprintln!("core option defs failed ({e}); no options registered");
@@ -618,8 +662,7 @@ fn scheme_core_option_defs(
     }
 }
 
-/// Parse an extension's `option_scheme()` into `OptionDef`s. Same dual-path
-/// (session / direct parse) as `extension_scheme_keymaps`.
+/// Parse an extension's `option_scheme()` into `OptionDef`s.
 fn extension_option_defs(
     session: &crate::script::SchemeSession,
     ready: bool,
@@ -628,16 +671,9 @@ fn extension_option_defs(
     let Some(src) = ext.option_scheme() else {
         return Vec::new();
     };
-    let inner = if ready {
-        session.eval(&src).and_then(|p| crate::script::sexpr::parse(&p))
-    } else {
-        crate::script::sexpr::parse(&src).and_then(|d| {
-            d.as_list()
-                .and_then(|l| l.get(1).cloned())
-                .ok_or_else(|| "extension option source is not a (quote …) form".to_string())
-        })
-    };
-    match inner.and_then(|d| crate::script::config::parse_option_config(&d)) {
+    match eval_quoted_scheme(session, ready, &src, "extension option source")
+        .and_then(|d| crate::script::config::parse_option_config(&d))
+    {
         Ok(defs) => defs,
         Err(e) => {
             eprintln!("extension '{}' option defs failed ({e}); ignoring", ext.id());
@@ -647,9 +683,7 @@ fn extension_option_defs(
 }
 
 /// Evaluate an extension's declarative Scheme source into Extension-layer keymap
-/// bindings. Uses the resident Scheme session when ready (Role 1: the session is
-/// the config parser); if not yet ready, parses the quoted literal directly so
-/// bindings still register. The source is `(quote ((mode panel (binding…)) …))`.
+/// bindings. The source is `(quote ((mode panel (binding…)) …))`.
 fn extension_scheme_keymaps(
     session: &crate::script::SchemeSession,
     ready: bool,
@@ -658,16 +692,9 @@ fn extension_scheme_keymaps(
     let Some(src) = ext.scheme_source() else {
         return Vec::new();
     };
-    let groups = if ready {
-        session.eval(&src).and_then(|printed| crate::script::sexpr::parse(&printed))
-    } else {
-        crate::script::sexpr::parse(&src).and_then(|d| {
-            d.as_list()
-                .and_then(|l| l.get(1).cloned())
-                .ok_or_else(|| "extension scheme source is not a (quote …) form".to_string())
-        })
-    };
-    match groups.and_then(|d| crate::script::config::parse_keymap_config(&d, Layer::Extension)) {
+    match eval_quoted_scheme(session, ready, &src, "extension scheme source")
+        .and_then(|d| crate::script::config::parse_keymap_config(&d, Layer::Extension))
+    {
         Ok(binds) => binds,
         Err(e) => {
             eprintln!("extension '{}' scheme keymap failed ({e}); ignoring", ext.id());
@@ -811,9 +838,12 @@ fn parse_user_config(
                     p.get(2).and_then(|d| d.text()).ok_or("set-option missing value")?.to_string();
                 opts.push((key, val));
             }
-            Some(other) => {
-                eprintln!("user config: unknown form '{other}'; skipping");
-            }
+            // Theme forms live in the same managed block but are consumed by the
+            // theme extension's own boot loader (see extension/theme.rs), not here.
+            Some("set-theme") | Some("define-theme") => {}
+            // Other unrecognised forms are skipped silently: this runs after the
+            // TUI owns the alternate screen, so an eprintln would corrupt it.
+            Some(_) => {}
             None => return Err("empty config form".into()),
         }
     }
@@ -904,11 +934,13 @@ impl App {
     }
 
     fn render_provider(&self) -> Option<crate::extension::FunctionDraw> {
+        let theme = crate::core::Theme::default();
         let ctx = crate::extension::FunctionRenderCtx {
             width: 80,
             height: 24,
             focused: true,
             func: &self.state.function,
+            theme: &theme,
         };
         self.extensions.provider().and_then(|p| p.render_function(&ctx))
     }

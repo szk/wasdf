@@ -11,8 +11,10 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+
+use crate::core::{Role, Theme};
 
 const N: u8 = 1;
 const S: u8 = 2;
@@ -25,6 +27,31 @@ pub struct ScrollInfo {
     pub total: usize,
     pub viewport: usize,
     pub position: usize,
+}
+
+/// The glyphs used to draw a panel's right-border scrollbar, configurable under
+/// `@/settings/Display`.
+#[derive(Clone)]
+pub struct ScrollbarChars {
+    /// The moving block.
+    pub thumb: String,
+    /// The track behind the thumb (when the panel is scrollable).
+    pub rail: String,
+    /// What fills the column when scrolling is unnecessary (the panel fully fits).
+    pub disabled: String,
+}
+
+impl Default for ScrollbarChars {
+    fn default() -> Self {
+        ScrollbarChars { thumb: "█".into(), rail: "│".into(), disabled: "│".into() }
+    }
+}
+
+impl ScrollbarChars {
+    /// First char of a configured glyph, falling back to `default` when empty.
+    fn glyph(s: &str, default: char) -> char {
+        s.chars().next().unwrap_or(default)
+    }
 }
 
 /// A panel to frame: its outer rect, optional title (left of the top border),
@@ -135,14 +162,14 @@ pub fn inner_open_bottom(rect: Rect) -> Rect {
     }
 }
 
-/// Track and thumb symbols for the right-border scrollbar, matched to the
-/// border style so the track is the same glyph as the side border.
-fn scrollbar_symbols(style: &str) -> (&'static str, &'static str) {
-    // (track, thumb)
+/// The horizontal rule glyph for a border style — the only character the
+/// bottom-border painter should treat as border padding (so a literal `-` inside
+/// a path/name is rendered as label text, not mistaken for the rule).
+fn rule_char(style: &str) -> char {
     match style {
-        "double" => ("║", "█"),
-        "ascii"  => ("|", "#"),
-        _        => ("│", "█"), // single, rounded, and any unrecognised value
+        "double" => '═',
+        "ascii" => '-',
+        _ => '─', // single, rounded, and any unrecognised value
     }
 }
 
@@ -177,14 +204,19 @@ fn glyph(mask: u8, style: &str) -> char {
 }
 
 /// Render the connected border, titles, and scrollbars for all panels.
-pub fn render(frame: &mut Frame, panels: &[PanelFrame], border_style: &str) {
+pub fn render(
+    frame: &mut Frame,
+    panels: &[PanelFrame],
+    border_style: &str,
+    scrollbar: &ScrollbarChars,
+    theme: &Theme,
+) {
     let area = frame.area();
     let (w, h) = (area.width as usize, area.height as usize);
     if w == 0 || h == 0 {
         return;
     }
     let mut mask = vec![0u8; w * h];
-    let mut focus = vec![false; w * h];
 
     // Accumulate each panel's outline into the connection mask.
     for p in panels {
@@ -199,9 +231,6 @@ pub fn render(frame: &mut Frame, panels: &[PanelFrame], border_style: &str) {
                 let (cx, cy) = ((x - area.x) as usize, (y - area.y) as usize);
                 if cx < w && cy < h {
                     mask[cy * w + cx] |= bits;
-                    if p.focused {
-                        focus[cy * w + cx] = true;
-                    }
                 }
             }
         };
@@ -247,11 +276,7 @@ pub fn render(frame: &mut Frame, panels: &[PanelFrame], border_style: &str) {
                 if m == 0 {
                     continue;
                 }
-                let style = if focus[cy * w + cx] {
-                    Style::default().fg(Color::Cyan)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
+                let style = Style::default().fg(theme.role(Role::Border));
                 let x = area.x + cx as u16;
                 let y = area.y + cy as u16;
                 if let Some(cell) = buf.cell_mut((x, y)) {
@@ -261,23 +286,38 @@ pub fn render(frame: &mut Frame, panels: &[PanelFrame], border_style: &str) {
             }
         }
 
-        // Titles embedded in the top border: ─[ title ]─.
+        // Titles embedded in the top border: ─[ title ]─. The `[ ` / ` ]`
+        // brackets carry their own role so they can be themed apart from the
+        // title text (banners are unbracketed and use the title role only).
         for p in panels {
             let Some(title) = &p.title else { continue };
             if p.rect.width < 6 {
                 continue;
             }
-            let style = if p.focused {
-                Style::default().fg(Color::Cyan)
+            // A banner (unbracketed title, e.g. the top-left `/ wasdf … /`) is the
+            // nameplate; bracketed panel titles use the title / title-bracket roles.
+            let text_style = if !p.bracket {
+                Style::default().fg(theme.role(Role::Nameplate))
+            } else if p.focused {
+                Style::default().fg(theme.role(Role::TitleFocused))
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(theme.role(Role::Title))
+            };
+            let bracket_style = if p.focused {
+                Style::default().fg(theme.role(Role::TitleBracketFocused))
+            } else {
+                Style::default().fg(theme.role(Role::TitleBracket))
             };
             let label = if p.bracket { format!("[ {title} ]") } else { title.clone() };
+            let full_len = label.chars().count();
             let max = p.rect.width.saturating_sub(4) as usize;
             let label: String = label.chars().take(max).collect();
             let mut x = p.rect.x + 2;
             let y = p.rect.y;
-            for ch in label.chars() {
+            for (i, ch) in label.chars().enumerate() {
+                // The first two (`[ `) and last two (` ]`) chars are brackets.
+                let is_bracket = p.bracket && (i < 2 || i >= full_len.saturating_sub(2));
+                let style = if is_bracket { bracket_style } else { text_style };
                 let (cx, cy) = ((x - area.x) as usize, (y - area.y) as usize);
                 // Only skip cells where a vertical border continues southward
                 // into this panel's content (S bit set). An N-only junction (a
@@ -294,19 +334,41 @@ pub fn render(frame: &mut Frame, panels: &[PanelFrame], border_style: &str) {
             }
         }
 
-        // Info embedded in the top border, right-aligned (e.g. load + clock).
+        // Info embedded in the top border, right-aligned (e.g. the clock). It is a
+        // bracketed label `[ … ]` possibly trailed by border rule (`──`): the
+        // brackets take the title-bracket role, the inner text the title role, and
+        // the trailing rule the border color. (Position-based so a `-` inside the
+        // clock text is never mistaken for an ascii rule.)
         for p in panels {
             let Some(info) = &p.info else { continue };
             if p.rect.width < 6 {
                 continue;
             }
+            let title_style = if p.focused {
+                Style::default().fg(theme.role(Role::TitleFocused))
+            } else {
+                Style::default().fg(theme.role(Role::Title))
+            };
+            let bracket_style = if p.focused {
+                Style::default().fg(theme.role(Role::TitleBracketFocused))
+            } else {
+                Style::default().fg(theme.role(Role::TitleBracket))
+            };
+            let border_c = Style::default().fg(theme.role(Role::Border));
             let max = p.rect.width.saturating_sub(4) as usize;
-            let label: String = info.chars().take(max).collect();
-            let len = label.chars().count() as u16;
+            let chars: Vec<char> = info.chars().take(max).collect();
+            let len = chars.len() as u16;
+            let close = chars.iter().rposition(|&c| c == ']').unwrap_or(chars.len());
             let y = p.rect.y;
             let mut x = (p.rect.x + p.rect.width).saturating_sub(1 + len).max(p.rect.x + 2);
-            let style = Style::default().fg(Color::Gray);
-            for ch in label.chars() {
+            for (i, &ch) in chars.iter().enumerate() {
+                let style = if ch == '[' || ch == ']' {
+                    bracket_style
+                } else if i > close {
+                    border_c
+                } else {
+                    title_style
+                };
                 let (cx, cy) = ((x - area.x) as usize, (y - area.y) as usize);
                 let junction = cx < w && cy < h && mask[cy * w + cx] & S != 0;
                 if !junction {
@@ -325,22 +387,29 @@ pub fn render(frame: &mut Frame, panels: &[PanelFrame], border_style: &str) {
         // top border, so a function-panel title may already have been painted here.
         // Three outcomes per cell, in priority order:
         //
-        //   1. A real label character (anything but a horizontal rule) always wins.
-        //      It overwrites the border glyph and any bled title, so the path and
+        //   1. A real label character (anything but a horizontal rule — brackets
+        //      and the path/name text) always wins, in the Nameplate color. It
+        //      overwrites the border glyph and any bled title, so the path and
         //      filename stay intact even where a divider or a title char sits.
-        //   2. A rule/padding character (`═` etc.) over a *junction* cell (any
-        //      vertical stem, N or S) repaints the **junction glyph**. The rule
-        //      yields to the connected chrome — and, crucially, this erases any
-        //      function title that bled here, so a `┴`/`╦` shows, never a stray
-        //      letter (e.g. `[ debug ]e[ examples ]`).
-        //   3. A rule character over a plain cell paints the rule.
+        //   2. A rule/padding character (`═` etc.) is part of the border line, so
+        //      it takes the **Border** color, not the Nameplate color — whether it
+        //      is the `─` padding/separators woven between `]…[` labels or a
+        //      junction stem. Over a *junction* cell (any vertical stem, N or S)
+        //      it repaints the connected junction glyph (`┴`/`╦`), which also
+        //      erases any function title that bled onto this shared row.
         //
         // The text belongs to the whole connected bottom line, so it is clamped to
         // the frame's right edge (the closing corner), not the carrier panel's own
         // width — a path may flow rightward across neighbouring panel sections.
         let frame_right = area.x + area.width - 1;
         let paint_bottom = |buf: &mut ratatui::buffer::Buffer, mut x: u16, y: u16, text: &str| {
-            let label_style = Style::default().fg(Color::Gray);
+            // The bracketed path/name labels are themed like panel titles: the
+            // `[`/`]` brackets take the title-bracket role, the inner text the
+            // title role, and the rule/padding the border color.
+            let title_style = Style::default().fg(theme.role(Role::Title));
+            let bracket_style = Style::default().fg(theme.role(Role::TitleBracket));
+            let border_style_fg = Style::default().fg(theme.role(Role::Border));
+            let rule = rule_char(border_style);
             for ch in text.chars() {
                 if x >= frame_right {
                     x += 1;
@@ -348,22 +417,22 @@ pub fn render(frame: &mut Frame, panels: &[PanelFrame], border_style: &str) {
                 }
                 let (cx, cy) = ((x - area.x) as usize, (y - area.y) as usize);
                 let m = if cx < w && cy < h { mask[cy * w + cx] } else { 0 };
-                let is_rule = matches!(ch, '═' | '─' | '-');
+                // Only the active border style's rule glyph is padding; a literal
+                // `-` in a directory name is label text, not a border rule.
+                let is_rule = ch == rule;
                 let stem = m & (N | S) != 0;
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    if is_rule && stem {
-                        // Restore the connected junction glyph, overwriting any
-                        // title that bled onto this shared row.
-                        let gstyle = if cx < w && cy < h && focus[cy * w + cx] {
-                            Style::default().fg(Color::Cyan)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        };
-                        cell.set_char(glyph(m, border_style));
-                        cell.set_style(gstyle);
+                    if is_rule {
+                        // Border-line rule/padding: Border color. Restore the
+                        // connected junction glyph where a stem crosses here.
+                        cell.set_char(if stem { glyph(m, border_style) } else { ch });
+                        cell.set_style(border_style_fg);
+                    } else if ch == '[' || ch == ']' {
+                        cell.set_char(ch);
+                        cell.set_style(bracket_style);
                     } else {
                         cell.set_char(ch);
-                        cell.set_style(label_style);
+                        cell.set_style(title_style);
                     }
                 }
                 x += 1;
@@ -403,29 +472,40 @@ pub fn render(frame: &mut Frame, panels: &[PanelFrame], border_style: &str) {
             width: 1,
             height: track_h,
         };
-        let style = if p.focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
+        let style = Style::default().fg(theme.role(Role::Border));
+
+        // Disabled: the panel fully fits, so a scrollbar is meaningless — fill the
+        // column with the configured disabled glyph (by default a plain border).
+        if s.total <= s.viewport {
+            let ch = ScrollbarChars::glyph(&scrollbar.disabled, '│');
+            let buf = frame.buffer_mut();
+            for y in track.y..track.y + track.height {
+                if let Some(cell) = buf.cell_mut((track.x, y)) {
+                    cell.set_char(ch);
+                    cell.set_style(style);
+                }
+            }
+            continue;
+        }
+
         // ratatui maps `position` over `0..content_length`, reaching the track
         // bottom only when the *last row* is at the viewport top. Our `position`
         // is the scroll offset (the top visible row), which maxes out at
         // total - viewport (the last row at the viewport *bottom*). So feed it
         // the number of distinct offsets as the content length: then offset 0
         // puts the thumb at the top, the max offset puts it flush at the bottom,
-        // and the thumb length stays proportional to viewport / total. Content
-        // that fits (total <= viewport) gives one position and a full-height thumb.
+        // and the thumb length stays proportional to viewport / total.
         let positions = s.total.saturating_sub(s.viewport) + 1;
         let mut state = ScrollbarState::new(positions)
             .viewport_content_length(s.viewport)
             .position(s.position.min(positions - 1));
-        let (track_sym, thumb_sym) = scrollbar_symbols(border_style);
+        let thumb = scrollbar.thumb.chars().next().map(|_| scrollbar.thumb.as_str()).unwrap_or("█");
+        let rail = if scrollbar.rail.is_empty() { "│" } else { scrollbar.rail.as_str() };
         let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None)
-            .track_symbol(Some(track_sym))
-            .thumb_symbol(thumb_sym)
+            .track_symbol(Some(rail))
+            .thumb_symbol(thumb)
             .style(style);
         frame.render_stateful_widget(bar, track, &mut state);
     }
@@ -437,19 +517,24 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    fn default_theme() -> crate::core::Theme {
+        crate::core::Theme::default()
+    }
+
     /// Render one framed panel and return the glyphs down its right-border
-    /// (scrollbar) column, top to bottom.
-    fn scrollbar_column_style(scroll: ScrollInfo, style: &str) -> Vec<char> {
+    /// (scrollbar) column, top to bottom, using the given scrollbar glyphs.
+    fn scrollbar_column_chars(scroll: ScrollInfo, chars: &ScrollbarChars) -> Vec<char> {
         let rect = Rect { x: 0, y: 0, width: 10, height: 12 };
         let mut t = Terminal::new(TestBackend::new(10, 12)).unwrap();
-        t.draw(|f| render(f, &[PanelFrame::new(rect).scroll(scroll)], style)).unwrap();
+        t.draw(|f| render(f, &[PanelFrame::new(rect).scroll(scroll)], "single", chars, &default_theme()))
+            .unwrap();
         let buf = t.backend().buffer();
         let x = rect.x + rect.width - 1;
         (1..rect.height - 1).map(|y| buf[(x, y)].symbol().chars().next().unwrap()).collect()
     }
 
     fn scrollbar_column(scroll: ScrollInfo) -> Vec<char> {
-        scrollbar_column_style(scroll, "single")
+        scrollbar_column_chars(scroll, &ScrollbarChars::default())
     }
 
     // doc/UI.md, point 1: when the bottom of the scroll range is at the bottom of
@@ -459,35 +544,30 @@ mod tests {
     fn thumb_reaches_the_bottom_at_max_offset() {
         let col = scrollbar_column(ScrollInfo { total: 100, viewport: 10, position: 90 });
         assert_eq!(*col.last().unwrap(), '█', "thumb at the very bottom: {col:?}");
-        assert_eq!(col[0], '│', "track (not thumb) at the top: {col:?}");
+        assert_eq!(col[0], '│', "rail (not thumb) at the top: {col:?}");
     }
 
     #[test]
     fn thumb_sits_at_the_top_at_offset_zero() {
         let col = scrollbar_column(ScrollInfo { total: 100, viewport: 10, position: 0 });
         assert_eq!(col[0], '█', "thumb at the top: {col:?}");
-        assert_eq!(*col.last().unwrap(), '│', "track (not thumb) at the bottom: {col:?}");
+        assert_eq!(*col.last().unwrap(), '│', "rail (not thumb) at the bottom: {col:?}");
     }
 
     #[test]
-    fn content_that_fits_is_a_full_thumb() {
-        let col = scrollbar_column(ScrollInfo { total: 5, viewport: 10, position: 0 });
-        assert!(col.iter().all(|&c| c == '█'), "full-height thumb when content fits: {col:?}");
+    fn content_that_fits_shows_the_disabled_glyph() {
+        // Scrolling is unnecessary → the configured disabled glyph fills the column
+        // (not a full thumb).
+        let chars = ScrollbarChars { disabled: "·".into(), ..ScrollbarChars::default() };
+        let col = scrollbar_column_chars(ScrollInfo { total: 5, viewport: 10, position: 0 }, &chars);
+        assert!(col.iter().all(|&c| c == '·'), "disabled glyph when content fits: {col:?}");
     }
 
     #[test]
-    fn ascii_style_uses_pipe_track_and_hash_thumb() {
-        let s = ScrollInfo { total: 100, viewport: 10, position: 0 };
-        let col = scrollbar_column_style(s, "ascii");
-        assert_eq!(col[0], '#', "ascii thumb is '#': {col:?}");
-        assert_eq!(*col.last().unwrap(), '|', "ascii track is '|': {col:?}");
-    }
-
-    #[test]
-    fn double_style_uses_double_bar_track() {
-        let s = ScrollInfo { total: 100, viewport: 10, position: 0 };
-        let col = scrollbar_column_style(s, "double");
-        assert_eq!(col[0], '█', "double thumb is block: {col:?}");
-        assert_eq!(*col.last().unwrap(), '║', "double track is double-bar: {col:?}");
+    fn custom_thumb_and_rail_glyphs_are_honored() {
+        let chars = ScrollbarChars { thumb: "#".into(), rail: "|".into(), disabled: "|".into() };
+        let col = scrollbar_column_chars(ScrollInfo { total: 100, viewport: 10, position: 0 }, &chars);
+        assert_eq!(col[0], '#', "custom thumb is '#': {col:?}");
+        assert_eq!(*col.last().unwrap(), '|', "custom rail is '|': {col:?}");
     }
 }
