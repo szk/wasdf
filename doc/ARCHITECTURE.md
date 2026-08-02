@@ -26,13 +26,19 @@ The only service trait is MatcherBackend (fuzzy ranking; one shipped
 implementation, SkimMatcher — the trait is a test seam, not an extension
 point). `rank_paths` applies a two-stage affinity re-rank on top of the skim
 base score: stage 1 scores all candidates using a tail-biased fuzzy pass (no
-I/O); stage 2 stats the top `RERANK_N` (800) survivors and applies configurable
-affinity adjustments (tail bonus, depth penalty, length penalty, exec bonus,
-preferred/noise extension lists, noise-directory penalty). Only the final 500
-results are returned, each carrying the already-read symlink metadata to avoid
-double-statting. Weights and lists are tunable under `@/settings/Matcher`; the
-`MatcherConfig` struct lives in `services/matcher.rs` so the worker thread can
-import it without creating a `runtime → app` circular dependency. Services are
+I/O) and keeps the top `RERANK_N.max(max_results)` survivors (800 is only the
+default floor — a raised cap widens this too, so it isn't starved below what
+the final result needs); stage 2 stats those survivors and applies
+configurable affinity adjustments (tail bonus, depth penalty, length penalty,
+exec bonus, preferred/noise extension lists, noise-directory penalty). One
+setting bounds the whole pipeline end to end: `MatcherConfig::max_results`
+(`@/settings/Matcher/max-results`, default 65535) caps both the raw recursive
+`fs::walk`'s candidate pool and the final ranked result count returned —
+raising it raises what the Results panel can actually show, not just how much
+of the filesystem gets walked. Weights and lists are tunable under
+`@/settings/Matcher`; the `MatcherConfig` struct lives in `services/matcher.rs`
+so the worker thread can import it without creating a `runtime → app`
+circular dependency. Services are
 defined by the embedded Scheme defaults and extended through the Extension trait
 ([EXTENSION.md](EXTENSION.md)).
 
@@ -74,7 +80,7 @@ Rules:
   returning follow-up intents in Effects.
 - The reducer is pure and synchronous. All I/O happens in kernel async tasks.
 - Extensions are always called synchronously (`handle_intent`, `accept_content`,
-  `render_function`, `on_cursor_changed`) and return data/intents; the kernel owns
+  `view`, `on_cursor_changed`) and return data/intents; the kernel owns
   all execution and all state mutation (via the reducer).
 - **Cursor-changed is a generic broadcast.** When the cursor target or panel
   visibility changes, the kernel calls every registered extension's
@@ -91,17 +97,19 @@ variant. Extension intents travel as data ([EXTENSION.md](EXTENSION.md)).
 
 | Category | Intents | Notes |
 |----------|---------|-------|
-| Navigation | CursorUp, CursorDown, CursorTop, CursorBottom, CursorLeft, CursorRight, Activate, NavigateTo | Geometric: the four Cursor moves shift the cursor over the file-list geometry (`AppState.list_geom`); the left wall escapes to the parent directory; the Rows right wall acts on the entry (dir → enter, file → cycle the preview), Columns/Grid clamp. Activate (Enter) enters a directory or **opens the file** via the resolver from any cell ([UI.md](UI.md), File-list layouts + Enter semantics) |
+| Navigation | CursorUp, CursorDown, CursorTop, CursorBottom, CursorLeft, CursorRight, Activate, NavigateTo | Geometric: the four Cursor moves shift the cursor over the file-list geometry (`AppState.list_geom`); the left wall escapes to the parent directory; the Rows right wall acts on the entry (dir → enter, file → cycle the preview), Columns/Grid clamp. Activate (Enter) enters a directory or **opens the file** via the resolver from any cell ([UI.md](UI.md), File-list layouts + Enter semantics). The same four Cursor intents (plus Top/Bottom) also drive `Mode::InputForm`'s widgets, reinterpreted per kind — see UI.md's Input Form Mode |
 | Function cursor | FuncUp, FuncDown, FuncLeft, FuncRight | Operate the function panel from the file panel without moving focus: FuncUp/Down scroll vertically, FuncLeft/Right scroll the content horizontally |
-| Selection | ToggleSelect, SelectAll, ClearSelection | Selection is a path set ([UI.md](UI.md)) |
+| Selection | ToggleSelect, SelectAll, ClearSelection | Selection is a path set ([UI.md](UI.md)). ToggleSelect also flips `Mode::InputForm`'s `Bool` kind |
+| Filter | ClearFilter, FilterListing, SelectRefine | ClearFilter pops one level of the file-search filter stack (Esc, while `has-filter` holds), restoring the entries/cursor/query the panel showed before that level's query was committed; a no-op with no filter active. FilterListing and SelectRefine are the marker intents behind shallow filtering ([UI.md](UI.md)'s "Deep search vs. shallow filter"): both carry no data — the keymap codec builds intents statically without state access — so the reducer itself snapshots the entry pool to rank (`state.entries` for FilterListing, the active Select's `view.entries` for SelectRefine) and pushes a fresh `Mode::Select(SelectSpec::filter_list(pool))`; `push_mode` replaces rather than stacks when already inside a Select, so SelectRefine narrows in place. Ranking is synchronous in the reducer (`filter_entries`, subsequence-scored) — no plan, no I/O, works on virtual paths |
 | External commands | RunResolver, Open, Edit, Execute | RunResolver is the generic "build a command line and run it": copy / move / rename / mkdir / touch / delete are all RunResolver carrying a `ResolverRequest` (op + targets + dst/path + opts). Resolved and executed per the Resolver and Async contracts below |
 | Initiators | StartCopy, StartMove, StartRename, DeleteSelected, StartEdit | Expanded by the reducer into the operations above (Effects follow-up intents) |
 | Mode | PushMode, PopMode | Mode stack transitions |
-| Function panel | SetSubLayout, CycleFunctionPanel, HideFunctionPanel, ShowFunctionContent, UpdateFunctionView, LoadContent | View state, not modes ([UI.md](UI.md)). ShowFunctionContent stores an extension's `PanelContent`; UpdateFunctionView stores an extension's opaque `ext_view`; LoadContent issues the generic cursor-follow `Plan::Read` for a named content owner. Generic mechanisms, not per-feature ([EXTENSION.md](EXTENSION.md)) |
-| Scroll | ScrollUp, ScrollDown, ScrollTop, ScrollBottom, PageUp, PageDown, SetScroll | Function-panel vertical scroll; SetScroll jumps to an offset (e.g. a search match) |
+| Function panel | SetSubLayout, CycleFunctionPanel, HideFunctionPanel, ShowFunctionContent, UpdateFunctionView, LoadContent, LoadSearch, SetFunctionForm, HostFunctionForm | View state, not modes ([UI.md](UI.md)). ShowFunctionContent stores an extension's logical `PanelView` (core lays it out); UpdateFunctionView stores an extension's opaque `ext_view`; LoadContent issues the generic cursor-follow `Plan::Read` for a named content owner. LoadSearch{owner, root, query} is LoadContent's deep-search sibling: an owner-addressed `Plan::Search` that completes as a `Plan::Read`-shaped `accept_content` call instead of a bare search result (CmdOp's browse-directory search — [EXTENSION.md](EXTENSION.md)). SetFunctionForm claims/releases the panel as an interactive form *and* moves focus to it (CmdOp's builder, an explicit user action); HostFunctionForm does the same but passively — form_owner/visible only, `focused_panel` untouched — for a form that follows the file cursor instead (theme's per-role color editor), so the file panel keeps browsing while the form's own keys, scoped to the **file** panel, edit it directly. Generic mechanisms, not per-feature ([EXTENSION.md](EXTENSION.md)) |
+| Scroll | ScrollUp, ScrollDown, ScrollTop, ScrollBottom, PageUp, PageDown, SetScroll | Function-panel vertical scroll; SetScroll jumps to an offset (e.g. a search match). PageUp/PageDown also step `Mode::InputForm`'s `Color` kind's focused channel by ±10 |
 | Content search | FunctionSearchStart, FunctionSearchSubmit, FunctionSearchNext, FunctionSearchPrev, FunctionSearchCancel, SetSearchMatches, ResetContentView | Less-style search over function-panel content. Submit hands the query to the owning extension's matcher; SetSearchMatches stores the result (match state lives in core so `:when` can gate `n`/`p`) |
-| Dialog | Confirm, Cancel | Phase-interpreted in Select; allow / deny in Policy |
-| Select | RawKeyEvent | RawKeyEvent delivers unbound printable keys; the reducer applies them to the Select query or the content-search input. Select results navigate through the shared `Cursor*` intents (no result-specific intents): a path-valued Select (file-search) keeps its hits as an `EntryList` and renders + navigates them as the file panel does (grid layouts, 2-D moves, `v`); token-valued Selects move ±1 in their candidate list |
+| Dialog | Confirm, Cancel | Phase-interpreted in Select; allow / deny in Policy; pop + re-inject the encoded value in InputForm (the `List` kind's Enter is row-contextual — see UI.md) |
+| InputForm rows | AddItem, RemoveItem | The `List` kind's row add/remove, valid only while browsing rows (not mid-item-edit); a no-op in any other mode or kind ([UI.md](UI.md)) |
+| Select | RawKeyEvent | RawKeyEvent delivers unbound printable keys; the reducer applies them to the Select query or the content-search input. Select results navigate through the shared `Cursor*` intents (no result-specific intents): a path-valued Select (file-search) keeps its hits as an `EntryList` and renders + navigates them as the file panel does (grid layouts, 2-D moves, `v`); token-valued Selects move ±1 in their candidate list. Confirming file-search does not reach `OnConfirm::Navigate` at all — it is special-cased in `select_confirm` to commit straight into File mode (see UI.md's Select Mode) |
 | Panel | FocusNextPanel, FocusPrevPanel, FocusPanel | |
 | View | ToggleDotFiles, ToggleLineNumbers, CycleListLayout | CycleListLayout cycles the file-list arrangement Rows → Columns → Grid ([UI.md](UI.md)) |
 | Process | KillProcess | Exec frame only |
@@ -130,7 +138,7 @@ extension's function-panel content is loaded by the generic Read plan.
 | Plan | Representative intents | purpose | Execution | payload |
 |------|------------------------|---------|-----------|---------|
 | ReadDir | CursorRight on a directory, CursorLeft, NavigateTo, Refresh, ToggleDotFiles | refresh | async directory read | Entries |
-| Search | the file-search walk; the kernel applies matcher ranking in a blocking task | search | walk + two-stage affinity re-rank | Entries (ranked) |
+| Search | the file-search walk; CmdOp's deep destination search | search (owner: None) / content (owner: Some) | walk + two-stage affinity re-rank | Entries (ranked, owner: None) / Read (owner: Some — `ReadResult::Dir`, routed through the same `accept_content` path as Read) |
 | Read | cursor-follow content load (any function-panel content provider) | content | async read of a path: one **bounded byte chunk from an offset** (the owner pages further chunks by re-issuing `LoadContent` with a new offset), or a directory's entries | Read (owner + path + offset; ReadResult::Bytes{offset,bytes,eof} / Dir) |
 | ResolveAndRun | RunResolver (copy/move/rename/mkdir/touch/delete), Open, extension plans | resolver | Background: detached process, no output capture, completion notification only | OpDone |
 | Execute | Execute | execute | Captured: stdout streamed line-by-line into the Exec frame, stderr appended at exit | ExecOutput |
@@ -253,9 +261,18 @@ There is no retry UI. Failures are notified once and the operation ends.
 
 ### Destructive Confirmation
 
-Policy mode confirms exactly two things before execution: the Delete operation,
-and any resolver plan whose entry carries the destructive flag. Destructiveness
-is declared on the resolver entry, never by the intent that requests it.
+Policy mode confirms a resolver plan two ways before execution, combined by
+`App::needs_confirmation`: a **static** flag on the entry (Delete is always
+destructive, declared on the resolver entry, never by the intent that
+requests it) — and, for `copy`/`move`/`rename` only, a **dynamic** check,
+`resolver::would_overwrite(req, cwd)`, run at dispatch time against the real
+filesystem: would the target path (or, for a directory destination, any
+source's `dst/basename(src)`) already exist? This is the `cp`/`mv -i`
+condition — it cannot be a fixed property of the entry the way `destructive`
+is, since the same operation is harmless against a new name and destructive
+against an existing one. Not evaluated for any other op: `mkdir -p` is
+idempotent and `touch` never erases a file's content, so neither one
+destroys anything by "overwriting".
 
 ### Who May Add Entries
 
@@ -269,8 +286,8 @@ is captured into the Exec frame.
 
 | Store | Contents | Mutation |
 |-------|----------|----------|
-| Mode stack | Mode-defining specs: SelectSpec (including static candidates, pending-operation sources, initial query), the Policy pending intent, extension mode state | Immutable per mode instance; replaced via mode transitions and UpdateExtensionState (reducer) |
-| AppState | Everything that affects behavior: cursor, path-based selection, directory entries, the file-list layout (`list_layout`) and last-rendered geometry (`list_geom`), FunctionPanelState (visibility, sublayout, ratio, vertical/horizontal scroll, line numbers, the active content owner id, an opaque per-extension `ext_view`, and `PanelSearch` — the content-search input + match list), Select runtime state (query, phase, ranked results, marks) | Reducer only, **except** the render-measured geometry the kernel refreshes after each draw — `function.scroll`/`hscroll` clamps and `list_geom` — so the pure reducer can scroll/move without seeing the viewport |
+| Mode stack | Mode-defining specs: SelectSpec (including static candidates, pending-operation sources, initial query), InputFormSpec (title, prefilled value, the re-injected extension intent template), the Policy pending intent, extension mode state | Immutable per mode instance; replaced via mode transitions and UpdateExtensionState (reducer) |
+| AppState | Everything that affects behavior: cursor, path-based selection, directory entries, the file-list layout (`list_layout`) and last-rendered geometry (`list_geom`), the file-search filter stack (`filter_stack`: saved pre-filter listings, innermost last; `filter_query`: the query behind the currently shown listing, `None` when unfiltered — see UI.md's "Filtering the file panel"), FunctionPanelState (visibility, sublayout, ratio, vertical/horizontal scroll, line numbers, the active content owner id, an opaque per-extension `ext_view`, and `PanelSearch` — the content-search input + match list), Select runtime state (query, phase, ranked results, marks), InputForm runtime state (typed value, cursor) | Reducer only, **except** the render-measured geometry the kernel refreshes after each draw — `function.scroll`/`hscroll` clamps and `list_geom` — so the pure reducer can scroll/move without seeing the viewport |
 | UiManager | Render-only caches: image protocol state, notification timers, computed layout, and the measured scroll/list geometry it hands back to the kernel post-draw | Imperative; never consulted by the reducer or handlers for decisions |
 
 If a value influences what an intent does, it lives in AppState or the Mode
@@ -288,11 +305,11 @@ shared types); implementations live inside the directory.
 
 | Module | Facade owns | Directory contents |
 |--------|-------------|--------------------|
-| core | re-exports | AppState (FunctionPanelState, PanelSearch, SelectState, path-based selection); Intent; reducer (the state machine — consumes (purpose, payload), query/search editing, phase switching); Mode, SelectSpec, OnConfirm (Resolve carries the ResolverRequest template + ResolveFill); ExtensionValue; AppEvent, Plan, AsyncResult; PanelContent, StyleRun, ReadResult |
+| core | re-exports | AppState (FunctionPanelState, PanelSearch, SelectState, InputFormState, path-based selection); Intent; reducer (the state machine — consumes (purpose, payload), query/search editing, phase switching); Mode, SelectSpec, OnConfirm (Resolve carries the ResolverRequest template + ResolveFill), InputFormSpec; ExtensionValue; AppEvent, Plan, AsyncResult; PanelView (Block/TextSpan/SpanStyle), ReadResult |
 | app | re-exports | The event loop; the kernel and `dispatch_intent` (extension dispatch, confirmation gate, plan issuance + reduction, the cursor-changed broadcast to extension subscribers, the option store); terminal init/restore and the Suspended execution form |
-| services | resolver and matcher type surfaces | CommandRegistry; confirmation spec; ResolverChain; MatcherBackend with SkimMatcher |
-| ui | re-exports | UiManager (render caches only); the frame compositor (`render`) and its top / middle / bottom bands; the top panel (nav and prop children); the main area (file list, select input + candidates, the function panel with its command summary); the generic content blitter (`content` — turns `PanelContent` + search/scroll into styled lines, shared by all content extensions); panel chrome (connected borders, titles, scrollbars); the help row |
-| extension | the bundled-extension list — the only place bundled extensions are named | the Extension trait (`provides_function_content`, `accept_content`, `render_function`, `scheme_source`, `keymaps`, `handle_intent`) with `FunctionRenderCtx`/`FunctionDraw`; ExtensionRegistry (loading rules, disable, the active content provider); the dynamic loader; the preview extension (decode / highlight / search submodules) and archive |
+| services | resolver and matcher type surfaces | CommandRegistry; confirmation spec; ResolverChain; MatcherBackend with SkimMatcher; the MessageLog behind `@/messages`, holding `(text, error)` pairs. `messages::log(text, error)` is the **single entry point for everything wasdf tells the user** — completion notices ("copy done", error = false) and diagnostics (a rejected config value, error = true) alike; it replaces `eprintln!` anywhere the TUI may hold the alternate screen, i.e. everything from boot onward, and is a process-global sink because its producers include the extension loader and the registries, which run before any owner could hand them a handle. The kernel drains the reducer's `Effects.notices` into the log too (`process_effects`), and the **only** `ui.notify` caller is the per-event-loop-pass pump (`surface_new_messages`, run before each draw, so a notice logged while handling an event shows in that event's own frame): it surfaces the newest unseen line, error attribute intact, as the single 4-second notice slot. Retention is capped by `@/settings/System/max-message-line`, newest listed first; the full history is `@/messages` |
+| ui | re-exports | UiManager (render caches only); the frame compositor (`render`) and its top / middle / bottom bands; the top panel (nav and prop children); the main area (file list, select input + candidates, the function panel with its command summary); the `PanelView` layout engine (`middle/function` + `content` — turns a logical `PanelView` + search/scroll into styled lines: label alignment, wrap/h-scroll, line numbers, theming, search highlight, image→cells; shared by all content extensions); panel chrome (connected borders, titles, scrollbars); the help row |
+| extension | the bundled-extension list — the only place bundled extensions are named | the Extension trait (`provides_function_content`, `accept_content`, `view`, `scheme_source`, `keymaps`, `handle_intent`) with `FunctionRenderCtx` (returns a logical `PanelView`); ExtensionRegistry (loading rules, disable, the active content provider); the dynamic loader; the preview extension (decode / highlight / search submodules) and archive |
 | script | re-exports | The resident steel (`steel-core`) session (dedicated thread + mpsc channel; Engine is `!Send`/`!Sync`); the single string codec and a small s-expression reader (the only place intent/key/mode/datum strings are parsed or formatted); the config decoders (keymaps, commands, resolvers ← Scheme); condition AST and native predicates; KeymapRegistry |
 | exec, fs, runtime | — | the external-command executor (Background/Captured forms — the resolver builds the argv, `exec` runs it) plus option extraction from a command's `--help`/`man`; async directory reading and the recursive walk; TaskManager (worker threads, one live task per unique purpose, streaming Execute, the generic Read) |
 

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::core::{AppState, Mode, SelectPhase, SubLayout};
+use crate::core::{AppState, InputFormState, Mode, SelectPhase, SubLayout};
 
 /// A condition AST. Unknown predicates evaluate to false.
 #[derive(Debug, Clone, PartialEq)]
@@ -85,9 +85,49 @@ impl Conditions {
             Box::new(|s| s.function.sublayout == SubLayout::Exec),
         );
         self.register("function-visible", Box::new(|s| s.function.visible));
+        self.register("has-filter", Box::new(|s| !s.filter_stack.is_empty()));
+        self.register(
+            "filter-maxed",
+            Box::new(|s| s.filter_stack.len() >= crate::core::state::MAX_FILTER_DEPTH),
+        );
         self.register(
             "mode-file",
             Box::new(|s| matches!(s.mode(), Mode::File)),
+        );
+        // Shallow-vs-deep `f` split (SEARCH_RENEW.md): a virtual cwd (@/...)
+        // has nothing for the recursive walk to read, so `f` there means
+        // "shallow-filter the current listing" instead of "deep search".
+        self.register("cwd-virtual", Box::new(|s| crate::vfs::is_virtual(&s.cwd)));
+        // Whether the active Select already holds a non-empty entry view (deep
+        // file-search results, or an earlier filter/refine) — gates `f` as
+        // shallow-refine inside a Select, as opposed to the file panel's own
+        // `filter-list` binding.
+        self.register(
+            "select-has-view",
+            Box::new(|s| {
+                s.select.as_ref().and_then(|sel| sel.view.as_ref()).is_some_and(|v| !v.entries.is_empty())
+            }),
+        );
+        // InputForm: gate the shared wasd/arrow/Space navigation bindings off
+        // while free text is being typed (the `Text` kind, or a `List` row's
+        // nested item edit), so those keys fall through as RawKeyEvent to
+        // tui-input instead of being intercepted as Cursor*/ToggleSelect.
+        self.register(
+            "input-form-typing",
+            Box::new(|s| match &s.input_form {
+                Some(InputFormState::Text { .. }) => true,
+                Some(InputFormState::List { editing, .. }) => editing.is_some(),
+                _ => false,
+            }),
+        );
+        // InputForm's `List` kind, row-browsing sub-state (not mid-item-edit):
+        // `a`/`d` mean add/remove a row here instead of their usual
+        // cursor-left/cursor-right meaning.
+        self.register(
+            "input-form-list-browsing",
+            Box::new(|s| {
+                matches!(&s.input_form, Some(InputFormState::List { editing: None, .. }))
+            }),
         );
     }
 }

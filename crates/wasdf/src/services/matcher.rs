@@ -25,6 +25,10 @@ pub struct MatcherConfig {
     pub noise_ext: Vec<String>,
     /// Directory components that trigger a −48 penalty.
     pub noise_dirs: Vec<String>,
+    /// The cap on raw entries a deep-search walk collects before ranking
+    /// (`@/settings/Matcher/max-results`). Bounds the recursive `fs::walk`
+    /// itself, not the post-rank display truncation.
+    pub max_results: usize,
 }
 
 impl Default for MatcherConfig {
@@ -38,6 +42,7 @@ impl Default for MatcherConfig {
             preferred_ext: csv("rs,toml,md,txt,sh,py,js,ts,json,c,h,go"),
             noise_ext: csv("lock,tmp,cache,log,o,d,rlib"),
             noise_dirs: csv("node_modules,.git,target,Caches,Library"),
+            max_results: 65535,
         }
     }
 }
@@ -196,7 +201,7 @@ pub fn rank_paths(
     if query.is_empty() {
         let mut paths = paths;
         paths.sort();
-        paths.truncate(500);
+        paths.truncate(cfg.max_results);
         return paths.into_iter().map(|p| RankedEntry { path: p, meta: None }).collect();
     }
 
@@ -210,7 +215,10 @@ pub fn rank_paths(
         .collect();
     // Sort descending by base score; path ascending as tiebreak.
     stage1.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
-    stage1.truncate(RERANK_N);
+    // Never stat fewer survivors than the final cap needs, so a raised
+    // max-results actually returns more results — RERANK_N (800) is only
+    // the default floor for the common, much smaller cap.
+    stage1.truncate(RERANK_N.max(cfg.max_results));
 
     // Stage 2: stat survivors (one symlink_metadata each), apply affinity.
     let mut stage2: Vec<(i64, PathBuf, Option<std::fs::Metadata>)> = stage1
@@ -229,7 +237,7 @@ pub fn rank_paths(
         })
         .collect();
     stage2.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    stage2.truncate(500);
+    stage2.truncate(cfg.max_results);
     stage2.into_iter().map(|(_, p, meta)| RankedEntry { path: p, meta }).collect()
 }
 
@@ -239,6 +247,10 @@ mod tests {
 
     fn cfg() -> MatcherConfig {
         MatcherConfig::default()
+    }
+
+    fn cfg_with_max(max_results: usize) -> MatcherConfig {
+        MatcherConfig { max_results, ..MatcherConfig::default() }
     }
 
     // ── affinity unit tests (pure, no I/O) ───────────────────────────────────
@@ -364,5 +376,24 @@ mod tests {
         let ranked = rank_paths(&m, root, paths, "src", &cfg());
         assert!(!ranked.is_empty(), "at least one match expected");
         assert_eq!(ranked[0].path, PathBuf::from("/r/src/main.rs"), "src/main.rs should rank first");
+    }
+
+    #[test]
+    fn rank_paths_empty_query_result_count_follows_max_results_not_a_hardcoded_500() {
+        let m = SkimMatcher::default();
+        let root = Path::new("/root");
+        let paths: Vec<PathBuf> = (0..10).map(|i| PathBuf::from(format!("/root/f{i}.txt"))).collect();
+        let ranked = rank_paths(&m, root, paths, "", &cfg_with_max(3));
+        assert_eq!(ranked.len(), 3, "the empty-query branch must respect the configured cap");
+    }
+
+    #[test]
+    fn rank_paths_query_result_count_follows_max_results_not_a_hardcoded_500() {
+        let m = SkimMatcher::default();
+        let root = Path::new("/root");
+        // 10 candidates all matching "f" so all 10 survive stage 1.
+        let paths: Vec<PathBuf> = (0..10).map(|i| PathBuf::from(format!("/root/f{i}.txt"))).collect();
+        let ranked = rank_paths(&m, root, paths, "f", &cfg_with_max(3));
+        assert_eq!(ranked.len(), 3, "the matched-query branch must respect the configured cap, not truncate(500)");
     }
 }

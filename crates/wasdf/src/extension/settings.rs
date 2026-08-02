@@ -1,8 +1,11 @@
 //! Settings extension: exposes app configuration as a navigable VFS tree under
-//! `@/settings`. Categories and leaves are generated dynamically from the shared
-//! `OptionStore`. Each leaf shows the current value and opens an inline editor on
-//! Enter. Confirmed edits apply live (via `OptionStore::set`) and persist to
-//! `~/.config/wasdf/config.scm` inside the managed block (unchanged writer).
+//! `@/settings`. Generated dynamically from the shared `OptionStore`: **core**
+//! options group by `category` at the root, while **extension-owned** options
+//! group under `@/settings/Extensions/<ext-id>` — one per-extension settings
+//! screen per extension that declared options (Preview's live there, not as a
+//! flat root category). Each leaf shows the current value and opens an inline
+//! editor on Enter. Confirmed edits apply live (via `OptionStore::set`) and
+//! persist to `~/.config/wasdf/config.scm` inside the managed block.
 //!
 //! After the `Options` struct was deleted, this extension is the only writer to
 //! the store for live edits. Matcher settings additionally refresh the shared
@@ -13,13 +16,13 @@ mod writer;
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::core::{
-    AppState, Candidate, Entry, ExtensionIntent, ExtensionValue, FunctionHint, Intent, Mode,
-    OptionKind, OptionStore, SelectSpec, KEY_ITEM,
+    AppState, Entry, ExtensionIntent, ExtensionValue, InputFormSpec, InputKind, Intent, Mode,
+    OptionKind, OptionStore, KEY_ITEM,
 };
-use crate::extension::Extension;
+use crate::extension::{About, Extension};
 use crate::services::MatcherConfig;
 use crate::vfs::{vfs_root, VfsProvider};
 
@@ -27,14 +30,18 @@ use writer::ConfigWriter;
 
 // ── SettingsNode ──────────────────────────────────────────────────────────────
 
-/// A navigable subtree grafted under a `@/settings/<category>` path. An
-/// extension implements this to serve a rich sub-panel (e.g. Themes) that the
+/// A navigable subtree grafted under a `@/settings/<category>` path — a core
+/// category (e.g. `Display`) or an extension's own screen (`Extensions/<id>`,
+/// anchored with the extension's id as the "category"). An extension
+/// implements this to serve a rich sub-panel (e.g. Themes) that the
 /// `SettingsProvider` cannot enumerate from the `OptionStore` alone.
 ///
 /// Activation leaves carry `ExtensionIntent { extension: "<owner>", … }` so
 /// the normal dispatch routes them back to the extension that owns the node.
 pub trait SettingsNode: Send + Sync {
-    /// Where this node grafts: `(category, node-name)`, e.g. `("Display","Themes")`.
+    /// Where this node grafts: `(category, node-name)`, e.g. `("Display","Themes")`
+    /// for a core category, or `("lscolors","Themes")` to graft onto that
+    /// extension's own `@/settings/Extensions/lscolors` screen.
     fn anchor(&self) -> (&str, &str);
     /// List the children of `path`, which is at or below
     /// `@/settings/<category>/<node>`. The node owns all entries at this
@@ -63,14 +70,62 @@ impl SettingsStore {
 
 // ── SettingsProvider ──────────────────────────────────────────────────────────
 
+/// One registered extension's id + About card, for the `@/settings/Extensions`
+/// listing. Populated once after all extensions are registered (the kernel knows
+/// the full set only then), so it is shared as a `OnceLock`.
+#[derive(Debug, Clone)]
+pub struct ExtInfo {
+    pub id: String,
+    pub about: About,
+}
+
+/// The set of registered extensions, filled once at the end of boot.
+pub type ExtInfos = Arc<OnceLock<Vec<ExtInfo>>>;
+
 pub struct SettingsProvider {
     store: Arc<SettingsStore>,
     nodes: Vec<Arc<dyn SettingsNode>>,
+    ext_infos: ExtInfos,
 }
 
 impl SettingsProvider {
-    fn new(store: Arc<SettingsStore>, nodes: Vec<Arc<dyn SettingsNode>>) -> Self {
-        SettingsProvider { store, nodes }
+    fn new(store: Arc<SettingsStore>, nodes: Vec<Arc<dyn SettingsNode>>, ext_infos: ExtInfos) -> Self {
+        SettingsProvider { store, nodes, ext_infos }
+    }
+
+    /// The registered extensions (or empty until boot fills them).
+    fn extensions(&self) -> &[ExtInfo] {
+        self.ext_infos.get().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The ids to list under `@/settings/Extensions`: all registered extensions,
+    /// falling back to the option-declaring owners before boot fills the list.
+    fn extension_ids(&self) -> Vec<String> {
+        let infos = self.extensions();
+        if infos.is_empty() {
+            self.store.option_store.owners()
+        } else {
+            infos.iter().map(|i| i.id.clone()).collect()
+        }
+    }
+
+    /// The About card for an extension id, if the list has been filled.
+    fn about_for(&self, id: &str) -> Option<&About> {
+        self.extensions().iter().find(|i| i.id == id).map(|i| &i.about)
+    }
+
+    /// The extension's precedence rank as `(1-based position, total)`, in the
+    /// order the kernel registers and consults extensions. That order is the
+    /// precedence for both input and display: a key collision resolves to the
+    /// **lowest**-ranked extension that binds it (earlier registration wins on a
+    /// tie — see `KeymapRegistry::resolve`), while the function panel is claimed
+    /// by the **highest**-ranked extension that pushes on a cursor event (later
+    /// registration overwrites — see the kernel's cursor-changed broadcast). So
+    /// if the top holder of a key is disabled, the key falls to the next-ranked
+    /// extension that binds it.
+    fn rank_of(&self, id: &str) -> Option<(usize, usize)> {
+        let ids = self.extension_ids();
+        ids.iter().position(|i| i == id).map(|p| (p + 1, ids.len()))
     }
 }
 
@@ -83,6 +138,42 @@ fn node_name_for(path: &Path) -> Option<&str> {
     })
 }
 
+/// The 5th path component of a virtual settings path:
+/// `@/settings/Extensions/<id>/<node>[/…]` → `Some("node")`. Used to detect a
+/// path reaching below an extension's own screen into a node it grafted there
+/// (e.g. lscolors' Themes), the `Extensions/<id>` analogue of a core
+/// category's node dirs.
+fn ext_subnode_name_for(path: &Path) -> Option<&str> {
+    use std::path::Component;
+    path.components().nth(4).and_then(|c| {
+        if let Component::Normal(s) = c { s.to_str() } else { None }
+    })
+}
+
+/// The root dir grouping every extension's own settings.
+const EXTENSIONS_DIR: &str = "Extensions";
+
+/// Capitalize the first character (for the display name of an extension id).
+fn display_name(id: &str) -> String {
+    let mut cs = id.chars();
+    match cs.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + cs.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Build one editable option leaf: `label: value`, activating the `settings`
+/// extension's inline editor for the key.
+fn option_leaf(path: PathBuf, key: &str, label: &str, value: &str) -> Entry {
+    let mut e = Entry::virtual_leaf(path, format!("{label}: {value}"));
+    e.activation = Some(ExtensionIntent {
+        extension: "settings".into(),
+        intent: "edit".into(),
+        data: ExtensionValue::String(key.to_string()),
+    });
+    e
+}
+
 impl VfsProvider for SettingsProvider {
     fn mount(&self) -> &str {
         "settings"
@@ -90,23 +181,105 @@ impl VfsProvider for SettingsProvider {
 
     fn list(&self, path: &Path) -> io::Result<Vec<Entry>> {
         let os = &self.store.option_store;
+        let base = || vfs_root().join("settings");
         match (crate::vfs::tail_after_mount(path), node_name_for(path)) {
-            // Root: list all settings categories.
+            // Root: the core categories, plus one "Extensions" dir grouping every
+            // registered extension's own settings + About (dynamic).
             (None, _) => {
-                Ok(os
-                    .categories()
+                let mut entries: Vec<Entry> = os
+                    .core_categories()
                     .into_iter()
-                    .map(|(cat, _)| {
-                        Entry::virtual_dir(
-                            vfs_root().join("settings").join(&cat),
-                            cat.clone(),
+                    .map(|(cat, _)| Entry::virtual_dir(base().join(&cat), cat.clone()))
+                    .collect();
+                if !self.extension_ids().is_empty() {
+                    entries.push(Entry::virtual_dir(
+                        base().join(EXTENSIONS_DIR),
+                        EXTENSIONS_DIR.to_string(),
+                    ));
+                }
+                Ok(entries)
+            }
+            // @/settings/Extensions → one dir per registered extension, prefixed
+            // with its precedence rank `[N]` in registration/consultation order
+            // (rank 1 wins key collisions; the highest rank wins the panel). The
+            // list is already in that order, so the ranks read top-to-bottom.
+            (Some(cat), None) if cat.eq_ignore_ascii_case(EXTENSIONS_DIR) => Ok(self
+                .extension_ids()
+                .into_iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    let name = self.about_for(&id).map(|a| a.name.clone()).unwrap_or_else(|| display_name(&id));
+                    Entry::virtual_dir(base().join(EXTENSIONS_DIR).join(&id), format!("[{}] {name}", i + 1))
+                })
+                .collect()),
+            // @/settings/Extensions/<id> → the extension's option leaves + About,
+            // plus one dir per node the extension grafted onto its own screen
+            // (e.g. lscolors' Themes). Any path reaching below such a node
+            // delegates to it instead, mirroring how a core category delegates
+            // to its own anchored nodes.
+            (Some(cat), Some(id)) if cat.eq_ignore_ascii_case(EXTENSIONS_DIR) => {
+                if let Some(node_n) = ext_subnode_name_for(path) {
+                    let node = self.nodes.iter().find(|n| {
+                        let (nc, nn) = n.anchor();
+                        nc.eq_ignore_ascii_case(id) && nn.eq_ignore_ascii_case(node_n)
+                    });
+                    return match node {
+                        Some(n) => n.list(path),
+                        None => Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("no settings node at {EXTENSIONS_DIR}/{id}/{node_n}"),
+                        )),
+                    };
+                }
+
+                let mut entries: Vec<Entry> = os
+                    .options_for_owner(id)
+                    .into_iter()
+                    .map(|def| {
+                        let val = os.get_str(&def.key);
+                        option_leaf(
+                            base().join(EXTENSIONS_DIR).join(id).join(&def.key),
+                            &def.key,
+                            &def.label,
+                            &val,
                         )
                     })
-                    .collect())
+                    .collect();
+                // One virtual dir per node this extension grafted onto its own screen.
+                for node in &self.nodes {
+                    let (nc, nn) = node.anchor();
+                    if nc.eq_ignore_ascii_case(id) {
+                        entries.push(Entry::virtual_dir(base().join(EXTENSIONS_DIR).join(id).join(nn), nn.to_string()));
+                    }
+                }
+                // A read-only Priority leaf: the extension's precedence rank in the
+                // registration/consultation order (keys: lower rank wins a
+                // collision; panel: higher rank overwrites on a cursor event).
+                if let Some((rank, total)) = self.rank_of(id) {
+                    entries.push(Entry::virtual_leaf(
+                        base().join(EXTENSIONS_DIR).join(id).join("Priority"),
+                        format!("Priority: [{rank}] of {total} — keys: lower wins; panel: higher wins"),
+                    ));
+                }
+                // A read-only About leaf carrying the version / description.
+                if let Some(about) = self.about_for(id) {
+                    let mut label = format!("About: {} v{}", about.name, about.version);
+                    if !about.description.is_empty() {
+                        label.push_str(" — ");
+                        label.push_str(&about.description);
+                    }
+                    entries.push(Entry::virtual_leaf(base().join(EXTENSIONS_DIR).join(id).join("About"), label));
+                } else if entries.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("no settings for extension: {id}"),
+                    ));
+                }
+                Ok(entries)
             }
-            // Category depth: list option leaves + one dir per grafted node.
+            // Core category: its (unowned) option leaves + one dir per grafted node.
             (Some(cat_name), None) => {
-                let cats = os.categories();
+                let cats = os.core_categories();
                 let (_, defs) = cats
                     .iter()
                     .find(|(cat, _)| cat.eq_ignore_ascii_case(cat_name))
@@ -123,26 +296,14 @@ impl VfsProvider for SettingsProvider {
                     .filter(|def| !self.nodes.iter().any(|n| n.owns_key(&def.key)))
                     .map(|def| {
                         let val = os.get_str(&def.key);
-                        let mut e = Entry::virtual_leaf(
-                            vfs_root().join("settings").join(cat_name).join(&def.key),
-                            format!("{}: {}", def.label, val),
-                        );
-                        e.activation = Some(ExtensionIntent {
-                            extension: "settings".into(),
-                            intent: "edit".into(),
-                            data: ExtensionValue::String(def.key.clone()),
-                        });
-                        e
+                        option_leaf(base().join(cat_name).join(&def.key), &def.key, &def.label, &val)
                     })
                     .collect();
                 // Append a virtual dir for each node anchored to this category.
                 for node in &self.nodes {
                     let (nc, nn) = node.anchor();
                     if nc.eq_ignore_ascii_case(cat_name) {
-                        entries.push(Entry::virtual_dir(
-                            vfs_root().join("settings").join(cat_name).join(nn),
-                            nn.to_string(),
-                        ));
+                        entries.push(Entry::virtual_dir(base().join(cat_name).join(nn), nn.to_string()));
                     }
                 }
                 Ok(entries)
@@ -242,6 +403,10 @@ pub struct SettingsExtension {
     matcher_cfg: Arc<Mutex<MatcherConfig>>,
     nodes: Vec<Arc<dyn SettingsNode>>,
     writer: Option<ConfigWriter>,
+    /// The registered extensions (id + About), filled by the kernel once all
+    /// extensions are known; shared with the provider so it can list them under
+    /// `@/settings/Extensions`.
+    ext_infos: ExtInfos,
 }
 
 impl SettingsExtension {
@@ -250,6 +415,7 @@ impl SettingsExtension {
         matcher_cfg: Arc<Mutex<MatcherConfig>>,
         nodes: Vec<Arc<dyn SettingsNode>>,
         config_scm: Option<PathBuf>,
+        ext_infos: ExtInfos,
     ) -> Self {
         let store = Arc::new(SettingsStore::new(option_store));
         let writer = config_scm.map(ConfigWriter::new);
@@ -257,7 +423,7 @@ impl SettingsExtension {
         // monitor.* options), so it is grafted here rather than collected in kernel.
         let mut nodes = nodes;
         nodes.push(Arc::new(MonitorNode { store: store.option_store.clone() }));
-        SettingsExtension { store, matcher_cfg, nodes, writer }
+        SettingsExtension { store, matcher_cfg, nodes, writer, ext_infos }
     }
 }
 
@@ -272,6 +438,7 @@ fn project_matcher(os: &OptionStore, cfg: &Mutex<MatcherConfig>) {
     mc.preferred_ext = os.get_list("matcher.preferred-ext");
     mc.noise_ext = os.get_list("matcher.noise-ext");
     mc.noise_dirs = os.get_list("matcher.noise-dirs");
+    mc.max_results = os.get_u32("matcher.max-results") as usize;
 }
 
 impl Extension for SettingsExtension {
@@ -279,8 +446,12 @@ impl Extension for SettingsExtension {
         "settings"
     }
 
+    fn about(&self) -> crate::extension::About {
+        crate::extension::About::new("Settings", "Browse and edit app + extension configuration under @/settings")
+    }
+
     fn vfs_providers(&self) -> Vec<Box<dyn VfsProvider>> {
-        vec![Box::new(SettingsProvider::new(self.store.clone(), self.nodes.clone()))]
+        vec![Box::new(SettingsProvider::new(self.store.clone(), self.nodes.clone(), self.ext_infos.clone()))]
     }
 
     fn handle_intent(&self, intent: &ExtensionIntent, _state: &AppState) -> Vec<Intent> {
@@ -297,43 +468,23 @@ impl Extension for SettingsExtension {
                         .with("field", ExtensionValue::String(key.into())),
                 };
 
-                let spec = match &def.kind {
-                    OptionKind::Bool => {
-                        let candidates = vec![
-                            Candidate::new("#t", ExtensionValue::String("#t".into())),
-                            Candidate::new("#f", ExtensionValue::String("#f".into())),
-                        ];
-                        SelectSpec::emit_static(
-                            "settings-edit",
-                            candidates,
-                            template,
-                            Some(FunctionHint::Extension("settings".into())),
-                        )
-                    }
-                    OptionKind::Choice(opts) => {
-                        let candidates: Vec<Candidate> = opts
-                            .iter()
-                            .map(|o| Candidate::new(o, ExtensionValue::String(o.clone())))
-                            .collect();
-                        SelectSpec::emit_static(
-                            "settings-edit",
-                            candidates,
-                            template,
-                            Some(FunctionHint::Extension("settings".into())),
-                        )
-                    }
-                    OptionKind::Text | OptionKind::List | OptionKind::Int { .. } => {
-                        let current = os.get_str(key);
-                        SelectSpec::emit_path_input(
-                            "settings-edit",
-                            template,
-                            Some(current),
-                            Some(FunctionHint::Extension("settings".into())),
-                        )
-                    }
+                // Every option kind gets its own typed widget; invalid typed
+                // values (Int out of range, a stale Choice option after a
+                // config edit) are simply rejected by `OptionStore::set`
+                // (below), same as an invalid value always was.
+                let kind = match &def.kind {
+                    OptionKind::Bool => InputKind::Bool,
+                    OptionKind::Text => InputKind::Text,
+                    OptionKind::List => InputKind::List,
+                    OptionKind::Int { min, max } => InputKind::Int { min: *min, max: *max },
+                    OptionKind::Choice(opts) => InputKind::Choice(opts.clone()),
                 };
+                let hint = def.kind.hint();
+                let title = if hint.is_empty() { key.to_string() } else { format!("{key} ({hint})") };
+                let current = os.get_str(key);
+                let spec = InputFormSpec::emit_input_widget(title, template, kind, current);
 
-                vec![Intent::PushMode(Box::new(Mode::Select(spec)))]
+                vec![Intent::PushMode(Box::new(Mode::InputForm(spec)))]
             }
             "set" => {
                 let Some(key) = intent.data.get("field").and_then(|v| v.as_str()) else {
@@ -368,275 +519,188 @@ impl Extension for SettingsExtension {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::core::{OptionDef, OptionKind};
 
-    fn core_option_defs() -> Vec<crate::core::OptionDef> {
-        let src = include_str!("../app/options.scm");
-        let outer = crate::script::sexpr::parse(src).expect("parse options.scm");
-        let inner = outer.as_list().expect("outer is list")[1].clone();
-        crate::script::config::parse_option_config(&inner).expect("parse defs")
+    /// A provider whose extension list is filled (as the kernel does at boot):
+    /// `preview` (with an option) and `archive` (no options, About only).
+    fn provider() -> SettingsProvider {
+        provider_with_nodes(vec![])
     }
 
-    fn make_store() -> Arc<SettingsStore> {
-        let option_store = Arc::new(crate::core::OptionStore::new(core_option_defs()));
-        Arc::new(SettingsStore::new(option_store))
+    /// A stub node anchored onto an extension's own screen, e.g. `("preview","Sub")`
+    /// for `@/settings/Extensions/preview/Sub` — stands in for `lscolors::LsColorsNode`
+    /// without pulling in the whole extension.
+    struct StubExtNode {
+        anchor: (&'static str, &'static str),
     }
 
-    fn make_ext() -> SettingsExtension {
-        let option_store = Arc::new(crate::core::OptionStore::new(core_option_defs()));
-        SettingsExtension::new(
-            option_store,
-            Arc::new(Mutex::new(MatcherConfig::default())),
-            Vec::new(),
-            None,
-        )
-    }
-
-    #[test]
-    fn settings_provider_lists_categories_from_store() {
-        let store = make_store();
-        let p = SettingsProvider::new(store, Vec::new());
-        let entries = p.list(Path::new("@/settings")).unwrap();
-        assert!(entries.len() >= 3, "at least 3 categories");
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"Display"));
-        assert!(names.contains(&"Matcher"));
-        assert!(names.contains(&"Layout"));
-        assert!(entries.iter().all(|e| e.is_dir));
-    }
-
-    #[test]
-    fn settings_provider_display_category_has_leaves_with_activation() {
-        let store = make_store();
-        let p = SettingsProvider::new(store, Vec::new());
-        let entries = p.list(Path::new("@/settings/Display")).unwrap();
-        assert!(entries.len() >= 1, "Display has fields");
-        let leaves: Vec<_> = entries.iter().filter(|e| !e.is_dir).collect();
-        for e in &leaves {
-            let act = e.activation.as_ref().expect("leaf has activation");
-            assert_eq!(act.extension, "settings");
-            assert_eq!(act.intent, "edit");
-            assert!(act.data.as_str().is_some(), "data is the key string");
+    impl SettingsNode for StubExtNode {
+        fn anchor(&self) -> (&str, &str) {
+            self.anchor
         }
-        let bs = leaves.iter().find(|e| e.name.contains("border-style")).unwrap();
-        assert!(bs.name.contains("single"), "default border-style is single: {:?}", bs.name);
-    }
 
-    #[test]
-    fn handle_edit_border_style_pushes_select_mode() {
-        let ext = make_ext();
-        let state = AppState::new(PathBuf::from("/tmp"));
-        let intent = ExtensionIntent {
-            extension: "settings".into(),
-            intent: "edit".into(),
-            data: ExtensionValue::String("border-style".into()),
-        };
-        let result = ext.handle_intent(&intent, &state);
-        assert_eq!(result.len(), 1);
-        assert!(matches!(&result[0], Intent::PushMode(m) if matches!(**m, Mode::Select(_))));
-    }
-
-    #[test]
-    fn handle_set_applies_live_and_returns_refresh() {
-        let option_store = Arc::new(crate::core::OptionStore::new(core_option_defs()));
-        let ext = SettingsExtension::new(
-            option_store.clone(),
-            Arc::new(Mutex::new(MatcherConfig::default())),
-            Vec::new(),
-            None,
-        );
-        let state = AppState::new(PathBuf::from("/tmp"));
-        let intent = ExtensionIntent {
-            extension: "settings".into(),
-            intent: "set".into(),
-            data: ExtensionValue::Nil
-                .with("field", ExtensionValue::String("border-style".into()))
-                .with(KEY_ITEM, ExtensionValue::String("rounded".into())),
-        };
-        let result = ext.handle_intent(&intent, &state);
-        assert_eq!(result, vec![Intent::Refresh]);
-        assert_eq!(option_store.get_str("border-style"), "rounded", "store updated");
-    }
-
-    #[test]
-    fn matcher_category_has_fields_with_activation() {
-        let store = make_store();
-        let p = SettingsProvider::new(store, Vec::new());
-        let entries = p.list(Path::new("@/settings/Matcher")).unwrap();
-        assert!(entries.len() >= 7, "Matcher has at least 7 fields");
-        for e in &entries {
-            assert!(!e.is_dir, "fields are leaves");
-            let act = e.activation.as_ref().expect("leaf has activation");
-            assert_eq!(act.extension, "settings");
-            assert_eq!(act.intent, "edit");
-        }
-        let tb = entries.iter().find(|e| e.name.contains("tail-bonus")).unwrap();
-        assert!(tb.name.contains("16"), "default tail-bonus is 16: {:?}", tb.name);
-    }
-
-    #[test]
-    fn handle_set_matcher_numeric_field_applies_live() {
-        let option_store = Arc::new(crate::core::OptionStore::new(core_option_defs()));
-        let matcher_cfg = Arc::new(Mutex::new(MatcherConfig::default()));
-        let ext = SettingsExtension::new(option_store.clone(), matcher_cfg.clone(), Vec::new(), None);
-        let state = AppState::new(PathBuf::from("/tmp"));
-        let intent = ExtensionIntent {
-            extension: "settings".into(),
-            intent: "set".into(),
-            data: ExtensionValue::Nil
-                .with("field", ExtensionValue::String("matcher.tail-bonus".into()))
-                .with(KEY_ITEM, ExtensionValue::String("32".into())),
-        };
-        let result = ext.handle_intent(&intent, &state);
-        assert_eq!(result, vec![Intent::Refresh]);
-        assert_eq!(option_store.get_i64("matcher.tail-bonus"), 32);
-        assert_eq!(matcher_cfg.lock().unwrap().tail_bonus, 32, "matcher cfg refreshed");
-    }
-
-    #[test]
-    fn handle_set_matcher_numeric_invalid_value_is_ignored() {
-        let option_store = Arc::new(crate::core::OptionStore::new(core_option_defs()));
-        let matcher_cfg = Arc::new(Mutex::new(MatcherConfig::default()));
-        let ext = SettingsExtension::new(option_store, matcher_cfg.clone(), Vec::new(), None);
-        let state = AppState::new(PathBuf::from("/tmp"));
-        let intent = ExtensionIntent {
-            extension: "settings".into(),
-            intent: "set".into(),
-            data: ExtensionValue::Nil
-                .with("field", ExtensionValue::String("matcher.tail-bonus".into()))
-                .with(KEY_ITEM, ExtensionValue::String("not-a-number".into())),
-        };
-        let result = ext.handle_intent(&intent, &state);
-        assert!(result.is_empty(), "invalid numeric value returns nothing");
-        assert_eq!(matcher_cfg.lock().unwrap().tail_bonus, 16, "value unchanged");
-    }
-
-    #[test]
-    fn handle_set_invalid_choice_is_ignored() {
-        let option_store = Arc::new(crate::core::OptionStore::new(core_option_defs()));
-        let ext = SettingsExtension::new(
-            option_store.clone(),
-            Arc::new(Mutex::new(MatcherConfig::default())),
-            Vec::new(),
-            None,
-        );
-        let state = AppState::new(PathBuf::from("/tmp"));
-        let intent = ExtensionIntent {
-            extension: "settings".into(),
-            intent: "set".into(),
-            data: ExtensionValue::Nil
-                .with("field", ExtensionValue::String("border-style".into()))
-                .with(KEY_ITEM, ExtensionValue::String("neon-pink".into())),
-        };
-        let result = ext.handle_intent(&intent, &state);
-        assert!(result.is_empty(), "invalid choice returns nothing");
-        assert_eq!(option_store.get_str("border-style"), "single", "option unchanged");
-    }
-
-    #[test]
-    fn handle_edit_unknown_key_returns_nothing() {
-        let ext = make_ext();
-        let state = AppState::new(PathBuf::from("/tmp"));
-        let intent = ExtensionIntent {
-            extension: "settings".into(),
-            intent: "edit".into(),
-            data: ExtensionValue::String("no-such-key".into()),
-        };
-        assert!(ext.handle_intent(&intent, &state).is_empty());
-    }
-
-    // ── §13.4 SettingsNode graft tests ────────────────────────────────────────
-
-    struct DummyNode { cat: &'static str, node: &'static str }
-    impl SettingsNode for DummyNode {
-        fn anchor(&self) -> (&str, &str) { (self.cat, self.node) }
         fn list(&self, _path: &Path) -> io::Result<Vec<Entry>> {
-            Ok(vec![Entry::virtual_leaf(
-                crate::vfs::vfs_root().join("settings").join(self.cat).join(self.node).join("child"),
-                "child".into(),
-            )])
+            Ok(vec![Entry::virtual_leaf(vfs_root().join("settings").join("stub-leaf"), "stub-leaf".into())])
         }
     }
 
-    fn make_store_with_node(node: Arc<dyn SettingsNode>) -> SettingsProvider {
-        let option_store = Arc::new(crate::core::OptionStore::new(core_option_defs()));
-        let store = Arc::new(SettingsStore::new(option_store));
-        SettingsProvider::new(store, vec![node])
+    fn provider_with_nodes(nodes: Vec<Arc<dyn SettingsNode>>) -> SettingsProvider {
+        let os = OptionStore::new(vec![
+            OptionDef {
+                key: "border-style".into(),
+                category: "Display".into(),
+                label: "border-style".into(),
+                kind: OptionKind::Choice(vec!["single".into()]),
+                default: "single".into(),
+                owner: None,
+            },
+            OptionDef {
+                key: "preview.tab-width".into(),
+                category: "Preview".into(),
+                label: "tab-width".into(),
+                kind: OptionKind::Int { min: 1, max: 8 },
+                default: "4".into(),
+                owner: Some("preview".into()),
+            },
+        ]);
+        let infos: ExtInfos = Arc::new(OnceLock::new());
+        infos
+            .set(vec![
+                ExtInfo { id: "preview".into(), about: About::new("Preview", "file preview") },
+                ExtInfo { id: "archive".into(), about: About::new("Archive", "pack/unpack") },
+            ])
+            .ok();
+        SettingsProvider {
+            store: Arc::new(SettingsStore::new(Arc::new(os))),
+            nodes,
+            ext_infos: infos,
+        }
+    }
+
+    fn names(entries: &[Entry]) -> Vec<String> {
+        entries.iter().map(|e| e.name.clone()).collect()
     }
 
     #[test]
-    fn display_category_lists_a_themes_node() {
-        let node: Arc<dyn SettingsNode> = Arc::new(DummyNode { cat: "Display", node: "Themes" });
-        let p = make_store_with_node(node);
-        let entries = p.list(Path::new("@/settings/Display")).unwrap();
-        let themes_entry = entries.iter().find(|e| e.name == "Themes");
-        assert!(themes_entry.is_some(), "Themes dir entry present under Display");
-        assert!(themes_entry.unwrap().is_dir);
+    fn root_lists_core_categories_plus_the_extensions_dir() {
+        let ns = names(&provider().list(&vfs_root().join("settings")).unwrap());
+        assert!(ns.contains(&"Display".to_string()), "core category listed: {ns:?}");
+        assert!(ns.contains(&EXTENSIONS_DIR.to_string()), "Extensions grouping listed: {ns:?}");
+        // The extension's own category no longer appears as a flat root category.
+        assert!(!ns.contains(&"Preview".to_string()), "extension category moved out of the root: {ns:?}");
     }
 
     #[test]
-    fn themes_path_delegates_to_settings_node() {
-        let node: Arc<dyn SettingsNode> = Arc::new(DummyNode { cat: "Display", node: "Themes" });
-        let p = make_store_with_node(node);
-        let entries = p.list(Path::new("@/settings/Display/Themes")).unwrap();
-        assert_eq!(entries.len(), 1, "delegated to DummyNode");
-        assert_eq!(entries[0].name, "child");
+    fn extensions_dir_lists_one_dir_per_registered_extension_ranked() {
+        let list = provider().list(&vfs_root().join("settings").join(EXTENSIONS_DIR)).unwrap();
+        // Every registered extension appears (About-only ones included), prefixed
+        // with its 1-based precedence rank in registration/consultation order.
+        assert_eq!(names(&list), vec!["[1] Preview", "[2] Archive"]);
+        // Navigation still keys off the id, not the ranked display name.
+        assert!(list[0].path.ends_with("preview"), "path uses the id: {:?}", list[0].path);
     }
 
     #[test]
-    fn unrelated_category_has_no_node() {
-        let node: Arc<dyn SettingsNode> = Arc::new(DummyNode { cat: "Display", node: "Themes" });
-        let p = make_store_with_node(node);
-        let entries = p.list(Path::new("@/settings/Matcher")).unwrap();
-        assert!(entries.iter().all(|e| !e.is_dir), "Matcher has no node dirs");
-    }
-
-    // ── Monitor node ──────────────────────────────────────────────────────────
-
-    fn monitor_provider() -> SettingsProvider {
-        let option_store = Arc::new(crate::core::OptionStore::new(core_option_defs()));
-        let store = Arc::new(SettingsStore::new(option_store.clone()));
-        let node: Arc<dyn SettingsNode> = Arc::new(MonitorNode { store: option_store });
-        SettingsProvider::new(store, vec![node])
+    fn extension_dir_lists_its_editable_options_and_an_about_leaf() {
+        let path = vfs_root().join("settings").join(EXTENSIONS_DIR).join("preview");
+        let list = provider().list(&path).unwrap();
+        // The editable option leaf.
+        let opt = list.iter().find(|e| e.name.contains("tab-width")).expect("option leaf");
+        let act = opt.activation.as_ref().expect("leaf edits via the settings extension");
+        assert_eq!(act.extension, "settings");
+        assert_eq!(act.intent, "edit");
+        // The read-only About leaf carrying version + description.
+        let about = list.iter().find(|e| e.name.starts_with("About:")).expect("About leaf");
+        assert!(about.name.contains("Preview"), "About shows the name: {}", about.name);
+        assert!(about.name.contains("file preview"), "About shows the description: {}", about.name);
+        assert!(about.activation.is_none(), "About is read-only");
     }
 
     #[test]
-    fn layout_lists_monitor_dir_and_hides_monitor_options() {
-        let p = monitor_provider();
-        let entries = p.list(Path::new("@/settings/Layout")).unwrap();
-        // The Monitor subtree dir is present...
-        assert!(entries.iter().any(|e| e.is_dir && e.name == "Monitor"));
-        // ...and the flat monitor.* option leaves are filtered out (owned by the node).
+    fn extension_dir_lists_a_node_grafted_onto_its_own_screen() {
+        // A node anchored ("preview","Sub") appears as a virtual dir alongside
+        // preview's own option leaves — the Extensions/<id> analogue of a core
+        // category listing its own anchored nodes.
+        let node: Arc<dyn SettingsNode> = Arc::new(StubExtNode { anchor: ("preview", "Sub") });
+        let list = provider_with_nodes(vec![node])
+            .list(&vfs_root().join("settings").join(EXTENSIONS_DIR).join("preview"))
+            .unwrap();
+        let dir = list.iter().find(|e| e.name == "Sub").expect("grafted node dir listed");
+        assert!(dir.path.ends_with("preview/Sub"));
+    }
+
+    #[test]
+    fn a_path_below_an_extension_owned_node_delegates_to_it() {
+        let node: Arc<dyn SettingsNode> = Arc::new(StubExtNode { anchor: ("preview", "Sub") });
+        let list = provider_with_nodes(vec![node])
+            .list(&vfs_root().join("settings").join(EXTENSIONS_DIR).join("preview").join("Sub"))
+            .unwrap();
+        assert_eq!(names(&list), vec!["stub-leaf"], "delegated to the node instead of the flat option listing");
+    }
+
+    #[test]
+    fn about_only_extension_lists_its_priority_and_about() {
+        // `archive` declared no options → its screen is the Priority + About leaves.
+        let path = vfs_root().join("settings").join(EXTENSIONS_DIR).join("archive");
+        let list = provider().list(&path).unwrap();
+        assert_eq!(list.len(), 2, "Priority + About: {:?}", names(&list));
+        let about = list.iter().find(|e| e.name.starts_with("About:")).expect("About leaf");
+        assert!(about.name.contains("Archive"));
+    }
+
+    #[test]
+    fn extension_screen_shows_its_precedence_rank() {
+        // `archive` is registered second → rank [2] of 2; the leaf is read-only.
+        let path = vfs_root().join("settings").join(EXTENSIONS_DIR).join("archive");
+        let list = provider().list(&path).unwrap();
+        let prio = list.iter().find(|e| e.name.starts_with("Priority:")).expect("Priority leaf");
+        assert!(prio.name.contains("[2] of 2"), "rank shown: {}", prio.name);
+        assert!(prio.activation.is_none(), "Priority is read-only");
+    }
+
+    // A **user** extension dropped into the extensions dir (the same path the
+    // kernel scans: `$WASDF_EXTENSIONS_DIR` / `~/.config/wasdf/extensions`) is
+    // registered like a bundled one and appears under @/settings/Extensions with
+    // an About card carrying the app version — equivalent display to bundled.
+    #[test]
+    fn a_user_extension_appears_under_extensions_like_a_bundled_one() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("wasdf-userext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut f = std::fs::File::create(dir.join("userext.scm")).unwrap();
+        writeln!(f, "(extension \"userext\")").unwrap();
+
+        // Loads via the real optional-extension loader.
+        let loaded = crate::extension::loader::load_optional(&dir);
+        assert_eq!(loaded.len(), 1, "the user manifest loaded");
+        let ue = &loaded[0];
+        assert_eq!(ue.id(), "userext");
+        let about = ue.about();
+        assert_eq!(about.name, "userext");
+        assert_eq!(about.version, env!("CARGO_PKG_VERSION"), "default About carries the app version");
+
+        // Fed into the settings provider exactly as the kernel does at boot.
+        let infos: ExtInfos = Arc::new(OnceLock::new());
+        infos.set(vec![ExtInfo { id: ue.id().to_string(), about }]).ok();
+        let p = SettingsProvider {
+            store: Arc::new(SettingsStore::new(Arc::new(OptionStore::new(vec![])))),
+            nodes: vec![],
+            ext_infos: infos,
+        };
+
+        let listed = names(&p.list(&vfs_root().join("settings").join(EXTENSIONS_DIR)).unwrap());
         assert!(
-            entries.iter().all(|e| !e.name.contains("monitor.")),
-            "monitor.* options must not list flat under Layout: {:?}",
-            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
+            listed.iter().any(|n| n.contains("userext")),
+            "user extension listed under Extensions: {listed:?}",
         );
-        // The non-monitor Layout options remain.
-        assert!(entries.iter().any(|e| e.name.contains("nav-weight")));
-    }
 
-    #[test]
-    fn monitor_lists_the_four_metric_dirs() {
-        let p = monitor_provider();
-        let entries = p.list(Path::new("@/settings/Layout/Monitor")).unwrap();
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["CPU", "Memory", "Disk", "Network"]);
-        assert!(entries.iter().all(|e| e.is_dir));
-    }
+        let screen = p.list(&vfs_root().join("settings").join(EXTENSIONS_DIR).join("userext")).unwrap();
+        assert!(
+            screen.iter().any(|e| e.name.starts_with("About:") && e.name.contains("userext")),
+            "user extension has an About leaf: {:?}",
+            names(&screen),
+        );
 
-    #[test]
-    fn metric_dir_lists_settings_leaves_with_edit_activation() {
-        let p = monitor_provider();
-        let entries = p.list(Path::new("@/settings/Layout/Monitor/CPU")).unwrap();
-        assert_eq!(entries.len(), 7, "seven settings per metric");
-        for e in &entries {
-            let act = e.activation.as_ref().expect("leaf has activation");
-            assert_eq!(act.extension, "settings");
-            assert_eq!(act.intent, "edit");
-            let key = act.data.as_str().unwrap();
-            assert!(key.starts_with("monitor.cpu."), "edits a monitor.cpu.* key: {key}");
-        }
-        assert!(entries.iter().any(|e| e.name.contains("bar-kind")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

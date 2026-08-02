@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use crate::core::{
-    ExtensionIntent, ExtensionValue, Intent, Key, KeyCode, Mode, Mods, PanelContent, ResolveFill,
-    ResolverRequest, SelectSpec, StyleRun, SubLayout,
+    Block, ExtensionIntent, ExtensionValue, Intent, Key, KeyCode, Mode, Mods, PanelView,
+    SelectSpec, SpanStyle, SubLayout, TextSpan,
 };
 use crate::script::condition::Cond;
 use crate::script::sexpr::Datum;
@@ -111,46 +111,38 @@ pub fn intent_from_datum(d: &Datum) -> Option<Intent> {
         Datum::List(items) => {
             let head = items.first()?.as_sym()?;
             match head {
-                "push-path-input" => {
-                    let op = items.get(1)?.as_sym()?;
-                    if op != "mkdir" && op != "touch" {
-                        return None;
-                    }
-                    let template = ResolverRequest {
-                        op: op.to_string(),
-                        src: None,
-                        dst: None,
-                        path: None,
-                        paths: Vec::new(),
-                        opts: Vec::new(),
-                        label: op.to_string(),
-                    };
-                    let spec = SelectSpec::command(template, ResolveFill::Path, Vec::new(), None);
-                    Some(Intent::PushMode(Box::new(Mode::Select(spec))))
-                }
                 // (navigate-to "path") — navigate to a real or virtual path.
                 "navigate-to" => {
                     let path = items.get(1)?.text()?.to_string();
                     Some(Intent::NavigateTo(std::path::PathBuf::from(path)))
                 }
                 // (ext "extension-id" "intent-id" [data]) — an extension intent.
-                "ext" => {
-                    let extension = items.get(1)?.text()?.to_string();
-                    let intent = items.get(2)?.text()?.to_string();
-                    let data = items.get(3).map(ext_value_from_datum).unwrap_or(ExtensionValue::Nil);
-                    Some(Intent::Extension(ExtensionIntent { extension, intent, data }))
-                }
-                // (show-function-content "owner" (lines LINE…)) where
-                // LINE = ("text" (LEN R G B) …). A line with no runs is plain.
+                "ext" => extension_intent_from_ext_form(items).map(Intent::Extension),
+                // (show-function-content "owner" (document BLOCK…)) — a logical
+                // view core lays out (see `panel_view_from_datum`).
                 "show-function-content" => {
                     let owner = items.get(1)?.text()?.to_string();
-                    let content = panel_lines_from_datum(items.get(2)?)?;
-                    Some(Intent::ShowFunctionContent { owner, content })
+                    let view = panel_view_from_datum(items.get(2)?)?;
+                    Some(Intent::ShowFunctionContent { owner, view })
                 }
                 // (update-function-view VALUE) — replace the opaque ext view state.
                 "update-function-view" => Some(Intent::UpdateFunctionView(
                     items.get(1).map(ext_value_from_datum).unwrap_or(ExtensionValue::Nil),
                 )),
+                // (notify "text") — show a transient user-facing notice.
+                "notify" => Some(Intent::Notify(items.get(1)?.text()?.to_string())),
+                // (push-overlay "ext" "mode") — push an overlay extension mode
+                // (falls through to the mode below for unbound keys; pop restores).
+                "push-overlay" => {
+                    let extension = items.get(1)?.text()?.to_string();
+                    let mode = items.get(2)?.text()?.to_string();
+                    Some(Intent::PushMode(Box::new(Mode::Extension {
+                        extension,
+                        mode,
+                        state: ExtensionValue::Nil,
+                        overlay: true,
+                    })))
+                }
                 _ => None,
             }
         }
@@ -158,41 +150,76 @@ pub fn intent_from_datum(d: &Datum) -> Option<Intent> {
     }
 }
 
-/// Decode a `(lines LINE…)` datum into `PanelContent::Lines`, where each
-/// `LINE = ("text" RUN…)` and `RUN = (LEN R G B)` (fg only) or
-/// `(LEN R G B BR BG BB)` (with a background). Runs tile the line by byte
-/// length. Returns None on any malformed element.
-fn panel_lines_from_datum(d: &Datum) -> Option<PanelContent> {
+/// Decode a `(document BLOCK…)` datum into a [`PanelView::Document`] — the
+/// logical, layout-free content an extension pushes; core owns the layout. Each
+/// BLOCK is one of:
+///   - `(field "label" (SPAN…))` — a key/value row,
+///   - `(line (SPAN…))`          — one logical line of rich text,
+///   - `(heading (SPAN…))`       — an emphasized section heading,
+///   - `(rule)`                  — a full-width separator,
+/// and each SPAN is `(span "text")` (default color), `(span "text" (role "name"))`
+/// (themed), or `(span "text" (rgb R G B))` / `(rgb R G B BR BG BB)` (literal).
+/// Returns None on any malformed element.
+fn panel_view_from_datum(d: &Datum) -> Option<PanelView> {
     let section = d.as_list()?;
-    if section.first().and_then(|h| h.as_sym()) != Some("lines") {
+    if section.first().and_then(|h| h.as_sym()) != Some("document") {
         return None;
     }
-    let mut lines = Vec::new();
-    let mut styles = Vec::new();
-    for line in &section[1..] {
-        let parts = line.as_list()?;
-        lines.push(parts.first()?.text()?.to_string());
-        let mut runs = Vec::new();
-        for run in &parts[1..] {
-            let r = run.as_list()?;
-            let int = |i: usize| match r.get(i)? {
-                Datum::Int(n) => Some(*n),
+    let blocks: Option<Vec<Block>> = section[1..].iter().map(block_from_datum).collect();
+    Some(PanelView::Document(blocks?))
+}
+
+fn block_from_datum(d: &Datum) -> Option<Block> {
+    let list = d.as_list()?;
+    match list.first()?.as_sym()? {
+        "field" => {
+            let label = list.get(1)?.text()?.to_string();
+            let value = spans_from_datum(list.get(2)?)?;
+            Some(Block::Field { label, value })
+        }
+        "line" => Some(Block::Line(spans_from_datum(list.get(1)?)?)),
+        "heading" => Some(Block::Heading(spans_from_datum(list.get(1)?)?)),
+        "rule" => Some(Block::Rule),
+        _ => None,
+    }
+}
+
+/// Decode a `(SPAN…)` list, each `(span "text" [style])`.
+fn spans_from_datum(d: &Datum) -> Option<Vec<TextSpan>> {
+    d.as_list()?.iter().map(span_from_datum).collect()
+}
+
+fn span_from_datum(d: &Datum) -> Option<TextSpan> {
+    let list = d.as_list()?;
+    if list.first()?.as_sym()? != "span" {
+        return None;
+    }
+    let text = list.get(1)?.text()?.to_string();
+    let style = match list.get(2) {
+        None => SpanStyle::Default,
+        Some(s) => span_style_from_datum(s)?,
+    };
+    Some(TextSpan::styled(text, style))
+}
+
+fn span_style_from_datum(d: &Datum) -> Option<SpanStyle> {
+    let s = d.as_list()?;
+    match s.first()?.as_sym()? {
+        "role" => Some(SpanStyle::Role(s.get(1)?.text()?.to_string())),
+        "rgb" => {
+            let int = |i: usize| match s.get(i)? {
+                Datum::Int(n) => Some(*n as u8),
                 _ => None,
             };
-            let bg = if r.len() >= 7 {
-                Some((int(4)? as u8, int(5)? as u8, int(6)? as u8))
+            let bg = if s.len() >= 7 {
+                Some((int(4)?, int(5)?, int(6)?))
             } else {
                 None
             };
-            runs.push(StyleRun {
-                len: int(0)? as usize,
-                fg: (int(1)? as u8, int(2)? as u8, int(3)? as u8),
-                bg,
-            });
+            Some(SpanStyle::Rgb { fg: (int(1)?, int(2)?, int(3)?), bg })
         }
-        styles.push(runs);
+        _ => None,
     }
-    Some(PanelContent::Lines { lines, styles })
 }
 
 fn intent_from_name(s: &str) -> Option<Intent> {
@@ -212,13 +239,12 @@ fn intent_from_name(s: &str) -> Option<Intent> {
         "toggle-select" => ToggleSelect,
         "select-all" => SelectAll,
         "clear-selection" => ClearSelection,
-        "start-copy" => StartCopy,
-        "start-move" => StartMove,
-        "start-rename" => StartRename,
+        "clear-filter" => ClearFilter,
         "delete-selected" => DeleteSelected,
         "start-edit" => StartEdit,
         "cycle-function-panel" => CycleFunctionPanel,
         "hide-function-panel" => HideFunctionPanel,
+        "pop-mode" => PopMode,
         "toggle-dotfiles" => ToggleDotFiles,
         "toggle-line-numbers" => ToggleLineNumbers,
         "cycle-list-layout" => CycleListLayout,
@@ -237,6 +263,8 @@ fn intent_from_name(s: &str) -> Option<Intent> {
         "function-search-cancel" => FunctionSearchCancel,
         "confirm" => Confirm,
         "cancel" => Cancel,
+        "add-item" => AddItem,
+        "remove-item" => RemoveItem,
         "focus-next-panel" => FocusNextPanel,
         "focus-prev-panel" => FocusPrevPanel,
         "kill-process" => KillProcess,
@@ -249,6 +277,11 @@ fn intent_from_name(s: &str) -> Option<Intent> {
         "set-sublayout-content" => SetSubLayout(SubLayout::Content),
         "set-sublayout-exec" => SetSubLayout(SubLayout::Exec),
         "file-search" => PushMode(Box::new(Mode::Select(SelectSpec::file_search()))),
+        // FilterListing/SelectRefine carry no data (the snapshot is taken in
+        // the reducer, which has state the codec does not) — see
+        // SEARCH_RENEW.md decision 3.
+        "filter-list" => FilterListing,
+        "select-refine" => SelectRefine,
         "command-palette" => {
             PushMode(Box::new(Mode::Select(SelectSpec::command_palette(Vec::new()))))
         }
@@ -281,6 +314,52 @@ pub fn intents_from_datum_list(d: &Datum) -> Vec<Intent> {
     d.as_list()
         .map(|items| items.iter().filter_map(intent_from_datum).collect())
         .unwrap_or_default()
+}
+
+/// Decode the fields of an `(ext "extension-id" "intent-id" [data])` form's
+/// tail (`items` includes the leading `ext` symbol) into an `ExtensionIntent`.
+/// Shared by `intent_from_datum`'s `"ext"` arm and `entries_from_datum_list`'s
+/// leaf activation field, so both read the same shape identically.
+fn extension_intent_from_ext_form(items: &[Datum]) -> Option<ExtensionIntent> {
+    let extension = items.get(1)?.text()?.to_string();
+    let intent = items.get(2)?.text()?.to_string();
+    let data = items.get(3).map(ext_value_from_datum).unwrap_or(ExtensionValue::Nil);
+    Some(ExtensionIntent { extension, intent, data })
+}
+
+/// Decode a dynamic extension's `wasdf_vfs_list` reply into `Entry`s under
+/// `base` (the virtual path that was listed). Each element is one of:
+///   - `(dir "display-name" "path-segment")` — a virtual subtree,
+///   - `(leaf "display-name" "path-segment" (ext "id" "intent" [data]))` — an
+///     activatable leaf, its `activation` decoded via the same `(ext …)` shape
+///     `intent_from_datum` uses.
+/// Malformed or unknown forms are skipped silently (a dynamic extension fault
+/// disables that entry, not the caller).
+pub fn entries_from_datum_list(d: &Datum, base: &std::path::Path) -> Vec<crate::core::Entry> {
+    let Some(items) = d.as_list() else { return Vec::new() };
+    items
+        .iter()
+        .filter_map(|form| {
+            let parts = form.as_list()?;
+            let head = parts.first()?.as_sym()?;
+            let name = parts.get(1)?.text()?.to_string();
+            let segment = parts.get(2)?.text()?.to_string();
+            match head {
+                "dir" => Some(crate::core::Entry::virtual_dir(base.join(segment), name)),
+                "leaf" => {
+                    let ext_form = parts.get(3)?.as_list()?;
+                    if ext_form.first()?.as_sym()? != "ext" {
+                        return None;
+                    }
+                    let activation = extension_intent_from_ext_form(ext_form)?;
+                    let mut e = crate::core::Entry::virtual_leaf(base.join(segment), name);
+                    e.activation = Some(activation);
+                    Some(e)
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Decode a datum into an ExtensionValue (the structural payload of an
@@ -341,31 +420,79 @@ mod tests {
     }
 
     #[test]
+    fn entries_from_datum_list_decodes_dirs_and_leaves() {
+        let d = parse(
+            "((dir \"Sub\" \"sub\") \
+              (leaf \"Go\" \"go\" (ext \"myext\" \"goto\" \"/real/path\")) \
+              (bogus \"skip\" \"me\"))",
+        )
+        .unwrap();
+        let base = std::path::Path::new("@/myext");
+        let entries = entries_from_datum_list(&d, base);
+        assert_eq!(entries.len(), 2, "the unknown form is skipped");
+
+        assert!(entries[0].is_dir);
+        assert_eq!(entries[0].name, "Sub");
+        assert_eq!(entries[0].path, base.join("sub"));
+        assert!(entries[0].activation.is_none());
+
+        assert!(!entries[1].is_dir);
+        assert_eq!(entries[1].name, "Go");
+        assert_eq!(entries[1].path, base.join("go"));
+        let activation = entries[1].activation.as_ref().unwrap();
+        assert_eq!(activation.extension, "myext");
+        assert_eq!(activation.intent, "goto");
+        assert_eq!(activation.data, ExtensionValue::String("/real/path".into()));
+    }
+
+    #[test]
     fn intent_list_decodes() {
         let d = parse("(refresh quit)").unwrap();
         assert_eq!(intents_from_datum_list(&d), vec![Intent::Refresh, Intent::Quit]);
     }
 
     #[test]
-    fn show_function_content_decodes() {
-        let d = parse("(show-function-content \"ext\" (lines (\"ab\" (2 10 20 30)) (\"plain\")))").unwrap();
+    fn show_function_content_decodes_a_document() {
+        let d = parse(
+            "(show-function-content \"ext\" (document \
+               (field \"Name\" ((span \"hosts\"))) \
+               (line ((span \"muted\" (role \"muted\")))) \
+               (rule)))",
+        )
+        .unwrap();
         match intent_from_datum(&d) {
-            Some(Intent::ShowFunctionContent { owner, content: PanelContent::Lines { lines, styles } }) => {
+            Some(Intent::ShowFunctionContent { owner, view: PanelView::Document(blocks) }) => {
                 assert_eq!(owner, "ext");
-                assert_eq!(lines, vec!["ab".to_string(), "plain".to_string()]);
-                assert_eq!(styles[0], vec![StyleRun { len: 2, fg: (10, 20, 30), bg: None }]);
-                assert!(styles[1].is_empty(), "a line with no runs is plain");
+                assert_eq!(blocks.len(), 3);
+                match &blocks[0] {
+                    Block::Field { label, value } => {
+                        assert_eq!(label, "Name");
+                        assert_eq!(value[0], TextSpan::plain("hosts"));
+                    }
+                    other => panic!("expected a field, got {other:?}"),
+                }
+                match &blocks[1] {
+                    Block::Line(spans) => assert_eq!(spans[0].style, SpanStyle::Role("muted".into())),
+                    other => panic!("expected a line, got {other:?}"),
+                }
+                assert_eq!(blocks[2], Block::Rule);
             }
             other => panic!("expected ShowFunctionContent, got {other:?}"),
         }
     }
 
     #[test]
-    fn show_function_content_decodes_background_runs() {
-        let d = parse("(show-function-content \"e\" (lines (\"ab\" (2 1 2 3 4 5 6))))").unwrap();
+    fn span_decodes_literal_rgb_with_background() {
+        let d = parse("(show-function-content \"e\" (document (line ((span \"ab\" (rgb 1 2 3 4 5 6))))))").unwrap();
         match intent_from_datum(&d) {
-            Some(Intent::ShowFunctionContent { content: PanelContent::Lines { styles, .. }, .. }) => {
-                assert_eq!(styles[0][0], StyleRun { len: 2, fg: (1, 2, 3), bg: Some((4, 5, 6)) });
+            Some(Intent::ShowFunctionContent { view: PanelView::Document(blocks), .. }) => {
+                match &blocks[0] {
+                    Block::Line(spans) => assert_eq!(
+                        spans[0].style,
+                        SpanStyle::Rgb { fg: (1, 2, 3), bg: Some((4, 5, 6)) },
+                    ),
+                    other => panic!("expected a line, got {other:?}"),
+                }
             }
             other => panic!("expected styled content, got {other:?}"),
         }
@@ -375,6 +502,27 @@ mod tests {
     fn update_function_view_decodes() {
         let d = parse("(update-function-view 7)").unwrap();
         assert_eq!(intent_from_datum(&d), Some(Intent::UpdateFunctionView(ExtensionValue::Int(7))));
+    }
+
+    #[test]
+    fn pop_mode_decodes() {
+        assert_eq!(intent_from_datum(&parse("pop-mode").unwrap()), Some(Intent::PopMode));
+    }
+
+    #[test]
+    fn push_overlay_decodes_an_overlay_extension_mode() {
+        let d = parse("(push-overlay \"exampleext\" \"info\")").unwrap();
+        match intent_from_datum(&d) {
+            Some(Intent::PushMode(m)) => match *m {
+                Mode::Extension { extension, mode, overlay, .. } => {
+                    assert_eq!(extension, "exampleext");
+                    assert_eq!(mode, "info");
+                    assert!(overlay, "push-overlay is an overlay mode");
+                }
+                other => panic!("expected an extension mode, got {other:?}"),
+            },
+            other => panic!("expected PushMode, got {other:?}"),
+        }
     }
 
     #[test]

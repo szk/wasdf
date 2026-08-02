@@ -139,14 +139,16 @@ fn run_plan(
     matcher_cfg: &Arc<Mutex<MatcherConfig>>,
 ) -> (AsyncStatus, Payload) {
     match plan {
-        Plan::ReadDir { path, show_hidden } => match vfs.list(path, *show_hidden) {
-            Ok(entries) => (AsyncStatus::Ok, Payload::Entries { path: path.clone(), entries }),
-            Err(e) => (AsyncStatus::Failed(format!("read {}: {e}", path.display())), Payload::None),
-        },
-        Plan::Search { root, query, show_hidden } => {
+        Plan::ReadDir { path, show_hidden } => {
+            match vfs.list(path, *show_hidden) {
+                Ok(entries) => (AsyncStatus::Ok, Payload::Entries { path: path.clone(), entries }),
+                Err(e) => (AsyncStatus::Failed(format!("read {}: {e}", path.display())), Payload::None),
+            }
+        }
+        Plan::Search { root, query, show_hidden, owner } => {
             // Snapshot config before the walk so weight edits don't race mid-search.
             let cfg = matcher_cfg.lock().unwrap().clone();
-            let walked = crate::fs::walk(root, *show_hidden, 20_000);
+            let walked = crate::fs::walk(root, *show_hidden, cfg.max_results);
             let ranked: Vec<RankedEntry> = rank_paths(matcher, root, walked, query, &cfg);
             let entries: Vec<Entry> = ranked
                 .into_iter()
@@ -159,7 +161,19 @@ fn run_plan(
                     crate::fs::make_entry_from(re.path, name, re.meta)
                 })
                 .collect();
-            (AsyncStatus::Ok, Payload::Entries { path: root.clone(), entries })
+            // Unaddressed (today's file-search): a Select's own Search
+            // completion. Owner-addressed (deep search from an extension,
+            // e.g. CmdOp's `/` — see SEARCH_RENEW.md decision 6): the same
+            // generic content Read every cursor-follow provider already uses,
+            // so the kernel routes it to `owner`'s `accept_content` with no
+            // new plumbing.
+            match owner {
+                None => (AsyncStatus::Ok, Payload::Entries { path: root.clone(), entries }),
+                Some(owner) => (
+                    AsyncStatus::Ok,
+                    Payload::Read { owner: owner.clone(), path: root.clone(), result: ReadResult::Dir { entries } },
+                ),
+            }
         }
         Plan::Read { owner, path, offset } => read_content(owner, path, *offset, vfs),
         Plan::ResolveAndRun { request } => match resolver.resolve(request, cwd) {
@@ -284,5 +298,93 @@ fn read_content(owner: &str, path: &std::path::Path, offset: u64, vfs: &Vfs) -> 
         }
     };
     (AsyncStatus::Ok, Payload::Read { owner: owner.to_string(), path: path.to_path_buf(), result })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::{ResolverChain, SkimMatcher};
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wasdf-task-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("needle.txt"), "").unwrap();
+        std::fs::write(dir.join("other.txt"), "").unwrap();
+        dir
+    }
+
+    fn run(plan: &Plan, cwd: &std::path::Path) -> (AsyncStatus, Payload) {
+        run_with_cfg(plan, cwd, MatcherConfig::default())
+    }
+
+    fn run_with_cfg(plan: &Plan, cwd: &std::path::Path, cfg: MatcherConfig) -> (AsyncStatus, Payload) {
+        let resolver = ResolverChain::new();
+        let matcher = SkimMatcher::default();
+        let vfs = Vfs::default();
+        let matcher_cfg = Arc::new(Mutex::new(cfg));
+        run_plan(plan, &resolver, &matcher, None, &vfs, cwd, &matcher_cfg)
+    }
+
+    #[test]
+    fn an_unaddressed_search_completes_as_its_own_select_result() {
+        let dir = scratch_dir("unaddressed");
+        let plan = Plan::Search { root: dir.clone(), query: "needle".into(), show_hidden: false, owner: None };
+        let (status, payload) = run(&plan, &dir);
+        assert_eq!(status, AsyncStatus::Ok);
+        match payload {
+            Payload::Entries { path, entries } => {
+                assert_eq!(path, dir);
+                assert!(entries.iter().any(|e| e.name == "needle.txt"));
+            }
+            other => panic!("expected Payload::Entries, got {other:?}"),
+        }
+        assert_eq!(plan.purpose(), Purpose::Search, "unaddressed: drives a Select's own view");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_owner_addressed_search_completes_as_a_content_read() {
+        // The extension-facing deep search (SEARCH_RENEW.md decision 6):
+        // same walk + ranking, but addressed like Plan::Read so the kernel
+        // routes it to the owner's accept_content with zero new plumbing.
+        let dir = scratch_dir("addressed");
+        let plan = Plan::Search {
+            root: dir.clone(),
+            query: "needle".into(),
+            show_hidden: false,
+            owner: Some("cmdop".into()),
+        };
+        let (status, payload) = run(&plan, &dir);
+        assert_eq!(status, AsyncStatus::Ok);
+        match payload {
+            Payload::Read { owner, path, result: ReadResult::Dir { entries } } => {
+                assert_eq!(owner, "cmdop");
+                assert_eq!(path, dir);
+                assert!(entries.iter().any(|e| e.name == "needle.txt"));
+            }
+            other => panic!("expected Payload::Read{{Dir}}, got {other:?}"),
+        }
+        assert_eq!(plan.purpose(), Purpose::Content, "owner-addressed: a generic content Read, not Search");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn max_results_caps_the_walk_not_just_a_hardcoded_constant() {
+        // @/settings/Matcher/max-results (MatcherConfig::max_results) bounds the
+        // raw fs::walk itself, not a fixed 20_000 the walk previously hardcoded.
+        let dir = scratch_dir("cap");
+        let plan = Plan::Search { root: dir.clone(), query: "".into(), show_hidden: false, owner: None };
+        let cfg = MatcherConfig { max_results: 1, ..MatcherConfig::default() };
+        let (status, payload) = run_with_cfg(&plan, &dir, cfg);
+        assert_eq!(status, AsyncStatus::Ok);
+        match payload {
+            Payload::Entries { entries, .. } => {
+                assert_eq!(entries.len(), 1, "walk stopped at the configured cap, not the two files present");
+            }
+            other => panic!("expected Payload::Entries, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 

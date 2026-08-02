@@ -26,9 +26,9 @@ Runs on **macOS**, **Linux**, and **Windows via WSL2**.
 |------|--------|
 | `w` `a` `s` `d` | move the cursor up / left / down / right |
 | `h` `j` `k` `l` | control the function pane |
-| `Enter` | enter directory / open file · `Space` toggle select |
-| `f` · `x` | file search · command palette |
-| `c` `m` `R` `e` | copy · move · rename · edit |
+| `Enter' 'e` | enter directory / open file · `Space` toggle select |
+| `f` · `z` | file search · command palette |
+| `c` `m` `R` `E` | copy · move · rename · edit |
 | `v` · `,` | cycle list layout (rows/columns/grid) · cycle the ratio of function pane |
 | `q` | quit |
 

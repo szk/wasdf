@@ -12,6 +12,7 @@ target
 # AI agents
 .claude
 plan/
+settings.local.json
 
 # macOS
 .DS_Store

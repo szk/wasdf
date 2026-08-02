@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use crate::core::event::{PanelContent, ResolverRequest};
+use crate::core::event::{PanelView, ResolverRequest};
 use crate::core::extension_value::ExtensionValue;
 use crate::core::mode::{Mode, SubLayout};
 
@@ -109,6 +109,22 @@ pub enum Intent {
     ToggleSelect,
     SelectAll,
     ClearSelection,
+    /// Pop one level of the file-search filter stack, restoring the entries the
+    /// panel showed before it (the real directory listing, or the parent filter's
+    /// own matches for a nested `f`). A no-op with no filter active — bound only
+    /// while `has-filter` holds (see keymap.scm).
+    ClearFilter,
+    /// Shallow filter (`f` on a virtual directory — see SEARCH_RENEW.md):
+    /// push a Select ranking the file panel's *current* `entries` in place,
+    /// synchronously, no I/O. The reducer takes the snapshot (this intent
+    /// carries none — the keymap codec builds intents without state). Commits
+    /// through the same path as deep file-search (`commit_file_search`).
+    FilterListing,
+    /// Shallow refine (`f` inside a Select whose `view` already holds
+    /// results — deep file-search or an earlier filter/refine): replace the
+    /// current Select in place with a fresh shallow filter over the frozen
+    /// result set. No refine-undo stack; Esc cancels the whole Select.
+    SelectRefine,
 
     // External commands (resolved + executed)
     /// Run a resolver operation — the generic "build a command line and execute".
@@ -120,9 +136,6 @@ pub enum Intent {
     Execute { argv: Vec<String> },
 
     // Initiators (expanded by the File mode handler)
-    StartCopy,
-    StartMove,
-    StartRename,
     DeleteSelected,
     StartEdit,
 
@@ -135,9 +148,9 @@ pub enum Intent {
     CycleFunctionPanel,
     HideFunctionPanel,
     /// Show (or replace) the function panel's content, owned by an extension.
-    /// A generic kernel mechanism: any extension produces `PanelContent`; the
-    /// kernel stores and renders it. Not a per-feature variant.
-    ShowFunctionContent { owner: String, content: PanelContent },
+    /// A generic kernel mechanism: any extension produces a logical `PanelView`;
+    /// core lays it out and renders it. Not a per-feature variant.
+    ShowFunctionContent { owner: String, view: PanelView },
     /// Replace the opaque per-extension function-panel view state. Generic.
     UpdateFunctionView(ExtensionValue),
     /// Load a chunk of the given path (bytes from `offset`, or entries) for the
@@ -146,6 +159,38 @@ pub enum Intent {
     /// A content extension emits this from `on_cursor_changed`, advancing `offset`
     /// to page through a large file; it is not tied to any one extension.
     LoadContent { owner: String, path: PathBuf, offset: u64 },
+    /// Deep search (recursive walk + matcher ranking) from `root`, addressed
+    /// to `owner` — the extension-facing counterpart of the file panel's own
+    /// `f` (see SEARCH_RENEW.md). The kernel issues an owner-addressed
+    /// `Plan::Search`; the completion arrives as a generic content Read
+    /// (`ReadResult::Dir`) and is handed to `owner`'s `accept_content`, same
+    /// as `LoadContent`. Not tied to any one extension.
+    LoadSearch { owner: String, root: PathBuf, query: String },
+    /// Set (or clear) the extension currently hosting an interactive form in the
+    /// function panel. `Some(id)` shows + focuses the panel and routes its render
+    /// and key-gating to that extension; `None` closes the form. Generic seam.
+    SetFunctionForm(Option<String>),
+    /// Like `SetFunctionForm`, but passive: shows/hides the extension's form
+    /// (`form_owner`, `visible`) without touching `focused_panel`. For a form
+    /// that follows the file cursor (like content's `LoadContent`, but write-
+    /// capable and needing raw `Frame` access via `render_form`) — the file
+    /// panel keeps focus, so its own wasd/hjkl bindings keep working, exactly
+    /// as `FuncUp`/`FuncDown`/`FuncLeft`/`FuncRight` already let it drive
+    /// scrolling a passively-followed content panel. An extension key-gates
+    /// its own edit bindings on `form_owner`, scoped to the **file** panel
+    /// (not `function`), so they fire without a focus switch. Generic seam.
+    HostFunctionForm(Option<String>),
+    /// Open a generic function-panel text input with the given `purpose` tag,
+    /// seeded with `seed`. The kernel then raw-routes keys into the buffer; on
+    /// Enter/Esc the reducer hands the text back to the `form_owner`. Generic.
+    /// `multiline`: when false (the common case), Enter submits immediately,
+    /// same as always. When true, Enter inserts `\n` instead — submission
+    /// then happens on an Enter pressed while the current line is already
+    /// empty (a blank line terminates the batch, the same convention
+    /// `InputKind::List`'s row editing uses, adapted for free text instead of
+    /// discrete rows). `purpose` stays fully opaque to core either way — only
+    /// this flag is structurally interpreted, not the tag string itself.
+    BeginInput { purpose: String, seed: String, multiline: bool },
 
     // Function-panel scroll
     ScrollUp,
@@ -174,6 +219,12 @@ pub enum Intent {
     Confirm,
     Cancel,
 
+    // InputForm's `List` kind row management (browsing only — see
+    // "input-form-list-browsing" in keymap.scm); a no-op in any other mode
+    // or InputForm kind.
+    AddItem,
+    RemoveItem,
+
     // Select (results navigate via the shared Cursor* intents)
     RawKeyEvent(Key),
 
@@ -195,6 +246,10 @@ pub enum Intent {
     Refresh,
     Quit,
     Noop,
+    /// Show a transient user-facing notice. A generic kernel mechanism: any
+    /// extension (or core) emits a message string; the kernel displays it via the
+    /// standard notice channel. Not tied to any one feature.
+    Notify(String),
 
     // Extension
     Extension(ExtensionIntent),

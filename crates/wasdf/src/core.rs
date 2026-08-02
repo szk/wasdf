@@ -8,20 +8,25 @@ pub mod intent;
 pub mod mode;
 pub mod option;
 pub mod reducer;
+pub mod scroll;
 pub mod state;
 pub mod theme;
 
 pub use event::{
-    AppEvent, AsyncResult, AsyncStatus, ExecOutput, OpDone, PanelContent, Payload, Plan, Purpose,
-    ReadResult, ResolverRequest, StyleRun,
+    AppEvent, AsyncResult, AsyncStatus, Block, Emph, ExecOutput, OpDone, PanelView, Payload, Plan,
+    Purpose, ReadResult, ResolverRequest, SpanStyle, TextSpan, LINE_NUMBER_WIDTH,
 };
 pub use extension_value::{ExtensionValue, KEY_ITEM, KEY_RESOLVER};
 pub use intent::{ExtensionIntent, Intent, Key, KeyCode, Mods};
 pub use mode::{
-    Candidate, CmdToken, ConfirmShape, FunctionHint, Mode, OnConfirm, ResolveFill, SelectInput,
-    SelectSpec, SubLayout,
+    Candidate, CmdToken, ConfirmShape, FunctionHint, InputFormSpec, InputKind, Mode, OnConfirm,
+    ResolveFill, SelectInput, SelectSource, SelectSpec, SubLayout,
 };
 pub use option::{OptionDef, OptionKind, OptionStore};
-pub use theme::{color_token, parse_color, Role, Theme};
+pub use scroll::Scroll;
+pub use theme::{color_to_rgb, color_token, parse_color, Role, Theme};
 pub use reducer::{CommandLookup, Effects, Notice, apply_intent, apply_result};
-pub use state::{AppState, Entry, EntryList, ListGeom, ListLayout, PanelSearch, SelectPhase};
+pub use state::{
+    AppState, Entry, EntryList, FunctionInput, InputFormState, ListGeom, ListLayout, PanelSearch,
+    SelectPhase, PANEL_FILE, PANEL_FUNCTION,
+};

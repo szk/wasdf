@@ -66,7 +66,9 @@ fn parse(text: &str) -> Vec<(String, String)> {
         if !is_flag(first) || matches!(first, "-h" | "--help" | "--version" | "--usage") {
             continue;
         }
-        out.push((first.to_string(), truncate(desc, 48)));
+        // Keep the full description — the CmdOp option rows scroll horizontally
+        // (`h`/`l`), so there is no need to truncate it with an ellipsis.
+        out.push((first.to_string(), desc.to_string()));
     }
     out
 }
@@ -75,14 +77,6 @@ fn parse(text: &str) -> Vec<(String, String)> {
 fn is_flag(s: &str) -> bool {
     s.starts_with('-')
         && s.trim_start_matches('-').chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false)
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() > n {
-        s.chars().take(n).collect::<String>() + "…"
-    } else {
-        s.to_string()
-    }
 }
 
 /// Keep the first occurrence of each token, capped so the list stays usable.

@@ -4,9 +4,18 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use crate::core::event::{ExecOutput, PanelContent};
+use crate::core::event::{ExecOutput, PanelView};
 use crate::core::intent::ExtensionIntent;
 use crate::core::mode::{Mode, SubLayout};
+use crate::core::scroll::Scroll;
+
+/// The id stored in [`AppState::focused_panel`] for the file panel (the main
+/// directory list). The single source of truth for this id, shared by the
+/// reducer's focus control and the UI's focus recognition.
+pub const PANEL_FILE: &str = "file";
+/// The id stored in [`AppState::focused_panel`] for the function panel (the
+/// right-hand renderer container).
+pub const PANEL_FUNCTION: &str = "function";
 
 /// A single directory entry.
 ///
@@ -168,6 +177,24 @@ impl Ratio {
     }
 }
 
+/// A generic text input an extension has requested in the function panel.
+/// Core owns the buffer (it gates key routing, so it must be in `AppState`);
+/// the extension owns what the submitted text *means*, disambiguated by
+/// `purpose` (opaque to core). Single-line by default; `multiline` (set from
+/// `Intent::BeginInput`) is the one structurally-interpreted flag — see its
+/// doc comment for the blank-line-submits convention.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FunctionInput {
+    /// The current text (embedded `\n`s when `multiline`) and caret byte
+    /// offset (generic readline editing).
+    pub query: String,
+    pub caret: usize,
+    /// An extension-defined tag telling the owner which input this is (e.g.
+    /// "filter" / "prompt" / "builder-edit"). Core never interprets it.
+    pub purpose: String,
+    pub multiline: bool,
+}
+
 /// Less-style incremental search over the text/hex content. Reducer-managed.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PanelSearch {
@@ -189,15 +216,28 @@ pub struct FunctionPanelState {
     pub visible: bool,
     pub sublayout: SubLayout,
     pub ratio: Ratio,
-    pub scroll: usize,
-    /// Horizontal scroll offset (columns) for the text/hex content.
-    pub hscroll: usize,
+    /// Vertical / horizontal content scroll (shared by the Content and Exec
+    /// frames). Kernel-owned: advanced blindly, clamped post-draw via [`Scroll`].
+    pub scroll: Scroll,
+    pub hscroll: Scroll,
     pub show_line_numbers: bool,
     /// Generic extension content shown in the Content frame (the Phase-B push
     /// path), and the id of the extension that owns the current content. The
     /// owning extension renders via its hook; this is its push-style buffer.
-    pub content: Option<PanelContent>,
+    pub content: Option<PanelView>,
     pub content_owner: Option<String>,
+    /// The id of the extension currently hosting an **interactive form** in the
+    /// panel (e.g. the CmdOp builder), distinct from the passive cursor-follow
+    /// `content_owner`. When `Some`, render dispatches the whole inner rect to that
+    /// extension's `render_form`, and its keys are gated by a `:when` predicate
+    /// reading this field — the generic seam that lets an extension own the panel
+    /// without core knowing what it is.
+    pub form_owner: Option<String>,
+    /// A generic text-input (readline) an extension has requested: while `Some`,
+    /// the kernel routes every key as a raw event and the reducer edits the buffer;
+    /// Enter/Esc hand the text back to `form_owner` as an extension intent. Reused
+    /// by any form extension (the CmdOp filter / dest prompt / builder edit).
+    pub input: Option<FunctionInput>,
     /// Opaque per-extension view state for the active function content, written
     /// via `UpdateFunctionView`. The owning extension manages its shape; the
     /// kernel only stores it (and a bundled extension can read it in
@@ -215,11 +255,13 @@ impl Default for FunctionPanelState {
             visible: false,
             sublayout: SubLayout::Content,
             ratio: Ratio::R2_1,
-            scroll: 0,
-            hscroll: 0,
+            scroll: Scroll::default(),
+            hscroll: Scroll::default(),
             show_line_numbers: false,
             content: None,
             content_owner: None,
+            form_owner: None,
+            input: None,
             ext_view: crate::core::ExtensionValue::Nil,
             search: PanelSearch::default(),
             exec: ExecOutput { lines: Vec::new(), finished: true, exit: None },
@@ -265,12 +307,53 @@ impl SelectState {
     }
 }
 
+/// Runtime state for a `Mode::InputForm` popup: one variant per
+/// [`crate::core::InputKind`]. `push_mode` decodes `spec.initial` into this
+/// shape; `input_form_confirm` encodes it back into the `KEY_ITEM` wire
+/// string (see `core::reducer::{decode_input_state, encode_input_value}`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputFormState {
+    /// `cursor` is a **char index** (not a byte offset), matching
+    /// `tui_input::Input::cursor()`'s convention, since the reducer
+    /// reconstructs a transient `tui_input::Input` from these two fields on
+    /// every keystroke.
+    Text { value: String, cursor: usize },
+    Bool { value: bool },
+    Choice { options: Vec<String>, selected: usize },
+    /// `typed`, when non-empty, is an in-progress digit buffer (may start with
+    /// `-`) that overrides how the next digit/Backspace is interpreted; any
+    /// arrow/Home/End key clears it and adjusts `value` directly instead —
+    /// needed because some `Int` options span millions (e.g. matcher tuning),
+    /// far too wide for arrow-only ±1/±10 stepping to reach.
+    Int { value: i64, min: i64, max: i64, typed: String },
+    /// `editing`, when `Some((index, buf, cursor))`, is a nested text edit of
+    /// one item (index `usize::MAX` means a new not-yet-appended item); `None`
+    /// means the row-browsing phase (mirrors `SelectPhase` conceptually).
+    List { items: Vec<String>, selected: usize, editing: Option<(usize, String, usize)> },
+}
+
 /// A single mode frame: the mode plus the generation id assigned when pushed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModeFrame {
     pub mode: Mode,
     pub generation: u64,
 }
+
+/// A saved filter level: the file panel's entries/cursor/active query exactly
+/// as they were *before* a file-search query was committed on top of them.
+/// Pushed by `commit_file_search`, popped one level at a time by
+/// `Intent::ClearFilter` (Esc) — the undo stack behind nested `f` filtering.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FilterFrame {
+    pub entries: Vec<Entry>,
+    pub cursor: usize,
+    pub query: Option<String>,
+}
+
+/// How many filter levels `filter_stack` may hold at once — caps nested `f`
+/// (each level is a full re-walk from `cwd`, not a narrowing of the current
+/// matches, so an unbounded stack would only bound memory, not usefulness).
+pub const MAX_FILTER_DEPTH: usize = 5;
 
 /// The whole behavior-affecting application state.
 #[derive(Debug, Clone, PartialEq)]
@@ -286,6 +369,10 @@ pub struct AppState {
     pub list_geom: ListGeom,
     pub function: FunctionPanelState,
     pub select: Option<SelectState>,
+    /// Runtime state for a `Mode::InputForm` popup: the typed value and
+    /// cursor (char index, matching `tui_input::Input`'s convention). `None`
+    /// whenever `Mode::InputForm` isn't on top of the stack.
+    pub input_form: Option<InputFormState>,
     pub focused_panel: String,
     pub modes: Vec<ModeFrame>,
     pub next_generation: u64,
@@ -295,6 +382,17 @@ pub struct AppState {
     pub pending_focus: Option<PathBuf>,
     /// Where to return to when toggling back out of the VFS root via `@`.
     pub root_return: Option<PathBuf>,
+    /// Filter levels beneath the currently shown listing, innermost last.
+    /// Non-empty ⇒ `entries` holds file-search matches rather than a real
+    /// directory listing — every other File-mode key (copy, move, rename,
+    /// delete, bookmark, hjkl scroll, …) still reads `entries`/`cursor`
+    /// directly, so nothing about them needs to know a filter is active.
+    /// `Intent::ClearFilter` (Esc) pops one level; any real directory
+    /// (re)load clears the whole stack (see `load_entries`).
+    pub filter_stack: Vec<FilterFrame>,
+    /// The query text that produced the currently shown listing, when
+    /// filtered — `None` exactly when `filter_stack` is empty.
+    pub filter_query: Option<String>,
 }
 
 impl AppState {
@@ -309,12 +407,15 @@ impl AppState {
             list_geom: ListGeom::default(),
             function: FunctionPanelState::default(),
             select: None,
-            focused_panel: "file".into(),
+            input_form: None,
+            focused_panel: PANEL_FILE.into(),
             modes: vec![ModeFrame { mode: Mode::File, generation: 0 }],
             next_generation: 1,
             quit: false,
             pending_focus: None,
             root_return: None,
+            filter_stack: Vec::new(),
+            filter_query: None,
         }
     }
 
@@ -334,6 +435,30 @@ impl AppState {
 
     pub fn current_entry(&self) -> Option<&Entry> {
         self.entries.get(self.cursor)
+    }
+
+    /// The path the cursor is logically on: the File-mode cursor entry, or (while
+    /// browsing the file-search picker) the currently highlighted search hit.
+    /// `None` in any other mode. The single mode-dispatch every "what's under the
+    /// cursor" query shares — the cursor-changed broadcast, a dynamic extension's
+    /// cursor hook, and the content provider's follow target all read this
+    /// instead of repeating the same `Mode::File` / `Mode::Select("file-search")`
+    /// match.
+    pub fn cursor_path(&self) -> Option<PathBuf> {
+        match self.mode() {
+            Mode::File => self.current_entry().map(|e| e.path.clone()),
+            // Any Select with an entry-grid view — deep file-search, a
+            // shallow filter/refine (SEARCH_RENEW.md) — not just file-search
+            // by id, so cursor-follow (theme editor, preview) works
+            // identically inside every one of them.
+            Mode::Select(_) => self
+                .select
+                .as_ref()
+                .and_then(|s| s.view.as_ref())
+                .and_then(|v| v.current())
+                .map(|e| e.path.clone()),
+            _ => None,
+        }
     }
 
     /// The operation target list: the selection if non-empty, else the cursor
@@ -389,7 +514,7 @@ impl AppState {
     pub fn reset_to_file(&mut self) {
         self.modes.truncate(1);
         self.select = None;
-        self.focused_panel = "file".into();
+        self.focused_panel = PANEL_FILE.into();
     }
 
     /// Clamp the cursor into range after a listing change.

@@ -44,7 +44,11 @@ pub struct App {
     pending_suspend: Option<Vec<String>>,
     /// The last cursor identity broadcast to extensions (target path + panel
     /// visibility), so the cursor-changed event fires only on an actual change.
-    last_cursor: (Option<std::path::PathBuf>, bool, usize),
+    last_cursor: (Option<std::path::PathBuf>, bool, usize, String),
+    /// The message-log cursor: everything up to this seq has already been
+    /// surfaced as a notice by `surface_new_messages` (the only reader).
+    /// Captured at boot *start* so boot diagnostics themselves surface.
+    msg_seen: u64,
     /// Memo of per-command options parsed from `--help`/`man`.
     option_cache: OptionCache,
 }
@@ -53,6 +57,10 @@ impl App {
     /// Boot the kernel: build registries, load embedded defaults, register
     /// bundled extensions, and issue the initial directory read.
     pub fn boot(cwd: std::path::PathBuf) -> Self {
+        // Before any producer runs, so every diagnostic this boot logs is
+        // "new" to surface_new_messages — but nothing from an earlier App in
+        // the same process (tests) is.
+        let msg_seen = crate::services::messages::global().seq();
         let (tx, rx) = std::sync::mpsc::channel::<AppEvent>();
 
         // Spawn the resident Scheme session first (pillar #3). Wait briefly for
@@ -87,19 +95,16 @@ impl App {
             crate::services::resolver::defaults()
         });
 
-        // Build the VFS: embedded defaults (filesystem + bookmarks), then extensions.
-        // The settings provider is contributed by the settings extension below.
-        let (default_providers, bookmarks_state) = crate::vfs::defaults();
+        // Build the VFS: the embedded filesystem default, then extensions (each
+        // contributes its own mount via `vfs_providers()`). The settings provider
+        // is contributed by the settings extension below.
         let mut vfs = crate::vfs::Vfs::default();
-        vfs.extend(default_providers);
-
-        // The bookmarks extension shares the Arc with the bookmarks provider.
-        let bookmarks_ext = extension::bookmarks::BookmarksExtension::new(bookmarks_state);
+        vfs.extend(crate::vfs::defaults());
 
         // ── OptionStore ────────────────────────────────────────────────────────
         // Collect option defs from core + all extensions before registering, so
         // the store is built once with all defs (first-wins on duplicate keys).
-        let bundled_exts = extension::bundled();
+        let bundled_exts = extension::bundled(config_dir());
         let optional_exts = load_optional_extensions();
 
         let mut all_option_defs = scheme_core_option_defs(&scheme, scheme_ready);
@@ -121,6 +126,7 @@ impl App {
             preferred_ext: store.get_list("matcher.preferred-ext"),
             noise_ext: store.get_list("matcher.noise-ext"),
             noise_dirs: store.get_list("matcher.noise-dirs"),
+            max_results: store.get_u32("matcher.max-results") as usize,
         }));
 
         // ── ThemeRegistry ──────────────────────────────────────────────────────
@@ -144,16 +150,30 @@ impl App {
             config_dir().map(|d| d.join("config.scm")),
         );
 
-        // Collect SettingsNode contributions from theme_ext before building
-        // settings_ext (plan §11 choice (b): no interior mutability needed).
-        let settings_nodes: Vec<std::sync::Arc<dyn extension::settings::SettingsNode>> =
-            theme_ext.settings_nodes();
+        // Collect SettingsNode contributions from theme_ext and every bundled
+        // extension (e.g. lscolors' Themes, grafted onto its own screen) before
+        // building settings_ext (plan §11 choice (b): no interior mutability
+        // needed). `&bundled_exts` since the vec is still needed below to
+        // register the extensions themselves.
+        let settings_nodes: Vec<std::sync::Arc<dyn extension::settings::SettingsNode>> = {
+            let mut nodes = theme_ext.settings_nodes();
+            for ext in &bundled_exts {
+                nodes.extend(ext.settings_nodes());
+            }
+            nodes
+        };
+
+        // The full extension list (id + About) is known only after every extension
+        // is registered, so the settings provider reads it through this shared
+        // OnceLock, which the kernel fills at the end of construction.
+        let ext_infos: extension::settings::ExtInfos = Arc::new(std::sync::OnceLock::new());
 
         let settings_ext = extension::settings::SettingsExtension::new(
             store.clone(),
             matcher_cfg.clone(),
             settings_nodes,
             config_dir().map(|d| d.join("config.scm")),
+            ext_infos.clone(),
         );
 
         // Register bundled extensions: keymaps, commands, resolver entries,
@@ -168,12 +188,25 @@ impl App {
             ext.register_conditions(&mut conditions);
             extensions.register(ext);
         }
-        // Bookmarks, settings, and theme registered separately (they need shared Arcs).
-        // Settings is registered before optional extensions so its ID wins any
-        // collision from an optional extension with the same name.
-        extensions.register(Box::new(bookmarks_ext));
+        // Settings and theme registered separately (they need shared Arcs built
+        // above). Settings is registered before optional extensions so its ID
+        // wins any collision from an optional extension with the same name.
+        // Theme still needs the same keymap/command/resolver/condition wiring
+        // the bundled_exts loop above gives every other bundled extension.
         vfs.extend(settings_ext.vfs_providers());
+        // @/messages: the diagnostic log every messages::log call above and
+        // below has been writing into (a kernel service, not an extension —
+        // its producers include the loader and this very boot sequence).
+        vfs.extend([Box::new(crate::services::messages::MessagesProvider::new(
+            crate::services::messages::global().clone(),
+            store.clone(),
+        )) as Box<dyn crate::vfs::VfsProvider>]);
         extensions.register(Box::new(settings_ext));
+        keymap.extend(theme_ext.keymaps());
+        keymap.extend(extension_scheme_keymaps(&scheme, scheme_ready, &theme_ext));
+        commands.extend(theme_ext.commands());
+        resolver.extend(theme_ext.resolver_entries());
+        theme_ext.register_conditions(&mut conditions);
         extensions.register(Box::new(theme_ext));
 
         // Optional (dynamically loaded) extensions: in file-name order; an id
@@ -182,7 +215,7 @@ impl App {
             extensions.iter().map(|e| e.id().to_string()).collect();
         for ext in optional_exts {
             if !ext_ids.insert(ext.id().to_string()) {
-                eprintln!("optional extension id collides ({}); disabled", ext.id());
+                crate::services::messages::log(format!("optional extension id collides ({}); disabled", ext.id()), true);
                 continue;
             }
             keymap.extend(ext.keymaps());
@@ -199,6 +232,15 @@ impl App {
             ext.bind_store(&store);
         }
 
+        // Publish the full extension list (id + About) to the settings provider so
+        // @/settings/Extensions can list every extension and its About card.
+        let _ = ext_infos.set(
+            extensions
+                .iter()
+                .map(|e| extension::settings::ExtInfo { id: e.id().to_string(), about: e.about() })
+                .collect(),
+        );
+
         // User layer last: apply to store (warns on invalid values for known keys);
         // then project any matcher.* changes into the shared MatcherConfig.
         if scheme_ready {
@@ -209,12 +251,22 @@ impl App {
             }
             project_matcher(&store, &matcher_cfg);
         }
+        // Apply the message-log cap now that the user's value (if any) is in
+        // the store; MessagesProvider re-reads it on every @/messages listing,
+        // so later edits under @/settings/System apply live too.
+        crate::services::messages::global()
+            .set_max_lines(store.get_u32("max-message-line") as usize);
 
         for w in keymap.warnings() {
-            eprintln!("warning: {w}");
+            crate::services::messages::log(format!("warning: {w}"), true);
         }
 
         let resolver = Arc::new(resolver);
+        // Hand the resolver chain to extensions that build external command lines
+        // (the CmdOp builder) now that it is finalized and shareable.
+        for ext in extensions.iter() {
+            ext.bind_services(&resolver);
+        }
         let vfs = Arc::new(vfs);
         let matcher: Arc<dyn crate::services::MatcherBackend> = Arc::new(SkimMatcher::default());
         let tasks = TaskManager::new(
@@ -245,7 +297,8 @@ impl App {
             tx,
             theme_registry,
             pending_suspend: None,
-            last_cursor: (None, false, 0),
+            last_cursor: (None, false, 0, String::new()),
+            msg_seen,
             option_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
         // Initial listing.
@@ -253,7 +306,8 @@ impl App {
         app
     }
 
-    /// Handle one key: resolve to an intent, or deliver a RawKeyEvent in Select.
+    /// Handle one key: resolve to an intent, or deliver a RawKeyEvent in
+    /// Select / InputForm (the popup text-entry dialog).
     pub fn handle_key(&mut self, key: Key) {
         // While the function-panel search input is open, keys edit the query — except
         // Enter (submit) and Esc (cancel), which still resolve via the keymap.
@@ -264,11 +318,19 @@ impl App {
             self.broadcast_cursor_changed();
             return;
         }
+        // While a generic function-panel input is open (any form extension), or a
+        // CmdOp text input (filter / prompt / builder edit) is active, all keys are
+        // fed as raw events so text editing works. The reducer routes Enter/Esc.
+        if self.state.function.input.is_some() {
+            self.dispatch(Intent::RawKeyEvent(key));
+            self.broadcast_cursor_changed();
+            return;
+        }
         let panel = self.state.focused_panel.clone();
         match self.keymap.resolve(&self.conditions, &self.state, &panel, key) {
             Some(intent) => self.dispatch(intent),
             None => {
-                if matches!(self.state.mode(), Mode::Select(_)) {
+                if matches!(self.state.mode(), Mode::Select(_) | Mode::InputForm(_)) {
                     self.dispatch(Intent::RawKeyEvent(key));
                 }
             }
@@ -283,19 +345,24 @@ impl App {
         if result.purpose == Purpose::Content {
             if result.status == AsyncStatus::Ok {
                 if let Payload::Read { owner, path, result: read } = result.payload {
-                    // Drop a content read whose path is no longer under the cursor:
-                    // the user navigated away (e.g. into an empty directory) while
-                    // the read was in flight. Without this gate the late read would
-                    // re-populate the preview that the cursor-changed clear just
-                    // dropped, leaving the previous file's content on screen.
-                    if self.cursor_signature().0.as_deref() != Some(path.as_path()) {
+                    // A form owner's explicit read (e.g. the CmdOp listing dir) is
+                    // not cursor-follow: it bypasses the cursor-staleness gate and
+                    // self-gates in accept_content, and does not reset the view.
+                    let is_form = self.state.function.form_owner.as_deref() == Some(owner.as_str());
+                    // Drop a cursor-follow read whose path is no longer under the
+                    // cursor: the user navigated away while the read was in flight.
+                    // Without this gate the late read would re-populate the preview
+                    // the cursor-changed clear just dropped.
+                    if !is_form && self.cursor_signature().0.as_deref() != Some(path.as_path()) {
                         return;
                     }
                     if let Some(ext) = self.extensions.find(&owner) {
                         ext.accept_content(&path, &read);
                     }
-                    // New content: reset the view (scroll / search) like a new file.
-                    self.dispatch(Intent::ResetContentView);
+                    if !is_form {
+                        // New content: reset the view (scroll / search) like a new file.
+                        self.dispatch(Intent::ResetContentView);
+                    }
                 }
             }
             return;
@@ -317,21 +384,18 @@ impl App {
     /// The cursor identity for the broadcast gate: what's under the cursor (the
     /// File-mode entry, or the file-search candidate) and whether the function
     /// panel is open. Generic — it carries no extension-specific notion.
-    fn cursor_signature(&self) -> (Option<std::path::PathBuf>, bool, usize) {
-        let path = match self.state.mode() {
-            Mode::File => self.state.current_entry().map(|e| e.path.clone()),
-            Mode::Select(spec) if spec.id == "file-search" => self
-                .state
-                .select
-                .as_ref()
-                .and_then(|s| s.view.as_ref())
-                .and_then(|v| v.current())
-                .map(|e| e.path.clone()),
-            _ => None,
-        };
+    fn cursor_signature(&self) -> (Option<std::path::PathBuf>, bool, usize, String) {
+        let path = self.state.cursor_path();
         // Scroll is part of the signature so paging down re-broadcasts and the
-        // content provider can fetch the next chunk as the viewport advances.
-        (path, self.state.function.visible, self.state.function.scroll)
+        // content provider can fetch the next chunk as the viewport advances. The
+        // mode id is part of it too, so pushing/popping an overlay extension mode
+        // re-broadcasts — letting the ambient provider reclaim the panel on pop.
+        (
+            path,
+            self.state.function.visible,
+            self.state.function.scroll.offset(),
+            self.state.mode_id(),
+        )
     }
 
     /// Broadcast the generic **cursor-changed** event: when the cursor identity or
@@ -408,14 +472,14 @@ impl App {
         if let Intent::Extension(ext) = &intent {
             if ext.data.get(KEY_RESOLVER).is_some() {
                 if let Some(req) = resolver_request(&ext.data) {
-                    if self.resolver.is_destructive(&req.op) && !confirmed {
+                    if self.needs_confirmation(&req) && !confirmed {
                         let i = intent.clone();
                         self.state.push_mode(Mode::Policy(Box::new(i)));
                         return;
                     }
                     self.spawn_plan(Plan::ResolveAndRun { request: req });
                 } else {
-                    self.ui.notify(core::Notice::error("malformed resolver intent"));
+                    crate::services::messages::log("malformed resolver intent", true);
                 }
                 return;
             }
@@ -426,9 +490,11 @@ impl App {
             return;
         }
 
-        // Confirmation gate: a destructive resolver op (e.g. delete) → Policy.
+        // Confirmation gate: a destructive resolver op (e.g. delete), or one
+        // that would silently overwrite an existing path (cp/mv's `-i`
+        // condition) → Policy.
         if let Intent::RunResolver(req) = &intent {
-            if self.resolver.is_destructive(&req.op) && !confirmed {
+            if self.needs_confirmation(req) && !confirmed {
                 self.state.push_mode(Mode::Policy(Box::new(intent)));
                 return;
             }
@@ -451,15 +517,40 @@ impl App {
         self.process_effects(effects, depth);
     }
 
+    /// Whether `req` needs a Policy confirmation before running: a
+    /// statically destructive op (delete), or one that would silently
+    /// overwrite an existing path — the dynamic `cp`/`mv -i` condition,
+    /// which depends on the actual filesystem at dispatch time and so can't
+    /// be a fixed property of the resolver entry the way `destructive` is.
+    fn needs_confirmation(&self, req: &ResolverRequest) -> bool {
+        self.resolver.is_destructive(&req.op)
+            || crate::services::resolver::would_overwrite(req, &self.state.cwd)
+    }
+
     fn process_effects(&mut self, effects: core::Effects, depth: u32) {
         for n in effects.notices {
-            self.ui.notify(n);
+            crate::services::messages::log(n.text, n.error);
         }
         for p in effects.plans {
             self.spawn_plan(p);
         }
         for i in effects.intents {
             self.dispatch_depth(i, false, depth + 1);
+        }
+    }
+
+    /// The single seam between the message log and the on-screen notice: the
+    /// newest line the user hasn't been shown yet — whether it came from the
+    /// reducer's `Effects.notices` (drained into the log above) or straight
+    /// from a boot/loader diagnostic — becomes the notice. Called every
+    /// event-loop pass *before* the draw, so a notice logged while handling
+    /// an event shows in that event's own frame, and a config mistake is
+    /// visible at launch. Only the newest unseen line: the notice UI is a
+    /// single 4-second slot; the full history is `@/messages`.
+    pub fn surface_new_messages(&mut self) {
+        if let Some((text, error, seq)) = crate::services::messages::global().latest_since(self.msg_seen) {
+            self.msg_seen = seq;
+            self.ui.notify(if error { core::Notice::error(text) } else { core::Notice::info(text) });
         }
     }
 
@@ -577,7 +668,7 @@ fn scheme_config<T>(
         .and_then(|printed| crate::script::sexpr::parse(&printed))
         .and_then(|datum| parse(&datum))
         .unwrap_or_else(|e| {
-            eprintln!("scheme {label} config failed ({e}); using embedded defaults");
+            crate::services::messages::log(format!("scheme {label} config failed ({e}); using embedded defaults"), true);
             fallback()
         })
 }
@@ -656,7 +747,7 @@ fn scheme_core_option_defs(
     {
         Ok(defs) => defs,
         Err(e) => {
-            eprintln!("core option defs failed ({e}); no options registered");
+            crate::services::messages::log(format!("core option defs failed ({e}); no options registered"), true);
             Vec::new()
         }
     }
@@ -674,9 +765,16 @@ fn extension_option_defs(
     match eval_quoted_scheme(session, ready, &src, "extension option source")
         .and_then(|d| crate::script::config::parse_option_config(&d))
     {
-        Ok(defs) => defs,
+        Ok(mut defs) => {
+            // Tag each def with its owning extension so settings groups them under
+            // @/settings/Extensions/<id> rather than as a flat category.
+            for d in &mut defs {
+                d.owner = Some(ext.id().to_string());
+            }
+            defs
+        }
         Err(e) => {
-            eprintln!("extension '{}' option defs failed ({e}); ignoring", ext.id());
+            crate::services::messages::log(format!("extension '{}' option defs failed ({e}); ignoring", ext.id()), true);
             Vec::new()
         }
     }
@@ -697,7 +795,7 @@ fn extension_scheme_keymaps(
     {
         Ok(binds) => binds,
         Err(e) => {
-            eprintln!("extension '{}' scheme keymap failed ({e}); ignoring", ext.id());
+            crate::services::messages::log(format!("extension '{}' scheme keymap failed ({e}); ignoring", ext.id()), true);
             Vec::new()
         }
     }
@@ -739,7 +837,7 @@ fn config_dir() -> Option<std::path::PathBuf> {
 /// silently stashed in `unowned` for late-arriving optional extensions).
 fn apply_option(store: &OptionStore, key: &str, val: &str) {
     if !store.set(key, val) && store.def(key).is_some() {
-        eprintln!("user config: invalid value '{val}' for option '{key}'");
+        crate::services::messages::log(format!("user config: invalid value '{val}' for option '{key}'"), true);
     }
 }
 
@@ -754,6 +852,7 @@ fn project_matcher(os: &OptionStore, cfg: &Mutex<MatcherConfig>) {
     mc.preferred_ext = os.get_list("matcher.preferred-ext");
     mc.noise_ext = os.get_list("matcher.noise-ext");
     mc.noise_dirs = os.get_list("matcher.noise-dirs");
+    mc.max_results = os.get_u32("matcher.max-results") as usize;
 }
 
 /// Load the user configuration: write the commented template (`config.scm`) if
@@ -794,7 +893,7 @@ fn scheme_user_config(
     {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("user config failed ({e}); ignoring user overrides");
+            crate::services::messages::log(format!("user config failed ({e}); ignoring user overrides"), true);
             (Vec::new(), Vec::new())
         }
     }
@@ -923,26 +1022,34 @@ impl App {
         }
     }
 
-    /// Render the active content provider; the row count if it drew anything.
+    /// The active content provider's logical row count, if it produced a view.
     pub fn function_content_rows(&self) -> Option<usize> {
-        self.render_provider().map(|d| d.total)
+        self.provider_view().map(|v| match v {
+            crate::core::PanelView::Document(blocks) => blocks.len(),
+            crate::core::PanelView::Image { .. } => 1,
+        })
     }
 
-    /// The active content provider's rendered title, if any.
+    /// The function-panel title for the active provider's view (the cursor file
+    /// name + any search position), if the provider produced a view.
     pub fn function_title(&self) -> Option<String> {
-        self.render_provider().map(|d| d.title)
+        self.provider_view().map(|_| {
+            crate::ui::content::title(self.cursor_signature().0.as_deref(), &self.state.function.search)
+        })
     }
 
-    fn render_provider(&self) -> Option<crate::extension::FunctionDraw> {
+    fn provider_view(&self) -> Option<crate::core::PanelView> {
         let theme = crate::core::Theme::default();
+        let sources = self.state.targets();
         let ctx = crate::extension::FunctionRenderCtx {
             width: 80,
             height: 24,
             focused: true,
             func: &self.state.function,
+            sources: &sources,
             theme: &theme,
         };
-        self.extensions.provider().and_then(|p| p.render_function(&ctx))
+        self.extensions.provider().and_then(|p| p.view(&ctx))
     }
 }
 
@@ -1073,6 +1180,92 @@ mod tests {
     }
 
     #[test]
+    fn cmdop_deep_search_submit_lands_through_the_real_kernel_pipeline() {
+        // Reproduces SEARCH_RENEW.md scenario 4 end-to-end: start-copy, "/" for
+        // deep search, type + Enter through the real handle_key path (not
+        // dispatch_for_test, which bypasses the function.input raw-key gate and
+        // the real async round trip) — the exact layer the reducer-only and
+        // extension-only unit tests never exercise.
+        use crate::core::ExtensionIntent;
+        let dir = temp_dir_with_files();
+        let mut app = App::boot(dir.clone());
+        app.pump_one(); // initial ReadDir
+        app.dispatch_for_test(Intent::CursorDown); // off subdir, onto alpha.txt
+        assert_eq!(app.state.current_entry().unwrap().name, "alpha.txt");
+
+        app.dispatch_for_test(Intent::Extension(ExtensionIntent {
+            extension: "cmdop".into(),
+            intent: "start-copy".into(),
+            data: ExtensionValue::Nil,
+        }));
+        assert_eq!(app.state.function.form_owner.as_deref(), Some("cmdop"));
+        app.pump_one(); // the browse dir's own LoadContent listing lands
+
+        app.dispatch_for_test(Intent::Extension(ExtensionIntent {
+            extension: "cmdop".into(),
+            intent: "filter-start".into(),
+            data: ExtensionValue::Nil,
+        }));
+        assert!(app.state.function.input.is_some(), "search-deep input is open");
+        assert_eq!(app.state.function.input.as_ref().unwrap().purpose, "search-deep");
+
+        for c in "alpha".chars() {
+            app.handle_key(Key::plain(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.state.function.input.as_ref().unwrap().query, "alpha",
+            "each character reached the query buffer, none were hijacked as file-cursor keymap bindings",
+        );
+        app.handle_key(Key::plain(KeyCode::Enter));
+        assert!(app.state.function.input.is_none(), "Enter closed the input box");
+        assert_eq!(
+            app.state.function.form_owner.as_deref(), Some("cmdop"),
+            "the builder is still open — Enter must not have fallen through to a stray keymap binding",
+        );
+
+        app.pump_one(); // the owner-addressed Plan::Search completes as a content Read
+        assert_eq!(app.state.function.form_owner.as_deref(), Some("cmdop"), "still open after the search lands");
+    }
+
+    #[test]
+    fn copy_onto_an_existing_file_gates_on_policy_like_delete() {
+        let dir = temp_dir_with_files();
+        let mut app = App::boot(dir.clone());
+        app.pump_one();
+        // beta.txt already exists — copying alpha.txt onto it must confirm
+        // first, the same `-i` condition real `cp`/`mv` prompt on.
+        let req = crate::core::ResolverRequest {
+            op: "copy".into(),
+            src: None,
+            dst: Some("beta.txt".into()),
+            path: None,
+            paths: vec![dir.join("alpha.txt")],
+            opts: vec![],
+            label: "copy".into(),
+        };
+        app.dispatch_for_test(Intent::RunResolver(req));
+        assert!(matches!(app.state.mode(), Mode::Policy(_)), "copy onto an existing file gates on Policy");
+    }
+
+    #[test]
+    fn copy_to_a_new_name_runs_without_confirmation() {
+        let dir = temp_dir_with_files();
+        let mut app = App::boot(dir.clone());
+        app.pump_one();
+        let req = crate::core::ResolverRequest {
+            op: "copy".into(),
+            src: None,
+            dst: Some("brand-new.txt".into()),
+            path: None,
+            paths: vec![dir.join("alpha.txt")],
+            opts: vec![],
+            label: "copy".into(),
+        };
+        app.dispatch_for_test(Intent::RunResolver(req));
+        assert!(matches!(app.state.mode(), Mode::File), "no existing target — runs immediately, no Policy gate");
+    }
+
+    #[test]
     fn file_search_loads_selected_candidate() {
         let dir = temp_dir_with_files();
         let mut app = App::boot(dir);
@@ -1103,6 +1296,36 @@ mod tests {
     }
 
     #[test]
+    fn effects_notices_reach_the_log_and_surface_with_their_error_attribute() {
+        let dir = temp_dir_with_files();
+        let mut app = App::boot(dir);
+        app.surface_new_messages(); // drain anything boot itself logged
+        // A unique text: the log is process-global and other tests may push
+        // concurrently, so assert containment, not exact contents.
+        let text = format!("notice-unified-{}", std::process::id());
+        let fx = core::Effects { notices: vec![core::Notice::info(text.clone())], ..Default::default() };
+        app.process_effects(fx, 0);
+        assert!(
+            crate::services::messages::global().lines().contains(&(text.clone(), false)),
+            "a reducer notice is a retained @/messages line, error attribute intact"
+        );
+        app.surface_new_messages();
+        let n = app.ui.live_notice().expect("the pump surfaces the logged notice");
+        assert!(!n.error, "an info notice keeps its info styling through the log");
+    }
+
+    #[test]
+    fn a_raw_log_line_surfaces_as_an_error_notice() {
+        let dir = temp_dir_with_files();
+        let mut app = App::boot(dir);
+        app.surface_new_messages(); // drain anything boot itself logged
+        crate::services::messages::log("some boot diagnostic", true);
+        app.surface_new_messages();
+        let n = app.ui.live_notice().expect("an unseen log line surfaces as a notice");
+        assert!(n.error, "the error attribute carries through to the notice styling");
+    }
+
+    #[test]
     fn resolver_table_sourced_from_scheme() {
         let session = crate::script::SchemeSession::spawn();
         session.wait_ready(Duration::from_secs(600));
@@ -1121,8 +1344,10 @@ mod tests {
         session.wait_ready(Duration::from_secs(600));
         let cmds = scheme_commands(&session);
         assert!(cmds.iter().any(|c| c.name == "quit"));
-        let mkdir = cmds.iter().find(|c| c.name == "mkdir").expect("mkdir command");
-        assert!(matches!(mkdir.intent, Intent::PushMode(_)), "mkdir opens a path input");
+        // copy/move/rename/mkdir/touch are contributed natively by the cmdop
+        // extension's commands(), not command.scm — see its own doc comment.
+        let home = cmds.iter().find(|c| c.name == "home").expect("home command");
+        assert!(matches!(home.intent, Intent::NavigateTo(_)), "home navigates to the VFS root");
     }
 
     #[test]
@@ -1260,6 +1485,7 @@ mod tests {
         app.tasks
             .spawn(Plan::EvalScheme { expr: "(+ 40 2)".into() }, generation, cwd);
         app.pump_one(); // Scheme result
+        app.surface_new_messages(); // notices reach the screen via the per-frame pump
         let shown = app.ui.live_notice().map(|n| n.text.clone()).unwrap_or_default();
         assert!(shown.contains("42"), "scheme result surfaced: {shown:?}");
     }

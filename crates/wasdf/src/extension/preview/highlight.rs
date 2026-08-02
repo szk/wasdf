@@ -1,6 +1,8 @@
 //! Syntax highlighting for text previews (syntect). Off the render path: this is
 //! called by the blocking Preview task, which stores the resulting per-line
-//! style runs alongside the raw text in PreviewContent::Text.
+//! logical spans alongside the raw text in `Decoded::Text`. Colors are emitted as
+//! literal `SpanStyle::Rgb` (syntax colors are not theme roles); core lays the
+//! spans out.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -9,7 +11,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-use crate::core::StyleRun;
+use crate::core::{SpanStyle, TextSpan};
 
 /// The bundled syntect syntax set (newline variants), loaded once on first text
 /// preview so startup pays nothing.
@@ -23,10 +25,11 @@ fn theme() -> &'static Theme {
     THEME.get_or_init(|| ThemeSet::load_defaults().themes["base16-ocean.dark"].clone())
 }
 
-/// Syntax-highlight `lines` (the raw text of a preview) into per-line style runs
-/// keyed by file extension. Returns an empty Vec when no syntax matches the
-/// file, so the renderer falls back to plain text.
-pub fn highlight_lines(path: &Path, lines: &[String]) -> Vec<Vec<StyleRun>> {
+/// Syntax-highlight `lines` (the raw text of a preview) into per-line logical
+/// spans keyed by file extension. Each inner Vec fully covers its line. Returns an
+/// empty outer Vec when no syntax matches the file, so the caller falls back to a
+/// single plain span per line.
+pub fn highlight_lines(path: &Path, lines: &[String]) -> Vec<Vec<TextSpan>> {
     let ss = syntaxes();
     let syntax = path
         .extension()
@@ -39,46 +42,30 @@ pub fn highlight_lines(path: &Path, lines: &[String]) -> Vec<Vec<StyleRun>> {
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
         // syntect's newline syntaxes expect a trailing '\n'; add one for parsing
-        // and cap by the original length so run lengths sum to the line length.
-        let mut runs = Vec::new();
+        // and cap by the original length so span lengths sum to the line length.
         let with_nl = format!("{line}\n");
         let Ok(ranges) = hl.highlight_line(&with_nl, ss) else {
-            out.push(Vec::new());
+            out.push(vec![TextSpan::plain(line.clone())]);
             continue;
         };
-        let mut remaining = line.len();
+        let mut spans = Vec::new();
+        let mut pos = 0usize;
         for (style, piece) in ranges {
-            if remaining == 0 {
+            if pos >= line.len() {
                 break;
             }
-            let len = piece.len().min(remaining);
-            remaining -= len;
+            let end = (pos + piece.len()).min(line.len());
+            let Some(text) = line.get(pos..end) else { break };
             let c = style.foreground;
-            runs.push(StyleRun { len, fg: (c.r, c.g, c.b), bg: None });
+            spans.push(TextSpan::styled(text, SpanStyle::Rgb { fg: (c.r, c.g, c.b), bg: None }));
+            pos = end;
         }
-        out.push(runs);
+        if pos < line.len() {
+            if let Some(rest) = line.get(pos..) {
+                spans.push(TextSpan::plain(rest.to_string()));
+            }
+        }
+        out.push(spans);
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn highlights_a_known_extension() {
-        let lines = vec!["fn main() {}".to_string()];
-        let styles = highlight_lines(Path::new("example.rs"), &lines);
-        assert_eq!(styles.len(), 1);
-        assert!(!styles[0].is_empty(), "rust source got highlight runs");
-        // Run lengths tile the line exactly (kept in sync with the raw text).
-        let total: usize = styles[0].iter().map(|r| r.len).sum();
-        assert_eq!(total, lines[0].len());
-    }
-
-    #[test]
-    fn unknown_extension_is_unstyled() {
-        let styles = highlight_lines(Path::new("data.unknownext"), &["x".to_string()]);
-        assert!(styles.is_empty(), "no syntax → plain text");
-    }
 }

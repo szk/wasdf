@@ -15,3 +15,4 @@ homepage = "https://github.com/szk/wasdf"
 ratatui = "0.30"
 crossterm = "0.29"
 fuzzy-matcher = "0.3"
+tui-input = { version = "0.15", default-features = false }

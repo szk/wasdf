@@ -34,14 +34,14 @@ fn main() -> ExitCode {
             let cmds: Vec<String> = ext.commands().iter().map(|c| c.name.clone()).collect();
             let res: Vec<String> = ext.resolver_entries().iter().map(|r| r.key.clone()).collect();
             println!("extension {} commands={cmds:?} resolvers={res:?}", ext.id());
-            // Probe handle_intent across the ABI with a `greet` intent.
+            // Probe handle_intent across the ABI with a `show-info` intent.
             let probe = core::ExtensionIntent {
                 extension: ext.id().to_string(),
-                intent: "greet".into(),
+                intent: "show-info".into(),
                 data: core::ExtensionValue::Nil,
             };
             let out = ext.handle_intent(&probe, &state);
-            println!("  handle_intent(greet) -> {out:?}");
+            println!("  handle_intent(show-info) -> {out:?}");
         }
         return ExitCode::SUCCESS;
     }

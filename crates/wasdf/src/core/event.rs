@@ -42,11 +42,18 @@ pub enum Plan {
         path: PathBuf,
         show_hidden: bool,
     },
-    /// Recursive walk + matcher ranking (file-search).
+    /// Recursive walk + matcher ranking (file-search, deep — see
+    /// SEARCH_RENEW.md). `owner: None` completes as `(Purpose::Search,
+    /// Payload::Entries)`, driving a Select's own `view` (today's file-search).
+    /// `owner: Some(id)` completes as a generic content Read instead
+    /// (`Purpose::Content`, `Payload::Read{owner, path: root, ReadResult::Dir}`)
+    /// — the extension-facing counterpart, addressed like `Plan::Read`,
+    /// routed to `id`'s `accept_content` with zero new kernel plumbing.
     Search {
         root: PathBuf,
         query: String,
         show_hidden: bool,
+        owner: Option<String>,
     },
     /// Read `path` for an extension's function-panel content (generic: a byte
     /// chunk from `offset` for a file, entries for a directory). The extension
@@ -90,28 +97,110 @@ pub enum AsyncStatus {
     StaleDiscarded,
 }
 
-/// A styled run within a content line: a byte length and its 24-bit colors. Runs
-/// tile a line left-to-right and their lengths sum to the line's byte length; an
-/// empty run list means the line is unstyled (plain). `bg` is optional so an
-/// extension can express backgrounds (e.g. highlights) — the extension owns all
-/// color; core's blitter only paints what the runs say.
+/// Layout-free logical content for the function panel. An extension describes
+/// *what* to show — sections, key/value fields, and spans tagged with a theme
+/// role or an explicit color — and **core owns all layout**: label-column
+/// alignment, line wrapping / horizontal scroll, vertical scroll, line numbers,
+/// and theming. Extensions never assemble pre-styled lines. A dynamic extension
+/// emits this as scheme data over the ABI (`(document (field …) (line …) …)`),
+/// which the codec decodes into a `PanelView`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct StyleRun {
-    pub len: usize,
-    pub fg: (u8, u8, u8),
-    pub bg: Option<(u8, u8, u8)>,
-}
-
-/// Extension-agnostic content rendered into the function panel. Any extension
-/// can produce it (synchronously via [`crate::core::Intent::ShowFunctionContent`]
-/// or, later, asynchronously). The kernel renders it generically: text, hex, and
-/// directory listings as `Lines`, images as `Image`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PanelContent {
-    /// Styled text. `styles[i]` are the highlight runs for `lines[i]` (empty = plain).
-    Lines { lines: Vec<String>, styles: Vec<Vec<StyleRun>> },
+pub enum PanelView {
+    /// A sequence of logical blocks core lays out top-to-bottom.
+    Document(Vec<Block>),
     /// A decoded image as packed RGB8 (width*height*3). Bundled-only across the ABI.
     Image { width: u32, height: u32, rgb: Vec<u8> },
+}
+
+/// One logical block of a [`PanelView::Document`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Block {
+    /// A key/value row; core aligns the `label` column across the document.
+    Field { label: String, value: Vec<TextSpan> },
+    /// One logical line of rich text.
+    Line(Vec<TextSpan>),
+    /// A section heading (core renders it emphasized).
+    Heading(Vec<TextSpan>),
+    /// A full-width horizontal separator.
+    Rule,
+    /// A decoded image as packed RGB8 (width*height*3), blitted inline at the
+    /// panel width. Same payload as [`PanelView::Image`]; this variant is the
+    /// *inline* form, for documents that mix prose and pictures (markdown).
+    /// Core picks the row count from the panel width — see [`Block::rows`].
+    /// Bundled-only across the ABI.
+    Image { width: u32, height: u32, rgb: Vec<u8> },
+}
+
+impl Block {
+    /// Panel rows this block occupies once laid out `cols` columns wide (the
+    /// text area — subtract [`LINE_NUMBER_WIDTH`] first when the gutter is on).
+    /// Every block is a single row except an image, which is blitted to its
+    /// aspect ratio and bounded by `max_rows`.
+    ///
+    /// Producers need this too, not just the renderer: anything that reports
+    /// *row* indices back to core (a search's match lines) has to agree with
+    /// the layout about an image's footprint.
+    pub fn rows(&self, cols: u16, max_rows: u16) -> u16 {
+        match self {
+            // Terminal cells run about twice as tall as they are wide.
+            Block::Image { width, height, .. } => {
+                if *width == 0 || *height == 0 || cols == 0 || max_rows == 0 {
+                    return 0;
+                }
+                let rows =
+                    (u64::from(*height) * u64::from(cols)).div_ceil(u64::from(*width) * 2);
+                rows.clamp(1, u64::from(max_rows)) as u16
+            }
+            _ => 1,
+        }
+    }
+}
+
+/// Columns the function panel reserves for the line-number gutter when it is
+/// shown. Core's line painter lays out the number in this width.
+pub const LINE_NUMBER_WIDTH: u16 = 5;
+
+/// A run of text with a logical style; core resolves the style at render time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextSpan {
+    pub text: String,
+    pub style: SpanStyle,
+    /// Font emphasis, orthogonal to the color in `style`. Markdown's `**bold**`
+    /// / `*italic*` carry no color of their own, so emphasis cannot be folded
+    /// into [`SpanStyle`].
+    pub emph: Emph,
+}
+
+impl TextSpan {
+    /// A span in the default (unstyled) text color.
+    pub fn plain(text: impl Into<String>) -> Self {
+        TextSpan { text: text.into(), style: SpanStyle::Default, emph: Emph::default() }
+    }
+
+    /// A span in `style`, unemphasized.
+    pub fn styled(text: impl Into<String>, style: SpanStyle) -> Self {
+        TextSpan { text: text.into(), style, emph: Emph::default() }
+    }
+}
+
+/// Font emphasis on a [`TextSpan`]. Default is "no emphasis"; core maps each
+/// flag onto the corresponding ratatui `Modifier` at render time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Emph {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub dim: bool,
+}
+
+/// How a [`TextSpan`] is colored. `Role` is resolved against the active theme so
+/// extension content re-themes automatically; `Rgb` is a literal escape hatch
+/// (e.g. syntax-highlight colors that are not theme roles).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpanStyle {
+    Default,
+    Role(String),
+    Rgb { fg: (u8, u8, u8), bg: Option<(u8, u8, u8)> },
 }
 
 /// Completion of a background resolver/open operation.
@@ -160,4 +249,47 @@ pub enum AppEvent {
     Resize(u16, u16),
     Async(AsyncResult),
     Tick,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(width: u32, height: u32) -> Block {
+        Block::Image { width, height, rgb: vec![0; (width * height * 3) as usize] }
+    }
+
+    #[test]
+    fn every_block_but_an_image_is_one_row() {
+        for b in [
+            Block::Line(vec![TextSpan::plain("x")]),
+            Block::Heading(vec![TextSpan::plain("x")]),
+            Block::Field { label: "k".into(), value: vec![TextSpan::plain("v")] },
+            Block::Rule,
+        ] {
+            assert_eq!(b.rows(80, 24), 1, "{b:?}");
+        }
+    }
+
+    #[test]
+    fn an_image_keeps_its_aspect_ratio_at_two_pixel_rows_per_cell() {
+        // 40 wide over 80 columns of a 2:1 cell: 80 * (40/40) / 2.
+        assert_eq!(image(40, 40).rows(80, 200), 40);
+        assert_eq!(image(40, 20).rows(80, 200), 20);
+        // A partial row still needs a whole cell.
+        assert_eq!(image(40, 41).rows(80, 200), 41);
+    }
+
+    #[test]
+    fn an_image_is_bounded_by_max_rows_and_never_vanishes_to_zero() {
+        assert_eq!(image(40, 400).rows(80, 24), 24);
+        assert_eq!(image(400, 1).rows(80, 24), 1);
+    }
+
+    #[test]
+    fn a_degenerate_image_occupies_no_rows() {
+        assert_eq!(image(40, 40).rows(0, 24), 0);
+        assert_eq!(image(40, 40).rows(80, 0), 0);
+        assert_eq!(image(0, 40).rows(80, 24), 0);
+    }
 }

@@ -5,7 +5,6 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -18,11 +17,8 @@ type Hint = (&'static str, &'static str);
 pub fn render_bottom(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let hints: Vec<Hint> = hints_for(state);
 
-    let bar = Style::default().fg(theme.role(Role::HelpFg)).bg(theme.role(Role::HelpBg));
-    let key = Style::default()
-        .fg(theme.role(Role::HelpKeyFg))
-        .bg(theme.role(Role::HelpKeyBg))
-        .add_modifier(Modifier::BOLD);
+    let bar = theme.style(Role::HelpFg).bg(theme.role(Role::HelpBg));
+    let key = theme.style(Role::HelpKeyFg).bg(theme.role(Role::HelpKeyBg));
 
     let mut spans: Vec<Span> = Vec::new();
     spans.push(Span::styled(" ", bar)); // left pad
@@ -99,6 +95,7 @@ fn hints_for(state: &AppState) -> Vec<Hint> {
             ("Space", "mark"), ("Esc", "cancel"),
         ],
         Mode::Policy(_) => vec![("y/Enter", "confirm"), ("n/Esc", "cancel")],
+        Mode::InputForm(_) => vec![("", "type value"), ("Enter", "confirm"), ("Esc", "cancel")],
         Mode::Extension { .. } => vec![("Esc", "back")],
     }
 }

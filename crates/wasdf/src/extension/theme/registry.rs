@@ -5,17 +5,72 @@ use ratatui::style::Color;
 
 use crate::core::{Role, Theme};
 
+/// Roles bold by default in the built-in look — the single, centralized
+/// source of "what bold means" for a theme with no bold override of its own
+/// (reproduces the exact spots that were once hard-coded `Modifier::BOLD` in
+/// `ui/*.rs`, before themes could carry bold at all). Lives here, not in
+/// `core/theme.rs`: `Theme` itself stays a neutral palette primitive: this is
+/// theme-extension-owned "default look" data.
+pub const DEFAULT_BOLD_ROLES: &[Role] = &[
+    Role::EntryDir,
+    Role::PathActive,
+    Role::NavCursorFg,
+    Role::MonitorCpuLabel,
+    Role::MonitorMemLabel,
+    Role::MonitorDskLabel,
+    Role::MonitorNetLabel,
+    Role::HelpKeyFg,
+];
+
+pub fn default_bold(role: Role) -> bool {
+    DEFAULT_BOLD_ROLES.contains(&role)
+}
+
+/// `role`'s full look in the built-in theme, absent any override — what an
+/// override compares against to decide whether it is redundant. `bg` is
+/// always `Color::Reset` ("nil"): `Theme::default()` carries no per-role
+/// background opinion of its own.
+pub fn default_style(role: Role) -> RoleStyle {
+    RoleStyle { fg: Theme::default().role(role), bg: Color::Reset, bold: default_bold(role), italic: false, underline: false }
+}
+
+// ── RoleStyle ────────────────────────────────────────────────────────────────
+
+/// One role's complete look: foreground, background (`Color::Reset` = nil /
+/// transparent), and the three style modifiers. A theme override is always
+/// this whole tuple at once — there is no partial per-attribute override —
+/// so editing one attribute of a role never leaves the others ambiguous.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoleStyle {
+    pub fg: Color,
+    pub bg: Color,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+}
+
 // ── NamedTheme ────────────────────────────────────────────────────────────────
 
 /// A single named theme: a sparse set of role overrides on top of
 /// `Theme::default()`. Presets are immutable; customs are editable.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct NamedTheme {
     pub name: String,
     /// true = built-in preset; immutable at runtime (edit offers duplicate).
     pub preset: bool,
-    /// Sparse overrides: roles listed here differ from `Theme::default()`.
-    pub overrides: Vec<(Role, Color)>,
+    /// Sparse overrides: roles listed here differ (in fg, bg, or any
+    /// modifier) from `default_style(role)`.
+    pub overrides: Vec<(Role, RoleStyle)>,
+}
+
+impl NamedTheme {
+    /// A new custom theme named `name`, seeding its overrides from `source`
+    /// (or empty if `None`) — the common shape behind "new theme" (seeds from
+    /// the active theme) and "duplicate" (seeds from the chosen one), so both
+    /// start as an exact copy of their source's look.
+    pub fn seeded(name: String, source: Option<&NamedTheme>) -> NamedTheme {
+        NamedTheme { name, preset: false, overrides: source.map(|nt| nt.overrides.clone()).unwrap_or_default() }
+    }
 }
 
 // ── ThemeRegistry ─────────────────────────────────────────────────────────────
@@ -26,11 +81,17 @@ pub struct ThemeRegistry {
 }
 
 impl ThemeRegistry {
-    /// Build from preset `NamedTheme`s. A synthetic "default" (empty overrides,
-    /// preset:true) is prepended if absent. `active` starts as "default".
+    /// Build from preset `NamedTheme`s. A synthetic "default" (preset:true,
+    /// one override per `DEFAULT_BOLD_ROLES` role — its `default_style`,
+    /// which is already just "the built-in fg, bold") is prepended if absent.
+    /// `default_style` is only ever consulted to *decide* whether an edit is
+    /// redundant; resolving a theme still only ever applies what's in its own
+    /// `overrides`, so "default" needs these written out explicitly to have
+    /// any bold roles at all. `active` starts as "default".
     pub fn with_presets(mut presets: Vec<NamedTheme>) -> Self {
         if !presets.iter().any(|t| t.name == "default") {
-            presets.insert(0, NamedTheme { name: "default".into(), preset: true, overrides: vec![] });
+            let overrides = DEFAULT_BOLD_ROLES.iter().map(|r| (*r, default_style(*r))).collect();
+            presets.insert(0, NamedTheme { name: "default".into(), preset: true, overrides });
         }
         ThemeRegistry { themes: presets, active: "default".into() }
     }
@@ -40,7 +101,7 @@ impl ThemeRegistry {
     pub fn load_customs(&mut self, customs: Vec<NamedTheme>) {
         for custom in customs {
             if self.themes.iter().any(|t| t.preset && t.name == custom.name) {
-                eprintln!("theme: custom '{}' collides with a preset; skipped", custom.name);
+                crate::services::messages::log(format!("theme: custom '{}' collides with a preset; skipped", custom.name), true);
                 continue;
             }
             if let Some(existing) = self.themes.iter_mut().find(|t| !t.preset && t.name == custom.name) {
@@ -70,8 +131,12 @@ impl ThemeRegistry {
     pub fn resolve(&self, name: &str) -> Theme {
         let mut t = Theme::default();
         if let Some(nt) = self.themes.iter().find(|t| t.name == name) {
-            for (role, color) in &nt.overrides {
-                t.set(*role, *color);
+            for (role, style) in &nt.overrides {
+                t.set_fg(*role, style.fg);
+                t.set_bg(*role, style.bg);
+                t.set_bold(*role, style.bold);
+                t.set_italic(*role, style.italic);
+                t.set_underline(*role, style.underline);
             }
         }
         t
@@ -122,84 +187,55 @@ impl ThemeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::Role;
 
-    fn nord_theme() -> NamedTheme {
-        NamedTheme {
-            name: "nord".into(),
-            preset: true,
-            overrides: vec![(Role::Border, ratatui::style::Color::Rgb(59, 66, 82))],
-        }
-    }
-
-    fn registry() -> ThemeRegistry {
-        ThemeRegistry::with_presets(vec![nord_theme()])
+    fn style(fg: Color, bold: bool) -> RoleStyle {
+        RoleStyle { fg, bg: Color::Reset, bold, italic: false, underline: false }
     }
 
     #[test]
-    fn resolve_unknown_name_is_default() {
-        let r = registry();
-        let got = r.resolve("nope");
-        let expected = Theme::default();
-        assert_eq!(got.role(Role::Border), expected.role(Role::Border));
-        assert_eq!(got.role(Role::Accent), expected.role(Role::Accent));
-    }
+    fn upsert_custom_replaces_overrides_on_an_existing_entry() {
+        let mut reg = ThemeRegistry::with_presets(vec![]);
+        reg.upsert_custom(NamedTheme { name: "x".into(), preset: false, overrides: vec![] });
+        assert!(!reg.resolve("x").bold(Role::Title));
 
-    #[test]
-    fn resolve_overlays_overrides_on_default() {
-        let r = registry();
-        let got = r.resolve("nord");
-        assert_eq!(got.role(Role::Border), ratatui::style::Color::Rgb(59, 66, 82));
-        assert_eq!(got.role(Role::Accent), Theme::default().role(Role::Accent));
-    }
-
-    #[test]
-    fn set_active_unknown_keeps_prior() {
-        let mut r = registry();
-        let was = r.active().to_string();
-        assert!(!r.set_active("nope"));
-        assert_eq!(r.active(), was);
-    }
-
-    #[test]
-    fn resolve_active_follows_selection() {
-        let mut r = registry();
-        assert!(r.set_active("nord"));
-        let active = r.resolve_active();
-        let direct = r.resolve("nord");
-        assert_eq!(active.role(Role::Border), direct.role(Role::Border));
-    }
-
-    #[test]
-    fn preset_is_immutable() {
-        let mut r = registry();
-        assert!(!r.remove_custom("nord"), "preset cannot be removed");
-        assert!(!r.remove_custom("default"), "built-in default cannot be removed");
-        let preset = NamedTheme { name: "nord".into(), preset: true, overrides: vec![] };
-        r.upsert_custom(preset);
-        assert_eq!(r.resolve("nord").role(Role::Border), ratatui::style::Color::Rgb(59, 66, 82),
-            "upsert_custom should not overwrite a preset");
-    }
-
-    #[test]
-    fn load_customs_skips_preset_collision() {
-        let mut r = registry();
-        r.load_customs(vec![NamedTheme { name: "nord".into(), preset: false, overrides: vec![] }]);
-        assert_eq!(r.resolve("nord").role(Role::Border), ratatui::style::Color::Rgb(59, 66, 82),
-            "custom with preset name should be dropped");
-    }
-
-    #[test]
-    fn upsert_and_remove_custom() {
-        let mut r = registry();
-        r.upsert_custom(NamedTheme {
-            name: "ocean".into(),
+        reg.upsert_custom(NamedTheme {
+            name: "x".into(),
             preset: false,
-            overrides: vec![(Role::Accent, ratatui::style::Color::Blue)],
+            overrides: vec![(Role::Title, style(Color::Reset, true))],
         });
-        assert!(r.names().contains(&"ocean".to_string()));
-        assert_eq!(r.resolve("ocean").role(Role::Accent), ratatui::style::Color::Blue);
-        assert!(r.remove_custom("ocean"));
-        assert!(!r.names().contains(&"ocean".to_string()));
+        assert!(reg.resolve("x").bold(Role::Title), "override must survive an upsert onto an existing theme");
+    }
+
+    #[test]
+    fn resolve_applies_fg_bg_and_every_modifier_from_one_overrides_entry() {
+        let mut reg = ThemeRegistry::with_presets(vec![]);
+        reg.upsert_custom(NamedTheme {
+            name: "x".into(),
+            preset: false,
+            overrides: vec![(Role::Title, RoleStyle {
+                fg: Color::Rgb(1, 2, 3),
+                bg: Color::Rgb(4, 5, 6),
+                bold: true,
+                italic: true,
+                underline: true,
+            })],
+        });
+        let resolved = reg.resolve("x");
+        assert_eq!(resolved.role(Role::Title), Color::Rgb(1, 2, 3));
+        assert_eq!(resolved.bg(Role::Title), Color::Rgb(4, 5, 6));
+        assert!(resolved.bold(Role::Title));
+        assert!(resolved.italic(Role::Title));
+        assert!(resolved.underline(Role::Title));
+        // Untouched role stays at Theme::default()'s own look.
+        assert_eq!(resolved.bg(Role::Border), Color::Reset);
+    }
+
+    #[test]
+    fn default_style_reflects_default_bold_roles_and_theme_default_colors() {
+        let s = default_style(Role::EntryDir);
+        assert_eq!(s.fg, Theme::default().role(Role::EntryDir));
+        assert_eq!(s.bg, Color::Reset);
+        assert!(s.bold, "EntryDir is bold in the built-in look");
+        assert!(!default_style(Role::Title).bold);
     }
 }

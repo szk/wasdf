@@ -5,8 +5,20 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::registry::NamedTheme;
+use ratatui::style::Color;
+
+use super::registry::{NamedTheme, RoleStyle};
 use crate::core::color_token;
+
+fn bool_tok(b: bool) -> &'static str {
+    if b { "#t" } else { "#f" }
+}
+
+/// `Color::Reset` ("nil"/transparent) is the bare symbol `nil`; any other
+/// color is a quoted token, same as everywhere else colors are written.
+fn color_tok(c: Color) -> String {
+    if c == Color::Reset { "nil".into() } else { format!("{:?}", color_token(c)) }
+}
 
 pub const BLOCK_BEGIN: &str =
     ";; >>> wasdf settings (managed — edited via the SETTINGS panel; do not hand-edit)";
@@ -27,11 +39,21 @@ impl ThemeWriter {
         self.upsert_line(|line| line.trim().starts_with("(set-theme "), &new_line)
     }
 
-    /// Insert or replace the `(define-theme "name" …)` multi-line form.
+    /// Insert or replace the `(define-theme "name" …)` multi-line form. Every
+    /// override is one line, always the full `(role fg bg bold italic
+    /// underline)` shape — `fg`/`bg` a quoted color token or the bare symbol
+    /// `nil` for "no color" (`Color::Reset`), `bold`/`italic`/`underline`
+    /// `#t`/`#f`. There is no partial/merged/standalone form: a role's whole
+    /// look is one setting, written as one line.
     pub fn upsert_theme(&self, t: &NamedTheme) -> io::Result<()> {
         let mut body = format!("(define-theme {:?}", t.name);
-        for (role, color) in &t.overrides {
-            body.push_str(&format!("\n  ({} {})", role.token(), color_token(*color)));
+        for (role, style) in &t.overrides {
+            let RoleStyle { fg, bg, bold, italic, underline } = *style;
+            body.push_str(&format!(
+                "\n  ({} {} {} {} {} {})",
+                role.token(), color_tok(fg), color_tok(bg),
+                bool_tok(bold), bool_tok(italic), bool_tok(underline),
+            ));
         }
         body.push(')');
         self.upsert_form(&t.name, &body)
@@ -210,90 +232,66 @@ fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use crate::core::Role;
 
-    fn temp_path() -> PathBuf {
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("wasdf-theme-writer-{}-{}", std::process::id(), n));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("config.scm")
+    fn writer_in(dir: &Path) -> ThemeWriter {
+        ThemeWriter::new(dir.join("config.scm"))
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("wasdf-theme-writer-test-{tag}-{}", std::process::id()))
+    }
+
+    fn style(fg: Color, bg: Color, bold: bool, italic: bool, underline: bool) -> RoleStyle {
+        RoleStyle { fg, bg, bold, italic, underline }
     }
 
     #[test]
-    fn set_active_upserts_single_line() {
-        let path = temp_path();
-        let w = ThemeWriter::new(path.clone());
-        w.set_active("nord").unwrap();
-        w.set_active("gruvbox").unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains(r#"(set-theme "gruvbox")"#));
-        assert!(!content.contains(r#"(set-theme "nord")"#), "old value replaced");
-        assert_eq!(content.matches("set-theme").count(), 1, "no duplicates");
-    }
-
-    #[test]
-    fn upsert_theme_creates_block_and_form() {
-        let path = temp_path();
-        let w = ThemeWriter::new(path.clone());
+    fn upsert_theme_writes_the_full_six_token_form_with_a_real_fg_and_nil_bg() {
+        let dir = scratch_dir("full");
+        let w = writer_in(&dir);
         let t = NamedTheme {
-            name: "ocean".into(),
+            name: "custom".into(),
             preset: false,
-            overrides: vec![(crate::core::Role::Border, ratatui::style::Color::Blue)],
+            overrides: vec![(Role::EntryDir, style(Color::Rgb(0x83, 0xa5, 0x98), Color::Reset, true, false, false))],
         };
         w.upsert_theme(&t).unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains(r#"(define-theme "ocean""#));
-        assert!(content.contains("(border blue)"));
+        let text = std::fs::read_to_string(dir.join("config.scm")).unwrap();
+        assert!(text.contains(r##"(entry-dir "#83a598" nil #t #f #f)"##), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn upsert_theme_replaces_no_duplicate() {
-        let path = temp_path();
-        let w = ThemeWriter::new(path.clone());
-        let t1 = NamedTheme {
-            name: "ocean".into(),
-            preset: false,
-            overrides: vec![(crate::core::Role::Border, ratatui::style::Color::Blue)],
-        };
-        w.upsert_theme(&t1).unwrap();
-        let t2 = NamedTheme {
-            name: "ocean".into(),
-            preset: false,
-            overrides: vec![(crate::core::Role::Accent, ratatui::style::Color::Red)],
-        };
-        w.upsert_theme(&t2).unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(content.matches("ocean").count(), 1, "only one define-theme for ocean");
-        assert!(content.contains("(accent red)"));
-        assert!(!content.contains("(border blue)"), "old form replaced");
-    }
-
-    #[test]
-    fn remove_theme_deletes_form() {
-        let path = temp_path();
-        let w = ThemeWriter::new(path.clone());
+    fn upsert_theme_writes_nil_for_a_reset_fg_and_a_real_bg() {
+        let dir = scratch_dir("bg");
+        let w = writer_in(&dir);
         let t = NamedTheme {
-            name: "ocean".into(),
+            name: "custom".into(),
             preset: false,
-            overrides: vec![(crate::core::Role::Accent, ratatui::style::Color::Red)],
+            overrides: vec![(Role::Nameplate, style(Color::Reset, Color::Rgb(0, 0, 0), false, false, true))],
         };
         w.upsert_theme(&t).unwrap();
-        w.remove_theme("ocean").unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(!content.contains("ocean"), "form removed");
+        let text = std::fs::read_to_string(dir.join("config.scm")).unwrap();
+        assert!(text.contains(r##"(nameplate nil "#000000" #f #f #t)"##), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn hand_written_forms_outside_block_preserved() {
-        let path = temp_path();
-        std::fs::write(&path, "; user comment\n(set-theme \"hand\")\n").unwrap();
-        let w = ThemeWriter::new(path.clone());
-        w.set_active("managed").unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("; user comment"), "comment preserved");
-        assert!(content.contains(r#"(set-theme "hand")"#), "hand-written form preserved");
-        assert!(content.contains(r#"(set-theme "managed")"#), "managed form written");
+    fn upsert_theme_writes_one_line_per_overridden_role() {
+        let dir = scratch_dir("multi");
+        let w = writer_in(&dir);
+        let t = NamedTheme {
+            name: "custom".into(),
+            preset: false,
+            overrides: vec![
+                (Role::Border, style(Color::Rgb(0x10, 0x20, 0x30), Color::Reset, false, false, false)),
+                (Role::Title, style(Color::Reset, Color::Reset, false, true, false)),
+            ],
+        };
+        w.upsert_theme(&t).unwrap();
+        let text = std::fs::read_to_string(dir.join("config.scm")).unwrap();
+        assert!(text.contains(r##"(border "#102030" nil #f #f #f)"##), "{text}");
+        assert!(text.contains("(title nil nil #f #t #f)"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

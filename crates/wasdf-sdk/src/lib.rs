@@ -7,6 +7,7 @@ pub mod chunk;
 pub mod format;
 pub mod magic;
 pub mod mime;
+pub mod settings;
 
 /// The ABI version the kernel and optional extensions must agree on exactly.
 /// A mismatch causes the extension to be skipped with a warning.
@@ -23,3 +24,4 @@ pub use chunk::{read_chunk, read_chunk_at};
 pub use format::{format_permissions, format_size};
 pub use magic::{Signature, detect_signature};
 pub use mime::{MimeClass, detect_mime};
+pub use settings::{SettingSpec, Settings};

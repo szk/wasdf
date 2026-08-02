@@ -9,9 +9,8 @@
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, RwLock};
 
-use crate::core::{Entry, ExtensionIntent, ExtensionValue};
+use crate::core::Entry;
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -139,15 +138,11 @@ impl Vfs {
 
 // ── Embedded providers ────────────────────────────────────────────────────────
 
-/// Build the embedded default providers: filesystem and bookmarks. The bookmarks
-/// provider is returned alongside its shared state handle so the kernel can wire
-/// it to the bookmarks extension. The settings provider comes from the settings
-/// extension (which needs the shared Options Arc) and is added by the kernel.
-pub fn defaults() -> (Vec<Box<dyn VfsProvider>>, Arc<RwLock<Vec<PathBuf>>>) {
-    let bm = BookmarksProvider::new();
-    let shared = bm.share();
-    let providers: Vec<Box<dyn VfsProvider>> = vec![Box::new(FilesystemProvider), Box::new(bm)];
-    (providers, shared)
+/// Build the embedded default providers: just the filesystem. Every other mount
+/// (bookmarks, settings, …) is contributed by its owning extension via
+/// `Extension::vfs_providers()`.
+pub fn defaults() -> Vec<Box<dyn VfsProvider>> {
+    vec![Box::new(FilesystemProvider)]
 }
 
 // ── FilesystemProvider ────────────────────────────────────────────────────────
@@ -170,55 +165,6 @@ impl VfsProvider for FilesystemProvider {
     }
 }
 
-
-// ── BookmarksProvider ─────────────────────────────────────────────────────────
-
-/// A data provider backed by a shared list of saved real paths. Leaves carry
-/// an `activation` intent so the bookmarks extension can receive and forward it
-/// as `Intent::NavigateTo(real_path)`.
-pub struct BookmarksProvider {
-    paths: Arc<RwLock<Vec<PathBuf>>>,
-}
-
-impl BookmarksProvider {
-    fn new() -> Self {
-        BookmarksProvider { paths: Arc::new(RwLock::new(Vec::new())) }
-    }
-
-    pub fn share(&self) -> Arc<RwLock<Vec<PathBuf>>> {
-        self.paths.clone()
-    }
-}
-
-impl VfsProvider for BookmarksProvider {
-    fn mount(&self) -> &str {
-        "bookmarks"
-    }
-
-    fn list(&self, _path: &Path) -> io::Result<Vec<Entry>> {
-        let saved = self.paths.read().map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "bookmark lock poisoned")
-        })?;
-        Ok(saved
-            .iter()
-            .enumerate()
-            .map(|(i, real)| {
-                let name = real
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| real.display().to_string());
-                let vpath = vfs_root().join("bookmarks").join(i.to_string());
-                let mut e = Entry::virtual_leaf(vpath, name);
-                e.activation = Some(ExtensionIntent {
-                    extension: "bookmarks".into(),
-                    intent: "goto".into(),
-                    data: ExtensionValue::Path(real.clone()),
-                });
-                e
-            })
-            .collect())
-    }
-}
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
@@ -286,17 +232,29 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// A minimal extra provider standing in for any extension-owned mount, so
+    /// capitalization is proven generic rather than tied to a specific one.
+    struct DummyProvider;
+    impl VfsProvider for DummyProvider {
+        fn mount(&self) -> &str {
+            "widgets"
+        }
+        fn list(&self, _path: &Path) -> io::Result<Vec<Entry>> {
+            Ok(Vec::new())
+        }
+    }
+
     #[test]
     fn root_listing_names_are_capitalized() {
-        let (providers, _) = defaults();
         let mut vfs = Vfs::default();
-        vfs.extend(providers);
+        vfs.extend(defaults());
+        vfs.extend([Box::new(DummyProvider) as Box<dyn VfsProvider>]);
         let entries = vfs.list(&vfs_root(), false).unwrap();
         // filesystem entry: capitalized display name, real-root path.
         let fs_entry = entries.iter().find(|e| e.path == PathBuf::from("/")).unwrap();
         assert_eq!(fs_entry.name, "FILESYSTEM");
-        // bookmarks entry: capitalized, virtual path unchanged.
-        let bm_entry = entries.iter().find(|e| e.path == vfs_root().join("bookmarks")).unwrap();
-        assert_eq!(bm_entry.name, "BOOKMARKS");
+        // any other provider's entry: capitalized, virtual path unchanged.
+        let dummy_entry = entries.iter().find(|e| e.path == vfs_root().join("widgets")).unwrap();
+        assert_eq!(dummy_entry.name, "WIDGETS");
     }
 }

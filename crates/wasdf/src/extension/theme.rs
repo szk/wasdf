@@ -3,31 +3,90 @@
 pub mod registry;
 pub mod writer;
 
-pub use registry::{NamedTheme, ThemeRegistry};
+pub use registry::{NamedTheme, RoleStyle, ThemeRegistry};
 
+use std::cell::RefCell;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use crate::core::{
-    AppState, Candidate, Entry, ExtensionIntent, ExtensionValue, Intent, Mode, Role, SelectSpec,
-    KEY_ITEM,
-};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Bar, BarChart, BarGroup, Paragraph};
+use ratatui::Frame;
+
+use crate::core::{AppState, Entry, ExtensionIntent, ExtensionValue, InputFormSpec, Intent, Mode, Role, KEY_ITEM};
 use crate::extension::settings::SettingsNode;
-use crate::extension::Extension;
+use crate::extension::{Extension, FunctionRenderCtx};
+use crate::script::condition::Conditions;
 use crate::vfs::vfs_root;
 
 use writer::ThemeWriter;
 
-/// The raw preset scheme source (include_str! at compile time).
-pub const PRESETS_SCHEME: &str = include_str!("theme_presets.scm");
+const ID: &str = "theme";
+const KEYMAP_SCHEME: &str = include_str!("theme/keymap.scm");
 
-/// The 16 standard ANSI color names offered in the role color picker.
-const ANSI_COLORS: &[&str] = &[
-    "black", "red", "green", "yellow", "blue", "magenta", "cyan", "gray",
-    "darkgray", "lightred", "lightgreen", "lightyellow", "lightblue",
-    "lightmagenta", "lightcyan", "white",
-];
+/// The live Color-in-panel editor (interior-mutable inside the extension,
+/// mirroring CmdOp's own form — see `extension/cmdop/extension.rs`). Hosted
+/// in the function panel via `Intent::HostFunctionForm` (passive — the file
+/// panel keeps focus), not a `Mode::InputForm` popup: nothing here round-trips
+/// through `KEY_ITEM`, since the state is entirely local to this extension.
+/// Cursor-follow: landing the file cursor on a custom theme's role entry opens
+/// this automatically (`on_cursor_changed`); every hjkl edit writes straight
+/// through — there is no confirm/cancel step, and no buffered value that could
+/// diverge from what's on screen. Edits a role's fg, bg, and its three style
+/// modifiers together — one leaf, one panel — instead of separate settings
+/// entries per attribute.
+struct ColorEdit {
+    theme_name: String,
+    role_tok: String,
+    fg_rgb: (u8, u8, u8),
+    /// `true` when fg is "nil" (`Color::Reset`, transparent) rather than
+    /// `fg_rgb` — the RGB sliders keep their last value underneath so
+    /// toggling nil off again restores it instead of resetting to black.
+    fg_nil: bool,
+    bg_rgb: (u8, u8, u8),
+    bg_nil: bool,
+    /// [bold, italic, underline] — indexed by `channel - MOD_CHANNEL_BASE`.
+    mods: [bool; 3],
+    /// Which control has focus — see the `*_CHANNEL*` constants below for the
+    /// full layout (FG nil, then fg R/G/B, then the 3 modifiers, then BG nil,
+    /// then bg R/G/B) — top-to-bottom, matching `render_color_form`.
+    channel: usize,
+}
+
+/// `ColorEdit::channel` layout, top-to-bottom as drawn: the FG nil toggle
+/// first, then fg's R/G/B (`FG_CHANNEL_BASE..`), then the three style
+/// modifiers (`MOD_NAMES` order, `MOD_CHANNEL_BASE..`), then the BG nil
+/// toggle, then bg's R/G/B (`BG_CHANNEL_BASE..`).
+const FG_NIL_CHANNEL: usize = 0;
+const FG_CHANNEL_BASE: usize = 1;
+const MOD_CHANNEL_BASE: usize = 4;
+const MOD_NAMES: [&str; 3] = ["Bold", "Italic", "Underline"];
+const BG_NIL_CHANNEL: usize = MOD_CHANNEL_BASE + MOD_NAMES.len(); // 7
+const BG_CHANNEL_BASE: usize = BG_NIL_CHANNEL + 1; // 8
+const MAX_CHANNEL: usize = BG_CHANNEL_BASE + 2; // 10
+
+/// The raw preset scheme source (include_str! at compile time).
+pub const PRESETS_SCHEME: &str = include_str!("theme/presets.scm");
+
+/// Extract `(theme_name, role_tok)` from a cursor path exactly two segments
+/// below `@/settings/Display/Themes` — the shape `ThemeNode::list` gives every
+/// per-role leaf. `None` for any other path (a shallower/deeper listing leaf,
+/// or a path outside the Themes subtree entirely) — the cursor-follow gate in
+/// `on_cursor_changed`.
+fn theme_role_from_path(path: Option<&Path>) -> Option<(String, String)> {
+    let base = vfs_root().join("settings").join("Display").join("Themes");
+    let rel = path?.strip_prefix(&base).ok()?;
+    let mut comps = rel.components();
+    let theme = comps.next()?.as_os_str().to_str()?.to_string();
+    let role = comps.next()?.as_os_str().to_str()?.to_string();
+    if comps.next().is_some() {
+        return None;
+    }
+    Some((theme, role))
+}
 
 // ── ThemeNode ─────────────────────────────────────────────────────────────────
 
@@ -104,10 +163,23 @@ impl SettingsNode for ThemeNode {
                 });
                 entries.push(header);
             }
+            // One leaf per role: fg, bg, and every style modifier are one
+            // setting now, shown and edited together — activating it opens
+            // the RGB-in-panel editor (`render_color_form`), which carries
+            // Bold/Italic/Underline controls alongside both fg and bg R/G/B,
+            // so there is nothing left to edit as a separate leaf.
             for role in Role::ALL {
                 let tok = role.token();
-                let color = crate::core::color_token(resolved.role(*role));
-                let label = format!("{tok}: {color}");
+                let fg = crate::core::color_token(resolved.role(*role));
+                let bg = resolved.bg(*role);
+                let set: Vec<&str> = [
+                    (resolved.bold(*role), "bold"),
+                    (resolved.italic(*role), "italic"),
+                    (resolved.underline(*role), "underline"),
+                ].into_iter().filter(|(on, _)| *on).map(|(_, name)| name).collect();
+                let bg_part = if bg == Color::Reset { String::new() } else { format!(" / bg:{}", crate::core::color_token(bg)) };
+                let mods_part = if set.is_empty() { String::new() } else { format!(" ({})", set.join(", ")) };
+                let label = format!("{tok}: {fg}{bg_part}{mods_part}");
                 let mut e = Entry::virtual_leaf(theme_base.join(tok), label);
                 e.activation = Some(ExtensionIntent {
                     extension: "theme".into(),
@@ -156,6 +228,7 @@ impl SettingsNode for ThemeNode {
 pub struct ThemeExtension {
     pub registry: Arc<RwLock<ThemeRegistry>>,
     writer: Option<ThemeWriter>,
+    color_edit: RefCell<Option<ColorEdit>>,
 }
 
 impl ThemeExtension {
@@ -166,7 +239,7 @@ impl ThemeExtension {
             }
         }
         let writer = config_scm.map(ThemeWriter::new);
-        ThemeExtension { registry, writer }
+        ThemeExtension { registry, writer, color_edit: RefCell::new(None) }
     }
 }
 
@@ -227,11 +300,42 @@ fn boot_load_config(registry: &Arc<RwLock<ThemeRegistry>>, text: &str) {
 
 impl Extension for ThemeExtension {
     fn id(&self) -> &str {
-        "theme"
+        ID
+    }
+
+    fn scheme_source(&self) -> Option<String> {
+        Some(KEYMAP_SCHEME.to_string())
+    }
+
+    fn register_conditions(&self, c: &mut Conditions) {
+        // Gates the Color-in-panel editor's keys — reads only &AppState (the
+        // generic form_owner), mirroring CmdOp's own "cmdop-active".
+        c.register("theme-color-active", Box::new(|s| s.function.form_owner.as_deref() == Some(ID)));
+    }
+
+    fn about(&self) -> crate::extension::About {
+        crate::extension::About::new("Theme", "Color themes: bundled presets and custom per-role overrides")
     }
 
     fn settings_nodes(&self) -> Vec<Arc<dyn SettingsNode>> {
         vec![Arc::new(ThemeNode { registry: self.registry.clone() })]
+    }
+
+    /// Cursor-follow: the file cursor landing on a custom theme's role leaf
+    /// (`@/settings/Display/Themes/<theme>/<role>`) opens the color-in-panel
+    /// editor for it automatically — no Enter, no separate "edit" step.
+    /// Landing anywhere else (a preset's role, another leaf, another
+    /// category) releases it, exactly like the content provider's own
+    /// cursor-follow releases a stale preview. Passive: `HostFunctionForm`
+    /// never touches focus, so the file panel keeps browsing with wasd while
+    /// hjkl edits whatever role is currently under the cursor.
+    fn on_cursor_changed(&self, state: &AppState) -> Vec<Intent> {
+        if let Some((theme_name, role_tok)) = theme_role_from_path(state.cursor_path().as_deref()) {
+            if let Some(out) = self.open_editor(&theme_name, &role_tok) {
+                return out;
+            }
+        }
+        self.release()
     }
 
     fn handle_intent(&self, intent: &ExtensionIntent, _state: &AppState) -> Vec<Intent> {
@@ -254,8 +358,8 @@ impl Extension for ThemeExtension {
                     intent: "new-apply".into(),
                     data: ExtensionValue::Nil,
                 };
-                let spec = SelectSpec::emit_path_input("theme-new", template, None, None);
-                vec![Intent::PushMode(Box::new(Mode::Select(spec)))]
+                let spec = InputFormSpec::emit_input_form("New theme name", template, None);
+                vec![Intent::PushMode(Box::new(Mode::InputForm(spec)))]
             }
             "new-apply" => {
                 let Some(name_raw) = intent.data.get(KEY_ITEM).and_then(|v| v.as_str()) else {
@@ -267,8 +371,7 @@ impl Extension for ThemeExtension {
                     let Ok(reg) = self.registry.read() else { return vec![]; };
                     if reg.get(&name).is_some() { return vec![]; }
                     let active = reg.active().to_string();
-                    let seed = reg.get(&active).map(|nt| nt.overrides.clone()).unwrap_or_default();
-                    NamedTheme { name: name.clone(), preset: false, overrides: seed }
+                    NamedTheme::seeded(name.clone(), reg.get(&active))
                 };
                 {
                     let Ok(mut reg) = self.registry.write() else { return vec![]; };
@@ -296,8 +399,8 @@ impl Extension for ThemeExtension {
                     data: ExtensionValue::Nil
                         .with("source", ExtensionValue::String(source)),
                 };
-                let spec = SelectSpec::emit_path_input("theme-duplicate", template, None, None);
-                vec![Intent::PushMode(Box::new(Mode::Select(spec)))]
+                let spec = InputFormSpec::emit_input_form("Duplicate as", template, None);
+                vec![Intent::PushMode(Box::new(Mode::InputForm(spec)))]
             }
             "duplicate-apply" => {
                 let Some(source_name) = intent.data.get("source").and_then(|v| v.as_str()) else {
@@ -312,10 +415,7 @@ impl Extension for ThemeExtension {
                 let new_theme = {
                     let Ok(reg) = self.registry.read() else { return vec![]; };
                     if reg.get(&new_name).is_some() { return vec![]; }
-                    let seed = reg.get(&source_name)
-                        .map(|nt| nt.overrides.clone())
-                        .unwrap_or_default();
-                    NamedTheme { name: new_name.clone(), preset: false, overrides: seed }
+                    NamedTheme::seeded(new_name.clone(), reg.get(&source_name))
                 };
                 {
                     let Ok(mut reg) = self.registry.write() else { return vec![]; };
@@ -338,8 +438,8 @@ impl Extension for ThemeExtension {
                     data: ExtensionValue::Nil
                         .with("source", ExtensionValue::String(old_name.to_string())),
                 };
-                let spec = SelectSpec::emit_path_input("theme-rename", template, None, None);
-                vec![Intent::PushMode(Box::new(Mode::Select(spec)))]
+                let spec = InputFormSpec::emit_input_form("Rename to", template, Some(old_name.to_string()));
+                vec![Intent::PushMode(Box::new(Mode::InputForm(spec)))]
             }
             "rename-apply" => {
                 let Some(old_name) = intent.data.get("source").and_then(|v| v.as_str()) else {
@@ -357,11 +457,7 @@ impl Extension for ThemeExtension {
                     let Some(old_nt) = reg.get(&old_name) else { return vec![]; };
                     if old_nt.preset { return vec![]; }
                     let was_active = reg.active() == old_name;
-                    let renamed = NamedTheme {
-                        name: new_name.clone(),
-                        preset: false,
-                        overrides: old_nt.overrides.clone(),
-                    };
+                    let renamed = NamedTheme::seeded(new_name.clone(), Some(old_nt));
                     (was_active, renamed)
                 };
                 {
@@ -378,7 +474,19 @@ impl Extension for ThemeExtension {
                 vec![Intent::Refresh]
             }
 
-            // ── Edit role color ────────────────────────────────────────────────
+            // ── Edit role fg + bg + modifiers ─────────────────────────────────
+            // Hosted in the function panel (two BarCharts — fg R/G/B, bg
+            // R/G/B — a nil toggle for each, a Bold/Italic/Underline toggle
+            // row, and a live swatch), not a Mode::InputForm popup: the RGB
+            // sliders can't preserve a named-ANSI color's identity, so the
+            // role's current fg/bg are seeded via `color_to_rgb` and every
+            // edit writes back as a literal `#rrggbb` (or `nil` when the
+            // color's own nil toggle is on) — an accepted tradeoff of this
+            // widget. A role's whole look (fg, bg, weight, slant, rule) is
+            // one setting. Primarily opened by cursor-follow
+            // (`on_cursor_changed`, below); this intent is kept as an
+            // idempotent manual fallback (harmless if the editor is already
+            // open for the same role).
             "edit-role" => {
                 let Some(theme_name) = intent.data.get("theme").and_then(|v| v.as_str()) else {
                     return vec![];
@@ -386,69 +494,26 @@ impl Extension for ThemeExtension {
                 let Some(role_tok) = intent.data.get("role").and_then(|v| v.as_str()) else {
                     return vec![];
                 };
-                let is_preset = self.registry.read().ok()
-                    .and_then(|r| r.get(theme_name).map(|nt| nt.preset))
-                    .unwrap_or(true);
-                if is_preset { return vec![]; }
-                let template = ExtensionIntent {
-                    extension: "theme".into(),
-                    intent: "edit-role-apply".into(),
-                    data: ExtensionValue::Nil
-                        .with("theme", ExtensionValue::String(theme_name.to_string()))
-                        .with("role", ExtensionValue::String(role_tok.to_string())),
-                };
-                let candidates: Vec<Candidate> =
-                    std::iter::once(Candidate::new(
-                        "default",
-                        ExtensionValue::String("default".to_string()),
-                    ))
-                    .chain(ANSI_COLORS.iter()
-                        .map(|&n| Candidate::new(n, ExtensionValue::String(n.to_string()))))
-                    .chain(std::iter::once(Candidate::new(
-                        "custom #hex…",
-                        ExtensionValue::String("custom".to_string()),
-                    )))
-                    .collect();
-                let spec = SelectSpec::emit_static("theme-edit-role", candidates, template, None);
-                vec![Intent::PushMode(Box::new(Mode::Select(spec)))]
+                self.open_editor(theme_name, role_tok).unwrap_or_default()
             }
-            "edit-role-apply" => {
-                let Some(theme_name) = intent.data.get("theme").and_then(|v| v.as_str()) else {
-                    return vec![];
-                };
-                let Some(role_tok) = intent.data.get("role").and_then(|v| v.as_str()) else {
-                    return vec![];
-                };
-                let Some(color_str) = intent.data.get(KEY_ITEM).and_then(|v| v.as_str()) else {
-                    return vec![];
-                };
-                if color_str == "custom" {
-                    let hex_template = ExtensionIntent {
-                        extension: "theme".into(),
-                        intent: "edit-role-hex-apply".into(),
-                        data: ExtensionValue::Nil
-                            .with("theme", ExtensionValue::String(theme_name.to_string()))
-                            .with("role", ExtensionValue::String(role_tok.to_string())),
-                    };
-                    let spec = SelectSpec::emit_path_input(
-                        "theme-edit-role-hex", hex_template, None, None,
-                    );
-                    return vec![Intent::PushMode(Box::new(Mode::Select(spec)))];
+            "channel-prev" => {
+                if let Some(ce) = self.color_edit.borrow_mut().as_mut() {
+                    ce.channel = ce.channel.saturating_sub(1);
                 }
-                self.apply_role_color(theme_name, role_tok, color_str)
+                vec![]
             }
-            "edit-role-hex-apply" => {
-                let Some(theme_name) = intent.data.get("theme").and_then(|v| v.as_str()) else {
-                    return vec![];
-                };
-                let Some(role_tok) = intent.data.get("role").and_then(|v| v.as_str()) else {
-                    return vec![];
-                };
-                let Some(hex_str) = intent.data.get(KEY_ITEM).and_then(|v| v.as_str()) else {
-                    return vec![];
-                };
-                self.apply_role_color(theme_name, role_tok, hex_str)
+            "channel-next" => {
+                if let Some(ce) = self.color_edit.borrow_mut().as_mut() {
+                    ce.channel = (ce.channel + 1).min(MAX_CHANNEL);
+                }
+                vec![]
             }
+            // Every step writes straight through — there is no confirm/cancel:
+            // the editor never buffers a value the real theme doesn't have.
+            "color-dec" => self.step_and_apply(-1),
+            "color-inc" => self.step_and_apply(1),
+            "color-dec-10" => self.step_and_apply(-10),
+            "color-inc-10" => self.step_and_apply(10),
 
             // ── Delete ─────────────────────────────────────────────────────────
             "delete" => {
@@ -483,33 +548,276 @@ impl Extension for ThemeExtension {
             _ => Vec::new(),
         }
     }
+
+    fn render_form(&self, frame: &mut Frame, inner: Rect, ctx: &FunctionRenderCtx) -> Option<String> {
+        self.render_color_form(frame, inner, ctx.theme)
+    }
 }
 
 impl ThemeExtension {
-    /// Read `color_str` via `parse_color`, set or remove the role override in
-    /// the named custom theme, then persist.
-    fn apply_role_color(&self, theme_name: &str, role_tok: &str, color_str: &str) -> Vec<Intent> {
+    /// Set or remove the role's whole override (fg, bg, bold, italic,
+    /// underline — one `RoleStyle`) in the named custom theme, then persist.
+    /// Applying all of it at once is the point: a role's whole look is one
+    /// setting from the editor's perspective, so there is one write, not
+    /// several independent attributes racing each other. An override that now
+    /// exactly matches `registry::default_style(role)` is removed rather than
+    /// stored, keeping the theme's overrides list minimal.
+    fn apply_role(&self, theme_name: &str, role_tok: &str, fg: Color, bg: Color, mods: [bool; 3]) -> Vec<Intent> {
         let Some(role) = Role::from_token(role_tok) else { return vec![]; };
-        let Some(color) = crate::core::parse_color(color_str) else { return vec![]; };
-        let default_color = crate::core::Theme::default().role(role);
+        let new_style = RoleStyle { fg, bg, bold: mods[0], italic: mods[1], underline: mods[2] };
+        let default = registry::default_style(role);
 
         let updated = {
             let Ok(reg) = self.registry.read() else { return vec![]; };
             let Some(nt) = reg.get(theme_name) else { return vec![]; };
             if nt.preset { return vec![]; }
+
             let mut new_overrides = nt.overrides.clone();
-            if color == default_color {
+            if new_style == default {
                 new_overrides.retain(|(r, _)| *r != role);
             } else if let Some(pos) = new_overrides.iter().position(|(r, _)| *r == role) {
-                new_overrides[pos].1 = color;
+                new_overrides[pos].1 = new_style;
             } else {
-                new_overrides.push((role, color));
+                new_overrides.push((role, new_style));
             }
+
             NamedTheme { name: nt.name.clone(), preset: false, overrides: new_overrides }
         };
         { let Ok(mut reg) = self.registry.write() else { return vec![]; }; reg.upsert_custom(updated.clone()); }
         if let Some(w) = &self.writer { let _ = w.upsert_theme(&updated); }
         vec![Intent::Refresh]
+    }
+
+    /// Seed (or refresh) the live `ColorEdit` from the named custom theme's
+    /// resolved fg/bg/modifiers for `role_tok`, and passively host the panel.
+    /// `None` when there is nothing to open: an unknown theme/role, or a
+    /// preset (immutable — editing a preset's role goes through `duplicate`
+    /// instead, unrelated to this seam). Idempotent: re-seeding the same
+    /// theme+role that's already open is a harmless no-op re-affirmation
+    /// (called both by cursor-follow on every cursor move and by the
+    /// `edit-role` manual fallback).
+    fn open_editor(&self, theme_name: &str, role_tok: &str) -> Option<Vec<Intent>> {
+        let role = Role::from_token(role_tok)?;
+        let reg = self.registry.read().ok()?;
+        let nt = reg.get(theme_name)?;
+        if nt.preset {
+            return None;
+        }
+        let resolved = reg.resolve(theme_name);
+        let (fg, bg) = (resolved.role(role), resolved.bg(role));
+        *self.color_edit.borrow_mut() = Some(ColorEdit {
+            theme_name: theme_name.to_string(),
+            role_tok: role_tok.to_string(),
+            fg_rgb: crate::core::color_to_rgb(fg),
+            fg_nil: fg == Color::Reset,
+            bg_rgb: crate::core::color_to_rgb(bg),
+            bg_nil: bg == Color::Reset,
+            mods: [resolved.bold(role), resolved.italic(role), resolved.underline(role)],
+            channel: 0,
+        });
+        Some(vec![Intent::HostFunctionForm(Some(ID.into()))])
+    }
+
+    /// Close the live editor if one is open, releasing the panel. A no-op
+    /// (no intents) when nothing was open, so cursor moves outside any
+    /// theme role never spam a redundant release.
+    fn release(&self) -> Vec<Intent> {
+        if self.color_edit.borrow_mut().take().is_some() {
+            vec![Intent::HostFunctionForm(None)]
+        } else {
+            vec![]
+        }
+    }
+
+    /// Adjust the focused control of the live `ColorEdit` by `delta` (see
+    /// `step_color`'s effect), then immediately persist the result via
+    /// `apply_role` — every hjkl/HL press writes straight through, so the
+    /// editor never buffers a value the real theme doesn't already have.
+    fn step_and_apply(&self, delta: i32) -> Vec<Intent> {
+        self.step_color(delta);
+        let Some((theme_name, role_tok, fg, bg, mods)) = self.color_edit.borrow().as_ref().map(|ce| {
+            let fg = if ce.fg_nil { Color::Reset } else { Color::Rgb(ce.fg_rgb.0, ce.fg_rgb.1, ce.fg_rgb.2) };
+            let bg = if ce.bg_nil { Color::Reset } else { Color::Rgb(ce.bg_rgb.0, ce.bg_rgb.1, ce.bg_rgb.2) };
+            (ce.theme_name.clone(), ce.role_tok.clone(), fg, bg, ce.mods)
+        }) else {
+            return vec![];
+        };
+        self.apply_role(&theme_name, &role_tok, fg, bg, mods)
+    }
+
+    /// Adjust the focused control of the live `ColorEdit` by `delta`: steps
+    /// the focused fg or bg R/G/B channel (clamped to `0..255`), or flips a
+    /// nil toggle or modifier (any nonzero `delta` toggles it — there is no
+    /// continuous value for a checkbox). A no-op when no Color-in-panel
+    /// editor is open.
+    fn step_color(&self, delta: i32) {
+        if let Some(ce) = self.color_edit.borrow_mut().as_mut() {
+            match ce.channel {
+                FG_NIL_CHANNEL => ce.fg_nil = !ce.fg_nil,
+                FG_CHANNEL_BASE => ce.fg_rgb.0 = (ce.fg_rgb.0 as i32 + delta).clamp(0, 255) as u8,
+                2 => ce.fg_rgb.1 = (ce.fg_rgb.1 as i32 + delta).clamp(0, 255) as u8,
+                3 => ce.fg_rgb.2 = (ce.fg_rgb.2 as i32 + delta).clamp(0, 255) as u8,
+                BG_NIL_CHANNEL => ce.bg_nil = !ce.bg_nil,
+                BG_CHANNEL_BASE => ce.bg_rgb.0 = (ce.bg_rgb.0 as i32 + delta).clamp(0, 255) as u8,
+                9 => ce.bg_rgb.1 = (ce.bg_rgb.1 as i32 + delta).clamp(0, 255) as u8,
+                10 => ce.bg_rgb.2 = (ce.bg_rgb.2 as i32 + delta).clamp(0, 255) as u8,
+                c => ce.mods[c - MOD_CHANNEL_BASE] = !ce.mods[c - MOD_CHANNEL_BASE],
+            }
+        }
+    }
+
+    /// Render the Color-in-panel editor: an fg BarChart (R/G/B), an "FG nil"
+    /// toggle, a bg BarChart, a "BG nil" toggle, a Bold/Italic/Underline
+    /// toggle row, and a live swatch of the role's actual resolved look —
+    /// the same visual this used to draw as a `Mode::InputForm` popup, now
+    /// drawn directly into the function panel's inner rect via the
+    /// `render_form` seam. Degrades gracefully in a short panel: each section
+    /// only draws if there's room, falling back to just the title.
+    fn render_color_form(&self, frame: &mut Frame, inner: Rect, theme: &crate::core::Theme) -> Option<String> {
+        let ce = self.color_edit.borrow();
+        let ce = ce.as_ref()?;
+        let fg_desc = if ce.fg_nil { "nil".to_string() } else { format!("#{:02x}{:02x}{:02x}", ce.fg_rgb.0, ce.fg_rgb.1, ce.fg_rgb.2) };
+        let bg_desc = if ce.bg_nil { "nil".to_string() } else { format!("#{:02x}{:02x}{:02x}", ce.bg_rgb.0, ce.bg_rgb.1, ce.bg_rgb.2) };
+        let set_mods: Vec<&str> = MOD_NAMES.iter().zip(ce.mods).filter(|(_, on)| *on).map(|(n, _)| *n).collect();
+        let title = format!(
+            "{} — {} (fg:{fg_desc} bg:{bg_desc}{})",
+            ce.role_tok, ce.theme_name,
+            if set_mods.is_empty() { String::new() } else { format!(", {}", set_mods.join("+").to_lowercase()) }
+        );
+        if inner.height == 0 {
+            return Some(title);
+        }
+
+        let channel_style = |i: usize, base: Color| {
+            let mut s = Style::default().fg(base);
+            if i == ce.channel {
+                s = s.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+            }
+            s
+        };
+        let bar = |label: &'static str, value: u8, i: usize, base: Color| {
+            Bar::default()
+                .label(Line::from(label))
+                .value(value as u64)
+                .style(channel_style(i, base))
+                // Fixed-width (right-aligned to 3 digits, matching u8's max
+                // "255"): a shorter "12" or "20" needs less width than "127"
+                // to draw its text_value, so BarChart starts each bar's fill
+                // at a different x offset unless every value claims the same
+                // width up front.
+                .text_value(format!("{value:>3}"))
+        };
+        let rgb_chart = |rgb: (u8, u8, u8), base_channel: usize| {
+            BarChart::default()
+                .direction(Direction::Horizontal)
+                .bar_width(1)
+                .bar_gap(0)
+                .max(255)
+                .data(BarGroup::default().bars(&[
+                    bar("R", rgb.0, base_channel, Color::Red),
+                    bar("G", rgb.1, base_channel + 1, Color::Green),
+                    bar("B", rgb.2, base_channel + 2, Color::Blue),
+                ]))
+        };
+        let nil_toggle = |frame: &mut Frame, area: Rect, label: &str, on: bool, channel: usize| {
+            let text = format!("{label:<10}[{}]", if on { "x" } else { " " });
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(text, channel_style(channel, theme.role(Role::Base))))),
+                area,
+            );
+        };
+
+        // Top-to-bottom, matching the channel order above: FG nil, fg R/G/B,
+        // Bold/Italic/Underline, a blank separator, BG nil, bg R/G/B, swatch,
+        // hint. Each section only draws if there's room, falling back to just
+        // the title in a short panel.
+        let [fg_nil_row, rest] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .areas(inner);
+        nil_toggle(frame, fg_nil_row, "FG nil", ce.fg_nil, FG_NIL_CHANNEL);
+        if rest.height == 0 {
+            return Some(title);
+        }
+
+        let bars_h = 3.min(rest.height);
+        let [fg_bars, rest2] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(bars_h), Constraint::Min(0)])
+            .areas(rest);
+        frame.render_widget(rgb_chart(ce.fg_rgb, FG_CHANNEL_BASE), fg_bars);
+        if rest2.height == 0 {
+            return Some(title);
+        }
+
+        let [mods_area, rest3] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(MOD_NAMES.len() as u16), Constraint::Min(0)])
+            .areas(rest2);
+        // One row per modifier (not packed onto one line) so the `[ ]`
+        // checkboxes line up in a column regardless of label length.
+        let mod_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(vec![Constraint::Length(1); MOD_NAMES.len()])
+            .split(mods_area);
+        for (i, name) in MOD_NAMES.iter().enumerate() {
+            nil_toggle(frame, mod_rows[i], name, ce.mods[i], MOD_CHANNEL_BASE + i);
+        }
+        if rest3.height == 0 {
+            return Some(title);
+        }
+
+        let [_gap, rest4] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .areas(rest3);
+        if rest4.height == 0 {
+            return Some(title);
+        }
+
+        let [bg_nil_row, rest5] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .areas(rest4);
+        nil_toggle(frame, bg_nil_row, "BG nil", ce.bg_nil, BG_NIL_CHANNEL);
+        if rest5.height == 0 {
+            return Some(title);
+        }
+
+        let bg_bars_h = 3.min(rest5.height);
+        let [bg_bars, rest6] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(bg_bars_h), Constraint::Min(0)])
+            .areas(rest5);
+        frame.render_widget(rgb_chart(ce.bg_rgb, BG_CHANNEL_BASE), bg_bars);
+        if rest6.height == 0 {
+            return Some(title);
+        }
+
+        let [swatch, rest7] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .areas(rest6);
+        // A live sample of the role's actual resolved look, not a blank
+        // color block: fg, bg, and every modifier together, exactly what
+        // wherever this role is used will render.
+        let fg_color = if ce.fg_nil { Color::Reset } else { Color::Rgb(ce.fg_rgb.0, ce.fg_rgb.1, ce.fg_rgb.2) };
+        let bg_color = if ce.bg_nil { Color::Reset } else { Color::Rgb(ce.bg_rgb.0, ce.bg_rgb.1, ce.bg_rgb.2) };
+        let mut swatch_style = Style::default().fg(fg_color).bg(bg_color);
+        if ce.mods[0] { swatch_style = swatch_style.add_modifier(Modifier::BOLD); }
+        if ce.mods[1] { swatch_style = swatch_style.add_modifier(Modifier::ITALIC); }
+        if ce.mods[2] { swatch_style = swatch_style.add_modifier(Modifier::UNDERLINED); }
+        frame.render_widget(Paragraph::new(Span::styled(" Sample Aa ", swatch_style)), swatch);
+        if rest7.height == 0 {
+            return Some(title);
+        }
+
+        let hint = "j/k channel  h/l \u{b1}1  H/L \u{b1}10 (writes through immediately)";
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(theme.role(Role::Muted))))),
+            Rect { x: rest7.x, y: rest7.y, width: rest7.width, height: 1 },
+        );
+        Some(title)
     }
 }
 
@@ -518,175 +826,283 @@ impl ThemeExtension {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{AppState, Intent, KEY_ITEM};
-    use std::sync::atomic::{AtomicU32, Ordering};
 
-    fn temp_path() -> PathBuf {
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("wasdf-theme-ext-{}-{}", std::process::id(), n));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("config.scm")
-    }
-
-    fn presets_registry() -> Arc<RwLock<ThemeRegistry>> {
-        let datum = crate::script::sexpr::parse(PRESETS_SCHEME).unwrap();
-        let inner = datum.as_list().and_then(|l| l.get(1)).cloned()
-            .unwrap_or(crate::script::sexpr::Datum::List(vec![]));
-        let presets = crate::script::config::parse_theme_config(&inner);
-        Arc::new(RwLock::new(ThemeRegistry::with_presets(presets)))
+    fn parse_presets() -> Vec<NamedTheme> {
+        let datum = crate::script::sexpr::parse(PRESETS_SCHEME).expect("presets.scm parses");
+        let inner = datum.as_list().and_then(|l| l.get(1)).cloned().expect("(quote (...))");
+        crate::script::config::parse_theme_config(&inner)
     }
 
     #[test]
-    fn themes_node_lists_presets_and_new_entry() {
-        let registry = presets_registry();
-        let node = ThemeNode { registry };
-        let entries = node.list(Path::new("@/settings/Display/Themes")).unwrap();
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.iter().any(|n| n.contains("default")), "default present: {names:?}");
-        assert!(names.iter().any(|n| n.contains("nord")));
-        assert!(names.iter().any(|n| n.contains("gruvbox")));
-        assert!(names.iter().any(|n| n.contains("light")));
-        assert!(names.contains(&"+ New theme…"), "new-theme entry present");
+    fn every_bundled_preset_declares_its_own_role_bold_entries() {
+        let presets = parse_presets();
+        for name in ["nord", "gruvbox", "light"] {
+            let nt = presets.iter().find(|t| t.name == name).unwrap_or_else(|| panic!("{name} preset missing"));
+            for role in registry::DEFAULT_BOLD_ROLES {
+                let bold = nt.overrides.iter().any(|(r, s)| r == role && s.bold);
+                assert!(bold, "{name} preset missing a bold override for {}", role.token());
+            }
+        }
     }
 
     #[test]
-    fn set_active_intent_updates_registry() {
-        let registry = presets_registry();
-        let ext = ThemeExtension::new(registry.clone(), None);
-        let state = AppState::new(PathBuf::from("/tmp"));
+    fn presets_scm_bold_reflects_through_resolve() {
+        let presets = parse_presets();
+        let reg = ThemeRegistry::with_presets(presets);
+        for name in ["default", "nord", "gruvbox", "light"] {
+            let resolved = reg.resolve(name);
+            assert!(resolved.bold(Role::EntryDir), "{name}: entry-dir should be bold");
+            assert!(!resolved.bold(Role::Title), "{name}: title should not be bold by default");
+        }
+    }
+
+    fn ext_with_custom(name: &str, source: &str) -> ThemeExtension {
+        let registry = Arc::new(RwLock::new(ThemeRegistry::with_presets(parse_presets())));
+        let ext = ThemeExtension::new(registry, None);
         let intent = ExtensionIntent {
             extension: "theme".into(),
-            intent: "set-active".into(),
-            data: ExtensionValue::String("nord".into()),
-        };
-        let result = ext.handle_intent(&intent, &state);
-        assert_eq!(result, vec![Intent::Refresh]);
-        assert_eq!(registry.read().unwrap().active(), "nord");
-    }
-
-    #[test]
-    fn set_active_unknown_name_returns_nothing() {
-        let registry = presets_registry();
-        let ext = ThemeExtension::new(registry.clone(), None);
-        let state = AppState::new(PathBuf::from("/tmp"));
-        let intent = ExtensionIntent {
-            extension: "theme".into(),
-            intent: "set-active".into(),
-            data: ExtensionValue::String("nope".into()),
-        };
-        let result = ext.handle_intent(&intent, &state);
-        assert!(result.is_empty());
-        assert_eq!(registry.read().unwrap().active(), "default");
-    }
-
-    #[test]
-    fn set_active_persists_to_config() {
-        let path = temp_path();
-        let registry = presets_registry();
-        let ext = ThemeExtension::new(registry.clone(), Some(path.clone()));
-        let state = AppState::new(PathBuf::from("/tmp"));
-        let intent = ExtensionIntent {
-            extension: "theme".into(),
-            intent: "set-active".into(),
-            data: ExtensionValue::String("gruvbox".into()),
-        };
-        ext.handle_intent(&intent, &state);
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains(r#"(set-theme "gruvbox")"#));
-    }
-
-    #[test]
-    fn boot_load_reads_set_theme_from_config() {
-        let path = temp_path();
-        std::fs::write(
-            &path,
-            format!(";; other\n{}\n(set-theme \"nord\")\n{}\n",
-                writer::BLOCK_BEGIN, writer::BLOCK_END),
-        ).unwrap();
-        let registry = presets_registry();
-        let _ext = ThemeExtension::new(registry.clone(), Some(path));
-        assert_eq!(registry.read().unwrap().active(), "nord");
-    }
-
-    #[test]
-    fn new_theme_creates_custom_and_selects_it() {
-        let path = temp_path();
-        let registry = presets_registry();
-        let ext = ThemeExtension::new(registry.clone(), Some(path.clone()));
-        let state = AppState::new(PathBuf::from("/tmp"));
-        // Simulate confirm from emit_path_input: KEY_ITEM = "ocean"
-        let intent = ExtensionIntent {
-            extension: "theme".into(),
-            intent: "new-apply".into(),
-            data: ExtensionValue::Nil.with(KEY_ITEM, ExtensionValue::String("ocean".into())),
-        };
-        let result = ext.handle_intent(&intent, &state);
-        assert_eq!(result, vec![Intent::Refresh]);
-        assert_eq!(registry.read().unwrap().active(), "ocean");
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("define-theme"), "define-theme persisted");
-        assert!(content.contains("ocean"), "theme name in config");
-        assert!(content.contains(r#"(set-theme "ocean")"#), "active persisted");
-    }
-
-    #[test]
-    fn edit_role_updates_override_and_persists() {
-        let path = temp_path();
-        let registry = presets_registry();
-        let ext = ThemeExtension::new(registry.clone(), Some(path.clone()));
-        let state = AppState::new(PathBuf::from("/tmp"));
-        // First create a custom theme.
-        ext.handle_intent(&ExtensionIntent {
-            extension: "theme".into(),
-            intent: "new-apply".into(),
-            data: ExtensionValue::Nil.with(KEY_ITEM, ExtensionValue::String("ocean".into())),
-        }, &state);
-        // Then edit border role to "blue".
-        let intent = ExtensionIntent {
-            extension: "theme".into(),
-            intent: "edit-role-apply".into(),
+            intent: "duplicate-apply".into(),
             data: ExtensionValue::Nil
-                .with("theme", ExtensionValue::String("ocean".into()))
-                .with("role", ExtensionValue::String("border".into()))
-                .with(KEY_ITEM, ExtensionValue::String("blue".into())),
+                .with("source", ExtensionValue::String(source.into()))
+                .with(KEY_ITEM, ExtensionValue::String(name.into())),
         };
-        let result = ext.handle_intent(&intent, &state);
-        assert_eq!(result, vec![Intent::Refresh]);
-        // Check override in registry.
-        let resolved = registry.read().unwrap().resolve("ocean");
-        assert_eq!(resolved.role(crate::core::Role::Border), ratatui::style::Color::Blue);
-        // Check config.scm.
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("(border blue)"), "role override persisted: {content}");
+        let state = AppState::new(std::env::temp_dir());
+        ext.handle_intent(&intent, &state);
+        ext
+    }
+
+    fn edit(ext: &ThemeExtension, theme_name: &str, role_tok: &str) {
+        let intent = ExtensionIntent {
+            extension: "theme".into(),
+            intent: "edit-role".into(),
+            data: ExtensionValue::Nil
+                .with("theme", ExtensionValue::String(theme_name.into()))
+                .with("role", ExtensionValue::String(role_tok.into())),
+        };
+        let state = AppState::new(std::env::temp_dir());
+        ext.handle_intent(&intent, &state);
     }
 
     #[test]
-    fn delete_custom_resets_active_to_default() {
-        let path = temp_path();
-        let registry = presets_registry();
-        let ext = ThemeExtension::new(registry.clone(), Some(path.clone()));
-        let state = AppState::new(PathBuf::from("/tmp"));
-        // Create a custom and make it active.
-        ext.handle_intent(&ExtensionIntent {
-            extension: "theme".into(),
-            intent: "new-apply".into(),
-            data: ExtensionValue::Nil.with(KEY_ITEM, ExtensionValue::String("ocean".into())),
-        }, &state);
-        assert_eq!(registry.read().unwrap().active(), "ocean");
-        // Delete-confirm fires the wrapped intent on confirm.
-        let intent = ExtensionIntent {
-            extension: "theme".into(),
-            intent: "delete-confirm".into(),
-            data: ExtensionValue::String("ocean".into()),
+    fn edit_role_seeds_bold_from_the_resolved_theme_not_just_the_color() {
+        // gruvbox's entry-dir is bold (DEFAULT_BOLD_ROLES); a duplicate must
+        // seed the color-in-panel editor's Bold control from that, not a
+        // separate/stale toggle-bold path.
+        let ext = ext_with_custom("mycopy", "gruvbox");
+        edit(&ext, "mycopy", "entry-dir");
+        let ce = ext.color_edit.borrow();
+        let ce = ce.as_ref().expect("edit-role opens the color editor");
+        assert_eq!(ce.role_tok, "entry-dir");
+        assert!(ce.mods[0], "entry-dir is bold in gruvbox, so the seeded editor state must be bold too");
+        assert_eq!(ce.fg_rgb, crate::core::color_to_rgb(ratatui::style::Color::Rgb(0x83, 0xa5, 0x98)));
+        assert!(ce.bg_nil, "entry-dir carries no bg override in gruvbox");
+    }
+
+    #[test]
+    fn edit_role_seeds_bold_false_for_a_non_bold_role() {
+        let ext = ext_with_custom("mycopy", "gruvbox");
+        edit(&ext, "mycopy", "entry-symlink");
+        let ce = ext.color_edit.borrow();
+        let ce = ce.as_ref().expect("edit-role opens the color editor");
+        assert_eq!(ce.role_tok, "entry-symlink");
+        assert!(!ce.mods[0], "entry-symlink carries no bold override in gruvbox");
+    }
+
+    #[test]
+    fn channel_next_reaches_every_control_and_h_l_toggles_them() {
+        let ext = ext_with_custom("mycopy", "gruvbox");
+        edit(&ext, "mycopy", "entry-symlink"); // starts with no modifiers set, no bg override
+        let state = AppState::new(std::env::temp_dir());
+        let go = |intent: &str| {
+            ext.handle_intent(
+                &ExtensionIntent { extension: "theme".into(), intent: intent.into(), data: ExtensionValue::Nil },
+                &state,
+            );
         };
-        let result = ext.handle_intent(&intent, &state);
+        for _ in 0..MOD_CHANNEL_BASE {
+            go("channel-next");
+        }
+        assert_eq!(ext.color_edit.borrow().as_ref().unwrap().channel, MOD_CHANNEL_BASE, "reaches the Bold control");
+        let underline_channel = MOD_CHANNEL_BASE + MOD_NAMES.len() - 1;
+        for _ in MOD_CHANNEL_BASE..underline_channel {
+            go("channel-next");
+        }
+        assert_eq!(ext.color_edit.borrow().as_ref().unwrap().channel, underline_channel, "reaches the Underline control");
+
+        go("color-dec"); // h: toggles Underline (no continuous value on a checkbox)
+        assert!(ext.color_edit.borrow().as_ref().unwrap().mods[2]);
+        go("color-inc"); // l: toggles back
+        assert!(!ext.color_edit.borrow().as_ref().unwrap().mods[2]);
+        go("color-inc-10"); // L: also toggles
+        assert!(ext.color_edit.borrow().as_ref().unwrap().mods[2]);
+
+        for _ in 0..(MAX_CHANNEL + 5) {
+            go("channel-next"); // way past the end
+        }
+        assert_eq!(ext.color_edit.borrow().as_ref().unwrap().channel, MAX_CHANNEL, "channel-next clamps at the last bg B control");
+    }
+
+    #[test]
+    fn the_fg_and_bg_nil_toggles_are_reachable_and_flip_independently() {
+        let ext = ext_with_custom("mycopy", "gruvbox");
+        edit(&ext, "mycopy", "entry-symlink");
+        let state = AppState::new(std::env::temp_dir());
+        let go = |intent: &str| {
+            ext.handle_intent(
+                &ExtensionIntent { extension: "theme".into(), intent: intent.into(), data: ExtensionValue::Nil },
+                &state,
+            );
+        };
+        assert!(!ext.color_edit.borrow().as_ref().unwrap().fg_nil, "entry-symlink starts with a real fg color");
+        assert!(ext.color_edit.borrow().as_ref().unwrap().bg_nil, "entry-symlink carries no bg override in gruvbox, so bg starts nil");
+        for _ in 0..FG_NIL_CHANNEL {
+            go("channel-next");
+        }
+        go("color-dec"); // toggle FG nil on
+        assert!(ext.color_edit.borrow().as_ref().unwrap().fg_nil);
+        assert!(ext.color_edit.borrow().as_ref().unwrap().bg_nil, "toggling fg-nil must not touch bg-nil");
+
+        for _ in FG_NIL_CHANNEL..BG_NIL_CHANNEL {
+            go("channel-next");
+        }
+        go("color-dec"); // toggle BG nil off (it starts nil, so this turns it on)
+        assert!(!ext.color_edit.borrow().as_ref().unwrap().bg_nil);
+    }
+
+    #[test]
+    fn every_step_writes_through_immediately_no_confirm_needed() {
+        let ext = ext_with_custom("mycopy", "gruvbox");
+        edit(&ext, "mycopy", "entry-symlink");
+        let state = AppState::new(std::env::temp_dir());
+        let go = |intent: &str| {
+            ext.handle_intent(
+                &ExtensionIntent { extension: "theme".into(), intent: intent.into(), data: ExtensionValue::Nil },
+                &state,
+            );
+        };
+        for _ in 0..MOD_CHANNEL_BASE {
+            go("channel-next"); // -> Bold
+        }
+        go("color-dec"); // toggle Bold on
+
+        // Persisted immediately — no confirm step exists, and the editor
+        // stays open (cursor-follow, not a modal popup) so the user can keep
+        // adjusting other channels for the same role.
+        assert!(ext.color_edit.borrow().is_some(), "the editor stays open — there is nothing to close");
+        let reg = ext.registry.read().unwrap();
+        let resolved = reg.resolve("mycopy");
+        assert!(resolved.bold(Role::EntrySymlink), "the Bold toggle must persist as soon as it's pressed");
+        // The color itself (untouched here) survives the same write.
+        assert_eq!(resolved.role(Role::EntrySymlink), ratatui::style::Color::Rgb(0xd3, 0x86, 0x9b));
+    }
+
+    #[test]
+    fn italic_and_underline_toggle_and_persist_independently_of_bold() {
+        let ext = ext_with_custom("mycopy", "gruvbox");
+        edit(&ext, "mycopy", "entry-symlink");
+        let state = AppState::new(std::env::temp_dir());
+        let go = |intent: &str| {
+            ext.handle_intent(
+                &ExtensionIntent { extension: "theme".into(), intent: intent.into(), data: ExtensionValue::Nil },
+                &state,
+            );
+        };
+        for _ in 0..(MOD_CHANNEL_BASE + 1) {
+            go("channel-next"); // -> Italic
+        }
+        go("color-dec"); // toggle Italic on
+        go("channel-next"); // -> Underline
+        go("color-dec"); // toggle Underline on
+
+        let reg = ext.registry.read().unwrap();
+        let resolved = reg.resolve("mycopy");
+        assert!(resolved.italic(Role::EntrySymlink));
+        assert!(resolved.underline(Role::EntrySymlink));
+        assert!(!resolved.bold(Role::EntrySymlink), "toggling italic/underline must not flip bold");
+    }
+
+    #[test]
+    fn apply_role_removes_the_override_once_it_matches_the_default_style_again() {
+        // Exercises `apply_role` directly rather than through the RGB-slider
+        // channels: those always reconstruct fg/bg as a literal `Color::Rgb`
+        // (`color_to_rgb`'s approximation), which can never structurally
+        // equal `Theme::default()`'s named-ANSI colors (e.g. `Color::Gray`)
+        // even when it's a visually exact match — a known, accepted limit of
+        // that widget, not what this test is about.
+        let ext = ext_with_custom("mycopy", "gruvbox");
+        let default = registry::default_style(Role::Title); // title has no override in gruvbox
+        ext.apply_role("mycopy", "title", default.fg, default.bg, [!default.bold, default.italic, default.underline]);
+        assert!(ext.registry.read().unwrap().get("mycopy").unwrap().overrides.iter().any(|(r, _)| *r == Role::Title));
+        ext.apply_role("mycopy", "title", default.fg, default.bg, [default.bold, default.italic, default.underline]);
+        assert!(
+            !ext.registry.read().unwrap().get("mycopy").unwrap().overrides.iter().any(|(r, _)| *r == Role::Title),
+            "an override identical to the default should be dropped, not stored"
+        );
+    }
+
+    #[test]
+    fn on_cursor_changed_opens_a_custom_roles_editor_and_releases_off_it() {
+        let ext = ext_with_custom("mycopy", "gruvbox");
         let themes_root = vfs_root().join("settings").join("Display").join("Themes");
-        assert_eq!(result, vec![Intent::NavigateTo(themes_root)]);
-        assert_eq!(registry.read().unwrap().active(), "default");
-        assert!(!registry.read().unwrap().names().contains(&"ocean".to_string()));
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(!content.contains("(define-theme \"ocean\""), "form removed from config");
+        let mut state = AppState::new(std::env::temp_dir());
+
+        let entry_at = |path: std::path::PathBuf| crate::core::Entry {
+            path,
+            name: "x".into(),
+            is_dir: false,
+            is_symlink: false,
+            size: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            modified: None,
+            created: None,
+            accessed: None,
+            symlink_target: None,
+            activation: None,
+        };
+
+        // Landing on a custom theme's role opens the editor.
+        state.entries = vec![entry_at(themes_root.join("mycopy").join("entry-dir"))];
+        state.cursor = 0;
+        let out = ext.on_cursor_changed(&state);
+        assert_eq!(out, vec![Intent::HostFunctionForm(Some("theme".into()))]);
+        assert_eq!(ext.color_edit.borrow().as_ref().unwrap().role_tok, "entry-dir");
+
+        // Moving to a non-role leaf releases it.
+        state.entries = vec![entry_at(themes_root.join("mycopy").join("rename"))];
+        let out = ext.on_cursor_changed(&state);
+        assert_eq!(out, vec![Intent::HostFunctionForm(None)]);
+        assert!(ext.color_edit.borrow().is_none());
+
+        // Releasing again (nothing open) is a silent no-op.
+        assert_eq!(ext.on_cursor_changed(&state), Vec::<Intent>::new());
+    }
+
+    #[test]
+    fn on_cursor_changed_ignores_a_presets_role() {
+        // gruvbox is still a preset (untouched) — landing on its own role
+        // entries must not open a live editor (presets are immutable).
+        let ext = ext_with_custom("mycopy", "gruvbox");
+        let themes_root = vfs_root().join("settings").join("Display").join("Themes");
+        let mut state = AppState::new(std::env::temp_dir());
+        state.entries = vec![crate::core::Entry {
+            path: themes_root.join("gruvbox").join("entry-dir"),
+            name: "x".into(),
+            is_dir: false,
+            is_symlink: false,
+            size: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            modified: None,
+            created: None,
+            accessed: None,
+            symlink_target: None,
+            activation: None,
+        }];
+        state.cursor = 0;
+        assert_eq!(ext.on_cursor_changed(&state), Vec::<Intent>::new());
+        assert!(ext.color_edit.borrow().is_none());
     }
 }

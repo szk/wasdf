@@ -18,7 +18,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::core::{AppState, Role, Theme};
+use crate::core::{AppState, Mode, Role, SubLayout, Theme};
 use crate::ui::chrome::{self, PanelFrame};
 use crate::ui::render::split_h;
 
@@ -42,6 +42,11 @@ pub struct TopOptions {
     pub monitor: MonitorOptions,
     /// Scrollbar glyphs.
     pub scrollbar: crate::ui::chrome::ScrollbarChars,
+    /// Whether the Rows layout's logarithmic file-size bar is drawn at all
+    /// (`@/settings/Display/file-row-size-graph`, default on). Consumed by
+    /// `ui/middle.rs`, not the top panel — lives here anyway since this is
+    /// already the per-frame options snapshot every renderer reads from.
+    pub file_row_size_graph: bool,
 }
 
 impl Default for TopOptions {
@@ -55,6 +60,7 @@ impl Default for TopOptions {
             monitor_weight: 2,
             monitor: MonitorOptions::default(),
             scrollbar: crate::ui::chrome::ScrollbarChars::default(),
+            file_row_size_graph: true,
         }
     }
 }
@@ -147,16 +153,31 @@ pub fn render_top(
     let (nav_r, prop_r, mon_r) = layout_panels(area, opts);
 
     // The bottom border is one connected line spanning the whole top area, so the
-    // path/filename labels are budgeted against the full top width (`area`), not
-    // the nav panel's slice — they may flow across the prop/monitor sections.
+    // labels are budgeted against the full top width (`area`), not the nav panel's
+    // slice. It carries the file panel's focus so the labels are themed focus-aware
+    // (they live on the nav border but belong to the file/function panels).
     let cwd_str = state.cwd.to_string_lossy().into_owned();
-    let name = state.current_entry().map(|e| e.name.as_str()).unwrap_or("");
-    // The padding and separators woven into the bottom border must match the
-    // active border style's horizontal rule (e.g. `─` for rounded, `═` for double).
-    let sep = h_rule(&opts.border_style);
-    let (nav_bottom, nav_bottom_right) = plan_bottom_labels(&cwd_str, name, area, func_x, sep);
+    // The cursor filename is placed after the function-panel junction only while
+    // the function panel previews file content — that is the one frame where its
+    // title *is* the shown file's name (doc/UI.md). In Command / Exec / Select the
+    // function panel keeps its own mode title, so no filename is drawn there.
+    let name: Option<String> = if !matches!(state.mode(), Mode::Select(_))
+        && state.function.visible
+        && state.function.sublayout == SubLayout::Content
+    {
+        state.current_entry().map(|e| e.name.clone())
+    } else {
+        None
+    };
+    let (nav_bottom, nav_name) =
+        plan_bottom_labels(&cwd_str, name.as_deref(), area, func_x, &opts.border_style);
+    // The two bottom-border labels follow independent focus: the path is the file
+    // panel's title, the filename is the function panel's. (They sit on the nav
+    // border but each reflects its own owner's focus, not the nav panel's.)
+    let file_focused = state.focused_panel == crate::core::PANEL_FILE;
+    let func_focused = state.focused_panel == crate::core::PANEL_FUNCTION;
 
-    render_nav(frame, nav_r, state, vfs, panels, nav_bottom, nav_bottom_right, theme);
+    render_nav(frame, nav_r, state, vfs, panels, nav_bottom, nav_name, file_focused, func_focused, theme);
     if let Some(r) = prop_r {
         render_prop(frame, r, state, panels, theme);
     }
@@ -165,113 +186,116 @@ pub fn render_top(
     }
 }
 
-/// Compute the top area's bottom-border labels given the current path, selected
-/// filename, the full top-area rect, and the optional func-panel junction column.
+/// Lay out the top area's bottom-border labels — the current **path** (left,
+/// owned by the file panel) and the optional cursor **filename** (right, the
+/// function panel's title) — across the shared border, per the five cases in
+/// doc/UI.md. Returns `(path_label, Some((x, name_segment)))`, where the name
+/// segment is positioned at absolute column `x`.
 ///
-/// The labels span the **whole** top-area bottom border (`╚`…`╣`), not just the
-/// nav slice, so a long path may flow across the prop/monitor sections. All
-/// widths are measured in display columns (`chars().count()`), consistent with
-/// the rest of the chrome.
+/// The path is `[ cwd ]` written from `top_area.x + 2`; the filename is
+/// `[ name ]`. The five outcomes follow from whether the function panel is
+/// visible and how the path length compares to the junction column `func_x`:
 ///
-/// Returns `(bottom_info, bottom_right)`:
-/// - `bottom_info`: written left-to-right starting at `top_area.x + 2`.
-/// - `bottom_right`: `Some((x, text))` — the filename segment starting at `x`.
+/// 1. No func panel, path fits — the path fills from the left, no filename.
+/// 2. Func visible, path shorter than the junction — the `╦` is kept and the
+///    filename starts just after it (`func_x + 1`).
+/// 3. Func visible, path longer than the junction — the path overwrites the `╦`
+///    and flows past it; the filename follows after a one-cell separator.
+/// 4. As Case 3, but the filename no longer fits, so it is `…`-truncated.
+/// 5. The path alone overflows the whole width — it is `…`-truncated, no filename.
 ///
-/// `sep` is the horizontal rule character of the active border style (`─` / `═` /
-/// `-`), used for the padding and the separators between labels.
-///
-/// Four layout cases (func panel visible):
-/// - **A** (path fits before ╦): `bottom_info` = padded path (stops before ╦),
-///   `bottom_right` = `<sep>[ name ]` starting at `╦+1`.
-/// - **B** (path past ╦, name fits): `bottom_info` = `[ path ]<sep>[ name ]`; ╦ is
-///   overwritten (chrome's N-only junction check allows this).
-/// - **C** (path past ╦, name truncated): `bottom_info` = `[ path ]<sep>[ name… ]`.
-/// - **D** (path overflows total width): `bottom_info` = truncated `[ path… ]`.
+/// `name` is `None` for non-content frames (Command / Exec / Select, or an empty
+/// directory); then the path is clamped to the file panel's zone and no filename
+/// is drawn, so the function panel's own title is left intact. The name segment is
+/// padded with trailing border rule out to the frame edge so any function title
+/// bled onto this shared row is erased (chrome's bottom painter restores the
+/// crossed junctions). Widths are display columns (`chars().count()`).
 fn plan_bottom_labels(
     cwd: &str,
-    name: &str,
+    name: Option<&str>,
     top_area: Rect,
     func_x: Option<u16>,
-    sep: char,
+    border_style: &str,
 ) -> (String, Option<(u16, String)>) {
-    // bottom_info starts writing at top_area.x + 2 (clearing the `╚═` corner).
-    let start_x = top_area.x + 2;
-    // Max display columns the border text may occupy (leave the corners untouched).
+    // The label starts at top_area.x + 2 (clearing the `╚═` corner); paint stops
+    // at the closing corner column on the right.
+    let start = top_area.x + 2;
+    let frame_right = top_area.x + top_area.width - 1;
+    // Max display columns the path may occupy before it overflows the whole width.
     let available = top_area.width.saturating_sub(4) as usize;
+    let rule = h_rule(border_style);
 
-    let pb = format!("[ {cwd} ]");
-    let pb_w = pb.chars().count();
+    let path_label = format!("[ {cwd} ]");
+    let pl = path_label.chars().count();
+
+    // Case 5: the path alone overflows the border — truncate it, show no filename,
+    // regardless of the function panel.
+    if pl > available {
+        return (bracket_truncated(cwd, available), None);
+    }
 
     let Some(fx) = func_x else {
-        // No func panel: path only, truncated if needed.
-        let s = if pb_w <= available { pb } else { path_bottom_text(cwd, available) };
-        return (s, None);
+        // Case 1: no function panel and the path fits — fill from the left.
+        return (path_label, None);
     };
 
-    // Columns from start_x to the ╦ column (exclusive): the "left zone".
-    let junc_offset = (fx as usize).saturating_sub(start_x as usize);
-
-    if name.is_empty() {
-        // Right zone belongs to the function panel title — keep the path in the
-        // left zone only so it does not overwrite the function title.
-        let limit = junc_offset.min(available);
-        let s = if pb_w <= limit { pb } else { path_bottom_text(cwd, limit) };
-        return (s, None);
-    }
-
-    let nb = format!("[ {name} ]");
-    let nb_w = nb.chars().count();
-
-    if pb_w <= junc_offset {
-        // Case A: path fits entirely before ╦.
-        // Pad with the rule char so bottom_info is exactly junc_offset columns —
-        // the string ends just before the junction cell, leaving ╦ untouched.
-        let pad = junc_offset - pb_w;
-        let bottom_left = format!("{}{}", pb, sep.to_string().repeat(pad));
-
-        // Right zone: from fx+1 to the closing `╣` (top_area right edge - 1).
-        let right_avail =
-            (top_area.x as usize + top_area.width as usize).saturating_sub(fx as usize + 2);
-        let right_text = build_right(name, &nb, right_avail, sep);
-        let bottom_right = if right_text.is_empty() { None } else { Some((fx + 1, right_text)) };
-        (bottom_left, bottom_right)
-    } else {
-        // Cases B/C/D: path extends past ╦.
-        // Chrome's N-only junction check lets path chars overwrite ╦ cleanly.
-        let bottom_left = if pb_w + 1 + nb_w <= available {
-            // Case B: path + sep + full name fits.
-            format!("{}{}{}", pb, sep, nb)
-        } else if pb_w + 1 < available {
-            // Case C: truncate name.
-            let nb_avail = available - pb_w - 1;
-            let nb_trunc = truncate_name_bracket(name, nb_avail);
-            if nb_trunc.is_empty() { pb } else { format!("{}{}{}", pb, sep, nb_trunc) }
-        } else if pb_w <= available {
-            // Name doesn't fit at all.
-            pb
+    // Pad a bracket label with trailing rule out to the frame's right edge so the
+    // function panel's title, bled onto this shared row, is fully erased (chrome
+    // restores the crossed junction glyphs from the rule cells).
+    let pad_to_edge = |label: String, x: u16| -> String {
+        let span = frame_right.saturating_sub(x) as usize;
+        let len = label.chars().count();
+        if len >= span {
+            label
         } else {
-            // Case D: path itself overflows.
-            path_bottom_text(cwd, available)
-        };
-        (bottom_left, None)
-    }
-}
+            let mut s = label;
+            s.extend(std::iter::repeat_n(rule, span - len));
+            s
+        }
+    };
 
-/// Build the `<sep>[ name ]` right-segment, truncating if it exceeds `avail`
-/// columns. `sep` is the active border style's horizontal rule character.
-fn build_right(name: &str, nb: &str, avail: usize, sep: char) -> String {
-    // Full: sep + "[ name ]"
-    if nb.chars().count() + 1 <= avail {
-        return format!("{}{}", sep, nb);
-    }
-    // Truncated: "<sep>[ name_trunc… ]"; overhead for "<sep>[ … ]" = 6 columns.
-    if avail >= 6 {
-        let name_chars = avail - 6;
-        if name_chars > 0 {
-            return format!("{}[ {}… ]", sep, name.chars().take(name_chars).collect::<String>());
+    let Some(name) = name else {
+        // Function panel visible but not previewing content: keep the path inside
+        // the file panel's zone (before the ╦) so it never overwrites the function
+        // panel's own mode title.
+        let zone = (fx as usize).saturating_sub(start as usize);
+        return if pl <= zone {
+            (path_label, None)
+        } else {
+            (bracket_truncated(cwd, zone), None)
+        };
+    };
+
+    let name_label = format!("[ {name} ]");
+    let nl = name_label.chars().count();
+    let junc_off = (fx as usize).saturating_sub(start as usize);
+
+    // The right-zone start column, and a closure to finish the segment (pad it to
+    // the edge if it fits, else `…`-truncate it to the remaining span).
+    let segment = |nx: u16| -> Option<(u16, String)> {
+        if nx >= frame_right {
+            return None;
+        }
+        let span = frame_right.saturating_sub(nx) as usize;
+        let seg = if nl <= span { pad_to_edge(name_label.clone(), nx) } else { bracket_truncated(name, span) };
+        Some((nx, seg))
+    };
+
+    if pl <= junc_off {
+        // Case 2: the path ends before the junction; the ╦ is preserved and the
+        // filename sits in the right zone, starting just after the junction.
+        (path_label, segment(fx + 1))
+    } else {
+        // Cases 3 & 4: the path is longer than the junction, so it overwrites the
+        // ╦ and flows past it; the filename follows after a one-cell separator. The
+        // separator rule is appended to the path so the single cell between the
+        // path's `]` and the filename is a border rule (which erases a bled title /
+        // restores a crossed junction), never a stray title letter.
+        match segment(start + pl as u16 + 1) {
+            Some(seg) => (format!("{path_label}{rule}"), Some(seg)),
+            None => (path_label, None),
         }
     }
-    String::new()
 }
 
 /// The horizontal rule character for a border style, matching chrome's `glyph()`.
@@ -283,31 +307,15 @@ fn h_rule(border_style: &str) -> char {
     }
 }
 
-/// Format `[ name ]`, truncating content to fit in `avail` columns.
-fn truncate_name_bracket(name: &str, avail: usize) -> String {
-    let full = format!("[ {name} ]");
-    if full.chars().count() <= avail {
-        return full;
-    }
-    // "[ name_trunc… ]"; overhead for "[ … ]" = 5 columns.
-    if avail >= 5 {
-        let chars = avail - 5;
-        if chars > 0 {
-            return format!("[ {}… ]", name.chars().take(chars).collect::<String>());
-        }
-    }
-    String::new()
-}
-
-/// Format `[ {path} ]` truncated to `max_width` columns with a trailing `…`.
-fn path_bottom_text(path: &str, max_width: usize) -> String {
-    let full = format!("[ {path} ]");
+/// Format `[ {text} ]` truncated to `max_width` columns with a trailing `…`.
+fn bracket_truncated(text: &str, max_width: usize) -> String {
+    let full = format!("[ {text} ]");
     if full.chars().count() <= max_width {
         return full;
     }
     let overhead = 5; // "[ " + "…" + " ]"
     let avail = max_width.saturating_sub(overhead);
-    format!("[ {}… ]", path.chars().take(avail).collect::<String>())
+    format!("[ {}… ]", text.chars().take(avail).collect::<String>())
 }
 
 // ── 3-way layout ─────────────────────────────────────────────────────────────
@@ -384,6 +392,7 @@ struct NavColumn {
     is_contents: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_nav(
     frame: &mut Frame,
     area: Rect,
@@ -391,13 +400,18 @@ fn render_nav(
     vfs: &crate::vfs::Vfs,
     panels: &mut Vec<PanelFrame>,
     nav_bottom: String,
-    nav_bottom_right: Option<(u16, String)>,
+    nav_name: Option<(u16, String)>,
+    file_focused: bool,
+    func_focused: bool,
     theme: &Theme,
 ) {
     let banner = format!("/ wasdf v{} /", env!("CARGO_PKG_VERSION"));
-    let mut pf = PanelFrame::new(area).banner(banner).bottom_info(nav_bottom);
-    if let Some((x, text)) = nav_bottom_right {
-        pf = pf.bottom_right(x, text);
+    let mut pf = PanelFrame::new(area)
+        .banner(banner)
+        .bottom_info(nav_bottom)
+        .bottom_focused(file_focused);
+    if let Some((x, t)) = nav_name {
+        pf = pf.bottom_right(x, t, func_focused);
     }
     let inner = chrome::inner(area);
     if inner.width < 4 || inner.height < 1 {
@@ -449,10 +463,10 @@ fn render_nav(
     let total_w = col_x.last().copied().unwrap_or(0) + widths.last().copied().unwrap_or(0);
     let scroll_x: u16 = total_w.saturating_sub(avail);
 
-    let path_style = Style::default().fg(theme.role(Role::PathActive)).add_modifier(Modifier::BOLD);
-    let cwd_style = Style::default().fg(theme.role(Role::NavCursorFg)).bg(theme.role(Role::NavCursorBg)).add_modifier(Modifier::BOLD);
-    let sib_style = Style::default().fg(theme.role(Role::PathMuted));
-    let link_style = Style::default().fg(theme.role(Role::PathMuted));
+    let path_style = theme.style(Role::PathActive);
+    let cwd_style = theme.style(Role::NavCursorFg).bg(theme.role(Role::NavCursorBg));
+    let sib_style = theme.style(Role::PathMuted);
+    let link_style = theme.style(Role::PathMuted);
 
     let buf = frame.buffer_mut();
     let center_y = inner.y + mid as u16;
@@ -647,13 +661,14 @@ fn render_monitor(
             lines.push(disk_row(&cfg, &ds, w, lbl_role, bar_role, val_role, theme));
             continue;
         }
-        if let Some((ratio, value, history)) =
-            metric_runtime(id, cfg.refresh, cfg.graph_window, &state.cwd)
-        {
-            lines.push(metric_row(
-                name, &cfg, ratio, &value, &history, w, lbl_role, bar_role, val_role, theme,
-            ));
-        }
+        let line = match metric_runtime(id, cfg.refresh, cfg.graph_window, &state.cwd) {
+            Some((ratio, value, history)) => {
+                metric_row(name, &cfg, ratio, &value, &history, w, lbl_role, bar_role, val_role, theme)
+            }
+            // No data yet (startup or unsupported platform): muted placeholder.
+            None => muted_metric_row(name, &cfg, w, lbl_role, theme),
+        };
+        lines.push(line);
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -665,11 +680,14 @@ fn render_monitor(
     let avail = area.width.saturating_sub(4) as usize;
     let time_ss = &clock_full[11..]; // "HH:MM:SS"
     let time_mm = &clock_full[11..16]; // "HH:MM"
+    // Every candidate keeps at least one trailing rule char so the info
+    // bracket never sits flush against the panel's right corner — `]┐` reads
+    // as a rendering glitch, not a border seam.
     let candidates = [
         format!("[ {clock_full} ]{h_sep}{h_sep}"),
-        format!("[ {clock_full} ]"),
-        format!("[ {time_ss} ]"),
-        format!("[ {time_mm} ]"),
+        format!("[ {clock_full} ]{h_sep}"),
+        format!("[ {time_ss} ]{h_sep}"),
+        format!("[ {time_mm} ]{h_sep}"),
     ];
     if let Some(info) = candidates.iter().find(|s| s.chars().count() <= avail) {
         panels.push(PanelFrame::new(area).info(info.clone()));
@@ -735,6 +753,40 @@ fn braille_sparkline(history: &[f64], width: usize) -> String {
     s
 }
 
+/// A muted-colored `░`-fill span of `width` cells, used to mark graph areas as
+/// "not yet loaded" on startup before any samples have been collected.
+fn muted_fill(width: usize, theme: &Theme) -> Span<'static> {
+    Span::styled("░".repeat(width), theme.style(Role::Muted))
+}
+
+/// Placeholder row for a metric that has no data yet (startup / unsupported
+/// platform). Shows the metric name in the normal label style and fills the
+/// gauge area with muted `░` characters so the graph layout is visible.
+fn muted_metric_row(
+    name: &str,
+    cfg: &MetricCfg,
+    width: usize,
+    label_role: Role,
+    theme: &Theme,
+) -> Line<'static> {
+    let name_str = format!("{name} ");
+    let avail = width.saturating_sub(name_str.chars().count());
+    let value_w = if cfg.label { (cfg.label_max as usize).min(avail) } else { 0 };
+    let sep = usize::from(value_w > 0);
+    let bar_w = avail.saturating_sub(value_w + sep);
+
+    let muted_style = theme.style(Role::Muted);
+    let mut spans = vec![Span::styled(name_str, theme.style(label_role))];
+    if bar_w >= 1 {
+        spans.push(muted_fill(bar_w, theme));
+    }
+    if value_w > 0 {
+        spans.push(Span::styled(" ".repeat(sep), muted_style));
+        spans.push(Span::styled(fit_right("---", value_w), muted_style));
+    }
+    Line::from(spans)
+}
+
 /// Render one metric row honoring its `MetricCfg`: the name, an optional gauge
 /// (style per `bar_kind`), and an optional value. `label_max` columns are always
 /// reserved for the value at the right edge, so the gauge width stays stable
@@ -760,10 +812,7 @@ fn metric_row(
     let bar_w = avail.saturating_sub(value_w + sep);
 
     let val_style = Style::default().fg(cascade_fg(theme, value_role));
-    let mut spans = vec![Span::styled(
-        name_str,
-        Style::default().fg(theme.role(label_role)).add_modifier(Modifier::BOLD),
-    )];
+    let mut spans = vec![Span::styled(name_str, theme.style(label_role))];
     if bar_w >= 1 {
         if cfg.bar {
             // Sparklines auto-range to the window's min..max so movement shows
@@ -774,7 +823,7 @@ fn metric_row(
                 "braille" => braille_sparkline(&scale_minmax(history, mn, mx), bar_w),
                 _ => mini_bar(ratio, bar_w), // "bar" and any unknown value
             };
-            spans.push(Span::styled(bar, Style::default().fg(theme.role(bar_role))));
+            spans.push(Span::styled(bar, theme.style(bar_role)));
         } else {
             // Keep the value at the right edge even with the gauge hidden.
             spans.push(Span::styled(" ".repeat(bar_w), val_style));
@@ -886,7 +935,7 @@ fn metric_runtime(id: &'static str, refresh: u64, graph_window: u64, cwd: &std::
 #[inline]
 fn cascade_fg(theme: &Theme, role: Role) -> ratatui::style::Color {
     let c = theme.role(role);
-    if c == ratatui::style::Color::Reset { theme.role(Role::Fg) } else { c }
+    if c == ratatui::style::Color::Reset { theme.role(Role::Base) } else { c }
 }
 
 /// Total and used physical memory in bytes.
@@ -1198,8 +1247,8 @@ fn disk_row(
     let sep = usize::from(value_w > 0);
     let gauge_area = avail.saturating_sub(value_w + sep);
 
-    let lbl = Style::default().fg(theme.role(label_role)).add_modifier(Modifier::BOLD);
-    let bar = Style::default().fg(theme.role(bar_role));
+    let lbl = theme.style(label_role);
+    let bar = theme.style(bar_role);
     let val = Style::default().fg(cascade_fg(theme, value_role));
     let mut spans = vec![Span::styled(name_str, lbl)];
 
@@ -1207,16 +1256,23 @@ fn disk_row(
     // space precedes W so the read gauge does not run into the W label).
     let drew_gauges = if cfg.bar && gauge_area >= 5 {
         let each = (gauge_area - 3) / 2;
-        // Shared auto-range across both series over the graph window.
-        let (rmn, rmx) = range(&ds.r_hist);
-        let (wmn, wmx) = range(&ds.w_hist);
-        let (mn, mx) = (rmn.min(wmn), rmx.max(wmx));
-        let r_g = gauge_str(&cfg.bar_kind, lerp_minmax(ds.r_rate, mn, mx), &scale_minmax(&ds.r_hist, mn, mx), each);
-        let w_g = gauge_str(&cfg.bar_kind, lerp_minmax(ds.w_rate, mn, mx), &scale_minmax(&ds.w_hist, mn, mx), each);
         spans.push(Span::styled("R", lbl));
-        spans.push(Span::styled(r_g, bar));
-        spans.push(Span::styled(" W", lbl));
-        spans.push(Span::styled(w_g, bar));
+        if ds.r_hist.is_empty() {
+            // No rate samples yet (first render): show muted fill on both gauges.
+            spans.push(muted_fill(each, theme));
+            spans.push(Span::styled(" W", lbl));
+            spans.push(muted_fill(each, theme));
+        } else {
+            // Shared auto-range across both series over the graph window.
+            let (rmn, rmx) = range(&ds.r_hist);
+            let (wmn, wmx) = range(&ds.w_hist);
+            let (mn, mx) = (rmn.min(wmn), rmx.max(wmx));
+            let r_g = gauge_str(&cfg.bar_kind, lerp_minmax(ds.r_rate, mn, mx), &scale_minmax(&ds.r_hist, mn, mx), each);
+            let w_g = gauge_str(&cfg.bar_kind, lerp_minmax(ds.w_rate, mn, mx), &scale_minmax(&ds.w_hist, mn, mx), each);
+            spans.push(Span::styled(r_g, bar));
+            spans.push(Span::styled(" W", lbl));
+            spans.push(Span::styled(w_g, bar));
+        }
         true
     } else {
         false
@@ -1400,24 +1456,28 @@ fn prop_line(
         value.to_string()
     };
     Line::from(vec![
-        Span::styled(prefix, Style::default().fg(theme.role(label_role))),
+        Span::styled(prefix, theme.style(label_role)),
         Span::styled(value, Style::default().fg(cascade_fg(theme, value_role))),
     ])
 }
 
-/// Resolve a uid to `name (uid)`, or just `uid` if the name is unavailable.
-fn uid_name(uid: u32) -> String {
+/// The plain username for a uid via `getpwuid`, or `None` if unresolvable —
+/// the lookup `uid_name` (this module's `name (uid)` prop-panel format) and
+/// `ui::middle`'s compact Rows-layout OWNR column both build on.
+pub(crate) fn username(uid: u32) -> Option<String> {
     unsafe {
         let pw = libc::getpwuid(uid as libc::uid_t);
-        if !pw.is_null() {
-            if let Ok(s) = std::ffi::CStr::from_ptr((*pw).pw_name).to_str() {
-                if !s.is_empty() {
-                    return format!("{s} ({uid})");
-                }
-            }
+        if pw.is_null() {
+            return None;
         }
+        let s = std::ffi::CStr::from_ptr((*pw).pw_name).to_str().ok()?;
+        (!s.is_empty()).then(|| s.to_string())
     }
-    uid.to_string()
+}
+
+/// Resolve a uid to `name (uid)`, or just `uid` if the name is unavailable.
+fn uid_name(uid: u32) -> String {
+    username(uid).map(|s| format!("{s} ({uid})")).unwrap_or_else(|| uid.to_string())
 }
 
 /// Resolve a gid to `name (gid)`, or just `gid` if the name is unavailable.
@@ -1438,7 +1498,7 @@ fn gid_name(gid: u32) -> String {
 /// Format a `SystemTime` in local time.
 /// `full=true`  → `YYYY-MM-DD HH:MM:SS`
 /// `full=false` → `MM-DD HH:MM`
-fn fmt_time(t: Option<SystemTime>, full: bool) -> String {
+pub(crate) fn fmt_time(t: Option<SystemTime>, full: bool) -> String {
     let Some(t) = t else { return "-".into() };
     let Ok(d) = t.duration_since(UNIX_EPOCH) else { return "-".into() };
     let secs = d.as_secs() as libc::time_t;
@@ -1459,93 +1519,4 @@ fn fmt_time(t: Option<SystemTime>, full: bool) -> String {
 fn loadavg() -> Option<[f64; 3]> {
     let mut a = [0f64; 3];
     if unsafe { libc::getloadavg(a.as_mut_ptr(), 3) } == 3 { Some(a) } else { None }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn top(width: u16) -> Rect {
-        Rect { x: 0, y: 0, width, height: 7 }
-    }
-
-    #[test]
-    fn no_func_panel_shows_path_only() {
-        let (info, right) = plan_bottom_labels("/a/b", "file.rs", top(90), None, '═');
-        assert!(info.contains("/a/b"), "path is shown");
-        assert!(right.is_none(), "no right segment without a func panel");
-    }
-
-    #[test]
-    fn long_path_without_func_truncates_with_ellipsis() {
-        let long = "/very/long/path/".repeat(10);
-        let (info, right) = plan_bottom_labels(&long, "f.rs", top(40), None, '═');
-        assert!(info.ends_with("… ]"), "overflowing path is …-truncated: {info:?}");
-        assert!(info.chars().count() <= 36, "stays within the available width");
-        assert!(right.is_none());
-    }
-
-    #[test]
-    fn case_a_places_name_after_the_junction() {
-        // Short path, func panel at column 30 → path fits before ╦, name goes right.
-        let (info, right) = plan_bottom_labels("/a", "file.rs", top(90), Some(30), '═');
-        // bottom_info is padded to end exactly before the junction column (30).
-        // start_x = 2, so junc_offset = 28 columns of left text.
-        assert_eq!(info.chars().count(), 28, "left text stops just before ╦");
-        let (x, text) = right.expect("name segment present in Case A");
-        assert_eq!(x, 31, "name starts at func_x + 1");
-        assert!(text.contains("file.rs"), "name segment carries the filename");
-        assert!(text.starts_with('═'), "name segment leads with a rule into the bracket");
-    }
-
-    #[test]
-    fn case_a_works_even_when_junction_exceeds_nav_width() {
-        // Regression for the nav-width binding bug: func_x can sit far to the right
-        // (past where a narrow nav panel would end). The label is budgeted against
-        // the full top width, so the filename is still placed rather than dropped.
-        let (info, right) = plan_bottom_labels("/a", "k.rs", top(90), Some(70), '═');
-        assert_eq!(info.chars().count(), 68, "left text reaches the distant ╦");
-        let (x, text) = right.expect("name still placed past a narrow nav slice");
-        assert_eq!(x, 71);
-        assert!(text.contains("k.rs"));
-    }
-
-    #[test]
-    fn case_b_flows_path_past_junction_with_name_appended() {
-        // Path longer than the junction offset → it overruns ╦; name is appended.
-        let cwd = "/Users/szk/src/github/wasdf/crates/wasdf/src/app";
-        let (info, right) = plan_bottom_labels(cwd, "kernel.rs", top(90), Some(30), '═');
-        assert!(info.contains(cwd), "full path present");
-        assert!(info.contains("═[ kernel.rs ]"), "name appended after the path: {info:?}");
-        assert!(right.is_none(), "Case B carries everything in bottom_info");
-    }
-
-    #[test]
-    fn case_c_truncates_the_name_when_it_overflows() {
-        let cwd = "/Users/szk/src/github/wasdf/crates/wasdf/src/app";
-        // Narrow enough that path fits but the full name does not.
-        let (info, right) = plan_bottom_labels(cwd, "a_very_long_filename.rs", top(64), Some(30), '═');
-        assert!(info.contains(cwd), "path is kept");
-        assert!(info.ends_with("… ]"), "name is …-truncated: {info:?}");
-        assert!(right.is_none());
-    }
-
-    #[test]
-    fn empty_name_never_emits_a_right_segment() {
-        let (info, right) = plan_bottom_labels("/a/b", "", top(90), Some(30), '═');
-        assert!(info.contains("/a/b"));
-        assert!(right.is_none(), "no selection → no filename");
-    }
-
-    #[test]
-    fn empty_name_with_long_path_stays_in_left_zone() {
-        // A path that exceeds junc_offset but fits in available — without the fix
-        // it would overflow into the function panel's title area.
-        // func_x=30 → start_x=2 → junc_offset=28; path "[ /Users/szk/src/github/dotfiles ]" = 35 chars.
-        let cwd = "/Users/szk/src/github/dotfiles";
-        let (info, right) = plan_bottom_labels(cwd, "", top(90), Some(30), '═');
-        assert!(info.chars().count() <= 28, "path clipped to left zone: {}", info.chars().count());
-        assert!(info.ends_with("… ]"), "overflowing path is truncated with ellipsis: {info:?}");
-        assert!(right.is_none());
-    }
 }

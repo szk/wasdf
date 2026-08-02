@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 [lib]
-name = "wasdf_example_ext"
+name = "exampleext"
 crate-type = ["cdylib"]
 
 [dependencies]

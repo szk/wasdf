@@ -5,7 +5,9 @@
 
 pub mod archive;
 pub mod bookmarks;
+pub mod cmdop;
 pub mod loader;
+pub mod lscolors;
 pub mod preview;
 pub mod registry;
 pub mod settings;
@@ -14,41 +16,47 @@ pub mod theme; // bundled id: "theme"
 use std::path::Path;
 use std::sync::Arc;
 
+use ratatui::style::Style;
+use ratatui::Frame;
+use ratatui::layout::Rect;
 use ratatui::text::Line;
 
 use crate::core::state::FunctionPanelState;
-use crate::core::{AppState, ExtensionIntent, Intent, OptionStore, ReadResult, Theme};
+use crate::core::{AppState, Entry, ExtensionIntent, Intent, OptionStore, PanelView, ReadResult, Theme};
 use crate::script::condition::Conditions;
 use crate::script::keymap::Binding;
 use crate::services::command::CommandDef;
-use crate::services::resolver::ResolverEntry;
+use crate::services::resolver::{ResolverEntry, ResolverChain};
 use crate::vfs::VfsProvider;
 
 pub use registry::ExtensionRegistry;
 
-/// What core hands an extension when asking it to render the function panel.
-/// The extension reads `func` (its content + view state) and produces a
-/// [`FunctionDraw`] sized for `width`×`height`.
+/// What core hands an extension when asking it for its function-panel content.
+/// The extension reads `func` (its view state) and the viewport `width`×`height`
+/// and returns a logical [`PanelView`]; core lays it out.
 pub struct FunctionRenderCtx<'a> {
     pub width: u16,
     pub height: u16,
     pub focused: bool,
     pub func: &'a FunctionPanelState,
+    /// The file panel's live operation targets (`AppState::targets`) — the current
+    /// selection or cursor entry. A cross-panel form (the CmdOp builder) reads them
+    /// to show the command's sources; content extensions ignore them.
+    pub sources: &'a [std::path::PathBuf],
     pub theme: &'a Theme,
 }
 
-/// The drawable an extension returns for the function panel. Core owns only the
-/// chrome around it: it vertically scrolls `lines` by `scroll`, blits them,
-/// draws the border/`title` and a scrollbar (when `total` exceeds the viewport),
-/// and an optional bottom-row `prompt` (e.g. a search input). The extension owns
-/// everything inside the lines (syntax color, search highlight, h-scroll, line
-/// numbers).
+/// Core's **internal** laid-out drawable for the function panel: the product of
+/// laying out a logical [`PanelView`] (see `ui/middle/function.rs`), consumed by
+/// the panel blitter. It is no longer produced by extensions — they return a
+/// `PanelView` and core owns all layout — but it remains the seam between the
+/// layout step and the blit/chrome step: core vertically scrolls `lines` by
+/// `scroll`, draws the border/`title`, a scrollbar (when `total` exceeds the
+/// viewport), and an optional bottom-row `prompt` (the search input).
 ///
-/// `total` (content rows) and `width` (content columns) are the content's
-/// intrinsic dimensions the extension reports — the lines themselves are already
-/// windowed/h-scrolled, so core cannot recover them. Core pairs each with the
-/// viewport size to bound scrolling and discard over-scroll input; the extension
-/// owns the content, core owns the viewport and the kernel-owned offsets.
+/// `total` (content rows) and `width` (content columns) are the laid-out content's
+/// intrinsic dimensions; core pairs each with the viewport to bound scrolling and
+/// discard over-scroll input.
 pub struct FunctionDraw {
     pub lines: Vec<Line<'static>>,
     pub title: String,
@@ -60,10 +68,44 @@ pub struct FunctionDraw {
     pub prompt: Option<Line<'static>>,
 }
 
+/// An extension's About card — its display name, version, and a one-line
+/// description — shown under `@/settings/Extensions/<id>` alongside its settings.
+#[derive(Debug, Clone)]
+pub struct About {
+    /// Human-facing name (defaults to the id).
+    pub name: String,
+    /// Version string (defaults to the app version).
+    pub version: String,
+    /// One-line description of what the extension does.
+    pub description: String,
+}
+
+impl About {
+    /// An About card with the app version and the given name/description.
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        About {
+            name: name.into(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            description: description.into(),
+        }
+    }
+}
+
 /// One interface, collected once at registration. Methods default to empty so
 /// an extension declares only what it provides.
 pub trait Extension: Send {
     fn id(&self) -> &str;
+
+    /// The extension's About / version card, shown under its settings screen.
+    /// Defaults to the id, the app version, and no description; extensions
+    /// override to describe themselves.
+    fn about(&self) -> About {
+        About {
+            name: self.id().to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            description: String::new(),
+        }
+    }
 
     /// Palette commands contributed by the extension.
     fn commands(&self) -> Vec<CommandDef> {
@@ -79,6 +121,11 @@ pub trait Extension: Send {
     /// Extensions that need to read their own options stash the store here; the
     /// default no-op leaves existing extensions unaffected.
     fn bind_store(&self, _store: &Arc<OptionStore>) {}
+
+    /// Called once at registration with the resolver chain, for extensions that
+    /// build external command lines (option/skeleton lookup) — e.g. the CmdOp
+    /// command builder, which has no `CmdCtx` inside `handle_intent`. Default no-op.
+    fn bind_services(&self, _resolver: &Arc<ResolverChain>) {}
 
     /// The extension's declarative Scheme source, evaluated in the resident Scheme session
     /// at registration. The `what/when` of the extension — keymaps and the like
@@ -97,10 +144,11 @@ pub trait Extension: Send {
     ///   (option "ext.tab-width" "Ext" (int 1 8) "4" "tab-width")))
     /// ```
     ///
-    /// Each declared option automatically appears in SETTINGS, persists to
-    /// `config.scm`, and is readable via the shared `OptionStore` — with zero
-    /// edits to core. Default `None` leaves no options (existing extensions are
-    /// unaffected).
+    /// Each declared option is tagged with this extension's id and automatically
+    /// appears under `@/settings/Extensions/<id>` (its own per-extension settings
+    /// screen, generated dynamically), persists to `config.scm`, and is readable
+    /// via the shared `OptionStore` (bundled) or a `wasdf_sdk::Settings` snapshot
+    /// (dynamic) — with zero edits to core. Default `None` leaves no options.
     fn option_scheme(&self) -> Option<String> {
         None
     }
@@ -110,10 +158,20 @@ pub trait Extension: Send {
         Vec::new()
     }
 
-    /// VFS providers contributed by this extension. Added after the embedded
-    /// defaults (filesystem, bookmarks), before the user layer.
+    /// VFS providers contributed by this extension (its own mount, typically
+    /// named after `id()`). Added after the embedded filesystem default, before
+    /// the user layer.
     fn vfs_providers(&self) -> Vec<Box<dyn VfsProvider>> {
         Vec::new()
+    }
+
+    /// Per-entry color override for the file-list grid (PANEL_FILE and any
+    /// path-valued Select sharing the same renderer). `None` means "no
+    /// opinion" — the renderer falls back to its built-in dir/symlink/default
+    /// coloring. `ExtensionRegistry::entry_style` takes the first `Some` in
+    /// registration order (mirrors `provider()`'s first-wins contract).
+    fn entry_style(&self, _entry: &Entry) -> Option<Style> {
+        None
     }
 
     /// Register `:when` predicates into the evaluator.
@@ -129,15 +187,18 @@ pub trait Extension: Send {
     /// Receive the raw read result core fetched off-thread for `path` (a
     /// `Plan::Read` this extension's provider role triggered). The extension
     /// decodes it (MIME, highlight, …) and stashes it internally (interior
-    /// mutability); `render_function` later renders from that stash. Runs on the
+    /// mutability); `view` later renders from that stash. Runs on the
     /// main thread; core retains nothing.
     fn accept_content(&self, _path: &Path, _result: &ReadResult) {}
 
-    /// Render this extension's function-panel content for the given viewport.
-    /// The extension owns the drawing (windowing, syntax color, search
-    /// highlight, h-scroll, line numbers); core only blits the result and draws
-    /// chrome. `None` means "nothing to draw" (core shows a placeholder).
-    fn render_function(&self, _ctx: &FunctionRenderCtx) -> Option<FunctionDraw> {
+    /// Produce this extension's function-panel content as a logical [`PanelView`]
+    /// (sections / fields / lines of role- or color-styled spans). **Core owns the
+    /// layout** — label alignment, line wrapping / h-scroll, vertical scroll, line
+    /// numbers, theming, and search-match highlighting; the extension only
+    /// describes *what* to show. `None` means "nothing to draw" (core shows a
+    /// placeholder). This is the single pull-render path, replacing the old
+    /// extension-assembled `FunctionDraw`.
+    fn view(&self, _ctx: &FunctionRenderCtx) -> Option<PanelView> {
         None
     }
 
@@ -146,9 +207,22 @@ pub trait Extension: Send {
         Vec::new()
     }
 
-    /// Subtrees grafted under `@/settings/<category>`. The `SettingsProvider`
-    /// appends one virtual dir per node under the matching category listing and
-    /// delegates any deeper path to the owning node. Default: none.
+    /// Draw an **interactive form** directly into the function panel's inner rect
+    /// (the deferred per-panel-renderer surface, bundled-only — a `Frame` does not
+    /// cross the ABI). Called by core when `form_owner` names this extension.
+    /// Returns the panel title; core wraps the border/title/open-bottom chrome and
+    /// owns the rect, so the interior is the extension's and the chrome is core's.
+    /// The extension self-clamps any scroll it owns (it has `ctx` + interior
+    /// mutability). `None` means "not hosting a form".
+    fn render_form(&self, _frame: &mut Frame, _inner: Rect, _ctx: &FunctionRenderCtx) -> Option<String> {
+        None
+    }
+
+    /// Subtrees grafted under `@/settings/<category>`, or onto this
+    /// extension's own screen at `@/settings/Extensions/<id>` (anchor the
+    /// node's "category" to `id()`, e.g. lscolors' Themes). The
+    /// `SettingsProvider` appends one virtual dir per node under the matching
+    /// listing and delegates any deeper path to the owning node. Default: none.
     fn settings_nodes(&self) -> Vec<Arc<dyn crate::extension::settings::SettingsNode>> {
         Vec::new()
     }
@@ -164,9 +238,18 @@ pub trait Extension: Send {
     }
 }
 
-/// Construct the bundled extensions. The only place they are named.
-/// Note: `BookmarksExtension` is built separately in the kernel so it can share
-/// its `Arc` with the VFS bookmarks provider; it is registered there.
-pub fn bundled() -> Vec<Box<dyn Extension>> {
-    vec![Box::new(preview::PreviewExtension::default()), Box::new(archive::ArchiveExtension)]
+/// Construct the bundled extensions. The only place they are named. (Settings
+/// and theme are built separately in the kernel — they need a shared `Arc`
+/// held on `App` itself for the per-frame `resolve_active()` read — and
+/// registered there instead.) `config_dir` is handed to any extension that
+/// persists its own state (bookmarks, lscolors) — the kernel only knows the
+/// directory; the file name inside it is that extension's own business.
+pub fn bundled(config_dir: Option<std::path::PathBuf>) -> Vec<Box<dyn Extension>> {
+    vec![
+        Box::new(preview::PreviewExtension::default()),
+        Box::new(archive::ArchiveExtension),
+        Box::new(cmdop::CmdOpExtension::default()),
+        Box::new(bookmarks::BookmarksExtension::new(config_dir.clone())),
+        Box::new(lscolors::LsColorsExtension::new(config_dir)),
+    ]
 }

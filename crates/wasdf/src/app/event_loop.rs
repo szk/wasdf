@@ -56,6 +56,11 @@ pub fn run(cwd: PathBuf) -> io::Result<()> {
     });
 
     let result = loop {
+        // Surface any diagnostic that reached the @/messages log without
+        // going through a notice (boot config warnings, loader failures) —
+        // before the draw, so it shows this frame, and on every pass
+        // (including Tick), so boot diagnostics appear at launch.
+        app.surface_new_messages();
         let top_opts = {
             let s = &app.store;
             crate::ui::top::TopOptions {
@@ -71,6 +76,7 @@ pub fn run(cwd: PathBuf) -> io::Result<()> {
                     rail: s.get_str("scrollbar-rail"),
                     disabled: s.get_str("scrollbar-disabled"),
                 },
+                file_row_size_graph: s.get_bool("file-row-size-graph"),
             }
         };
         let theme = app.theme_registry.read().unwrap().resolve_active();
@@ -78,11 +84,11 @@ pub fn run(cwd: PathBuf) -> io::Result<()> {
             break Err(e);
         }
         // The reducer advances function scroll/hscroll blindly (it can't see the
-        // viewport); clamp both to the bounds the render just measured so over-scroll
-        // — vertical and horizontal — is discarded rather than left to drift.
-        let (fmax, fhmax) = (app.ui.function_max_scroll(), app.ui.function_hmax_scroll());
-        app.state.function.scroll = app.state.function.scroll.min(fmax);
-        app.state.function.hscroll = app.state.function.hscroll.min(fhmax);
+        // viewport); feed the render-measured bounds back into each kernel-owned
+        // Scroll: bind folds in the bound and clamps the offset, so over-scroll is
+        // discarded and reversing direction moves immediately.
+        app.state.function.scroll.bind(app.ui.function_max_scroll());
+        app.state.function.hscroll.bind(app.ui.function_hmax_scroll());
         // Refresh the file-list geometry the renderer just measured, so the
         // reducer's 2-D cursor movement matches what is on screen.
         app.state.list_geom = app.ui.list_geom();

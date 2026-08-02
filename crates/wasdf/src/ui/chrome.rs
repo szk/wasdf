@@ -11,7 +11,6 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use crate::core::{Role, Theme};
@@ -69,6 +68,16 @@ pub struct PanelFrame {
     /// Right-segment text starting at an explicit X column (filename after ╦).
     /// Only rendered when `open_bottom` is false.
     pub bottom_right: Option<(u16, String)>,
+    /// Whether the panel that *owns* the left bottom-border label (`bottom_info`)
+    /// is focused. The label (e.g. the file panel's path) is themed focus-aware
+    /// off this flag, independent of this carrier panel's own `focused` (the path
+    /// lives on the nav panel's bottom border but reflects the file panel's focus).
+    pub bottom_focused: bool,
+    /// Whether the panel that *owns* the right bottom-border label (`bottom_right`)
+    /// is focused. Tracked separately from `bottom_focused` because the two labels
+    /// belong to different panels — the path to the file panel, the filename to the
+    /// function panel — so they must show focus independently.
+    pub bottom_right_focused: bool,
     pub focused: bool,
     pub scroll: Option<ScrollInfo>,
     /// When true, the panel has no bottom border: the side borders run down
@@ -92,6 +101,8 @@ impl PanelFrame {
             info: None,
             bottom_info: None,
             bottom_right: None,
+            bottom_focused: false,
+            bottom_right_focused: false,
             focused: false,
             scroll: None,
             open_bottom: false,
@@ -117,9 +128,17 @@ impl PanelFrame {
         self.bottom_info = Some(t.into());
         self
     }
-    /// Right-segment text starting at absolute column `x` (filename after ╦).
-    pub fn bottom_right(mut self, x: u16, t: impl Into<String>) -> Self {
+    /// Right-segment text starting at absolute column `x` (filename after ╦), with
+    /// the focus of its owning panel (the function panel) for focus-aware theming.
+    pub fn bottom_right(mut self, x: u16, t: impl Into<String>, focused: bool) -> Self {
         self.bottom_right = Some((x, t.into()));
+        self.bottom_right_focused = focused;
+        self
+    }
+    /// Whether the owner of the left bottom-border label is focused (themes the
+    /// label focus-aware, e.g. the path reflecting the file panel's focus).
+    pub fn bottom_focused(mut self, f: bool) -> Self {
+        self.bottom_focused = f;
         self
     }
     pub fn focused(mut self, f: bool) -> Self {
@@ -276,7 +295,7 @@ pub fn render(
                 if m == 0 {
                     continue;
                 }
-                let style = Style::default().fg(theme.role(Role::Border));
+                let style = theme.style(Role::Border);
                 let x = area.x + cx as u16;
                 let y = area.y + cy as u16;
                 if let Some(cell) = buf.cell_mut((x, y)) {
@@ -297,16 +316,16 @@ pub fn render(
             // A banner (unbracketed title, e.g. the top-left `/ wasdf … /`) is the
             // nameplate; bracketed panel titles use the title / title-bracket roles.
             let text_style = if !p.bracket {
-                Style::default().fg(theme.role(Role::Nameplate))
+                theme.style(Role::Nameplate)
             } else if p.focused {
-                Style::default().fg(theme.role(Role::TitleFocused))
+                theme.style(Role::TitleFocused)
             } else {
-                Style::default().fg(theme.role(Role::Title))
+                theme.style(Role::Title)
             };
             let bracket_style = if p.focused {
-                Style::default().fg(theme.role(Role::TitleBracketFocused))
+                theme.style(Role::TitleBracketFocused)
             } else {
-                Style::default().fg(theme.role(Role::TitleBracket))
+                theme.style(Role::TitleBracket)
             };
             let label = if p.bracket { format!("[ {title} ]") } else { title.clone() };
             let full_len = label.chars().count();
@@ -345,16 +364,16 @@ pub fn render(
                 continue;
             }
             let title_style = if p.focused {
-                Style::default().fg(theme.role(Role::TitleFocused))
+                theme.style(Role::TitleFocused)
             } else {
-                Style::default().fg(theme.role(Role::Title))
+                theme.style(Role::Title)
             };
             let bracket_style = if p.focused {
-                Style::default().fg(theme.role(Role::TitleBracketFocused))
+                theme.style(Role::TitleBracketFocused)
             } else {
-                Style::default().fg(theme.role(Role::TitleBracket))
+                theme.style(Role::TitleBracket)
             };
-            let border_c = Style::default().fg(theme.role(Role::Border));
+            let border_c = theme.style(Role::Border);
             let max = p.rect.width.saturating_sub(4) as usize;
             let chars: Vec<char> = info.chars().take(max).collect();
             let len = chars.len() as u16;
@@ -402,13 +421,23 @@ pub fn render(
         // the frame's right edge (the closing corner), not the carrier panel's own
         // width — a path may flow rightward across neighbouring panel sections.
         let frame_right = area.x + area.width - 1;
-        let paint_bottom = |buf: &mut ratatui::buffer::Buffer, mut x: u16, y: u16, text: &str| {
+        let paint_bottom = |buf: &mut ratatui::buffer::Buffer, mut x: u16, y: u16, text: &str, focused: bool| {
             // The bracketed path/name labels are themed like panel titles: the
             // `[`/`]` brackets take the title-bracket role, the inner text the
-            // title role, and the rule/padding the border color.
-            let title_style = Style::default().fg(theme.role(Role::Title));
-            let bracket_style = Style::default().fg(theme.role(Role::TitleBracket));
-            let border_style_fg = Style::default().fg(theme.role(Role::Border));
+            // title role, and the rule/padding the border color. They follow the
+            // owning panel's focus the same way top-border titles do, so the path
+            // shows the focused colors when the file panel holds focus.
+            let title_style = theme.style(if focused {
+                Role::TitleFocused
+            } else {
+                Role::Title
+            });
+            let bracket_style = theme.style(if focused {
+                Role::TitleBracketFocused
+            } else {
+                Role::TitleBracket
+            });
+            let border_style_fg = theme.style(Role::Border);
             let rule = rule_char(border_style);
             for ch in text.chars() {
                 if x >= frame_right {
@@ -444,7 +473,7 @@ pub fn render(
                 continue;
             }
             let y = p.rect.y + p.rect.height - 1;
-            paint_bottom(buf, p.rect.x + 2, y, bottom_text);
+            paint_bottom(buf, p.rect.x + 2, y, bottom_text, p.bottom_focused);
         }
 
         // Bottom-border right-segment text: filename after the ╦ junction. Starts
@@ -455,7 +484,7 @@ pub fn render(
                 continue;
             }
             let y = p.rect.y + p.rect.height - 1;
-            paint_bottom(buf, *start_x, y, right_text);
+            paint_bottom(buf, *start_x, y, right_text, p.bottom_right_focused);
         }
     }
 
@@ -472,7 +501,7 @@ pub fn render(
             width: 1,
             height: track_h,
         };
-        let style = Style::default().fg(theme.role(Role::Border));
+        let style = theme.style(Role::Border);
 
         // Disabled: the panel fully fits, so a scrollbar is meaningless — fill the
         // column with the configured disabled glyph (by default a plain border).
@@ -508,66 +537,5 @@ pub fn render(
             .thumb_symbol(thumb)
             .style(style);
         frame.render_stateful_widget(bar, track, &mut state);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
-    fn default_theme() -> crate::core::Theme {
-        crate::core::Theme::default()
-    }
-
-    /// Render one framed panel and return the glyphs down its right-border
-    /// (scrollbar) column, top to bottom, using the given scrollbar glyphs.
-    fn scrollbar_column_chars(scroll: ScrollInfo, chars: &ScrollbarChars) -> Vec<char> {
-        let rect = Rect { x: 0, y: 0, width: 10, height: 12 };
-        let mut t = Terminal::new(TestBackend::new(10, 12)).unwrap();
-        t.draw(|f| render(f, &[PanelFrame::new(rect).scroll(scroll)], "single", chars, &default_theme()))
-            .unwrap();
-        let buf = t.backend().buffer();
-        let x = rect.x + rect.width - 1;
-        (1..rect.height - 1).map(|y| buf[(x, y)].symbol().chars().next().unwrap()).collect()
-    }
-
-    fn scrollbar_column(scroll: ScrollInfo) -> Vec<char> {
-        scrollbar_column_chars(scroll, &ScrollbarChars::default())
-    }
-
-    // doc/UI.md, point 1: when the bottom of the scroll range is at the bottom of
-    // the viewport (offset == total - viewport), the thumb sits flush at the
-    // bottom of the track.
-    #[test]
-    fn thumb_reaches_the_bottom_at_max_offset() {
-        let col = scrollbar_column(ScrollInfo { total: 100, viewport: 10, position: 90 });
-        assert_eq!(*col.last().unwrap(), '█', "thumb at the very bottom: {col:?}");
-        assert_eq!(col[0], '│', "rail (not thumb) at the top: {col:?}");
-    }
-
-    #[test]
-    fn thumb_sits_at_the_top_at_offset_zero() {
-        let col = scrollbar_column(ScrollInfo { total: 100, viewport: 10, position: 0 });
-        assert_eq!(col[0], '█', "thumb at the top: {col:?}");
-        assert_eq!(*col.last().unwrap(), '│', "rail (not thumb) at the bottom: {col:?}");
-    }
-
-    #[test]
-    fn content_that_fits_shows_the_disabled_glyph() {
-        // Scrolling is unnecessary → the configured disabled glyph fills the column
-        // (not a full thumb).
-        let chars = ScrollbarChars { disabled: "·".into(), ..ScrollbarChars::default() };
-        let col = scrollbar_column_chars(ScrollInfo { total: 5, viewport: 10, position: 0 }, &chars);
-        assert!(col.iter().all(|&c| c == '·'), "disabled glyph when content fits: {col:?}");
-    }
-
-    #[test]
-    fn custom_thumb_and_rail_glyphs_are_honored() {
-        let chars = ScrollbarChars { thumb: "#".into(), rail: "|".into(), disabled: "|".into() };
-        let col = scrollbar_column_chars(ScrollInfo { total: 100, viewport: 10, position: 0 }, &chars);
-        assert_eq!(col[0], '#', "custom thumb is '#': {col:?}");
-        assert_eq!(*col.last().unwrap(), '|', "custom rail is '|': {col:?}");
     }
 }

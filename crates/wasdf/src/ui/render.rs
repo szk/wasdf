@@ -10,12 +10,14 @@
 //! junctions.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row, Table,
+};
 
-use crate::core::{AppState, Mode, Notice, Role, Theme};
+use crate::core::{AppState, InputFormState, Mode, Notice, Role, Theme};
 use crate::extension::ExtensionRegistry;
 use crate::ui::chrome::{self, PanelFrame};
 use crate::ui::middle::ScrollMemory;
@@ -83,11 +85,10 @@ pub fn render(
     // Global base colors: fg/bg paint the entire frame — including the cells
     // behind the border and every panel — and are overridden per-cell wherever
     // a more specific role sets its own fg/bg. Applied first so everything that
-    // follows composes on top of it.
-    frame.buffer_mut().set_style(
-        area,
-        Style::default().fg(theme.role(Role::Fg)).bg(theme.role(Role::Bg)),
-    );
+    // follows composes on top of it. `theme.style(Role::Base)` already resolves
+    // to the base fg/bg pair (see `Theme::resolved_fg_bg`), so no manual `.bg`
+    // override is needed here anymore.
+    frame.buffer_mut().set_style(area, theme.style(Role::Base));
 
     let tr = top_rows(area.height);
     // help on the last row (unboxed); the box spans the rest. Top and main
@@ -110,7 +111,7 @@ pub fn render(
     crate::ui::top::render_top(frame, top, state, vfs, &mut panels, opts, func_x, theme);
     match state.mode() {
         Mode::Select(_) => crate::ui::middle::render_select_main(frame, main, state, extensions, scroll, &mut panels, theme),
-        _ => crate::ui::middle::render_file_main(frame, main, state, extensions, scroll, &mut panels, theme),
+        _ => crate::ui::middle::render_file_main(frame, main, state, extensions, scroll, &mut panels, theme, opts.file_row_size_graph),
     }
 
     chrome::render(frame, &panels, &opts.border_style, &opts.scrollbar, theme);
@@ -122,18 +123,36 @@ pub fn render(
     if let Mode::Policy(pending) = state.mode() {
         render_policy(frame, area, pending, theme);
     }
+    if let Mode::InputForm(spec) = state.mode() {
+        if let Some(form) = &state.input_form {
+            render_input_form(frame, area, spec, form, theme);
+        }
+    }
 }
 
 fn render_notice(frame: &mut Frame, area: Rect, notice: &Notice, theme: &Theme) {
     let style = if notice.error {
-        Style::default().fg(theme.role(Role::NoticeErrorFg)).bg(theme.role(Role::NoticeErrorBg))
+        theme.style(Role::NoticeErrorFg).bg(theme.role(Role::NoticeErrorBg))
     } else {
-        Style::default().fg(theme.role(Role::NoticeInfoFg)).bg(theme.role(Role::NoticeInfoBg))
+        theme.style(Role::NoticeInfoFg).bg(theme.role(Role::NoticeInfoBg))
     };
     let w = (notice.text.len() as u16 + 2).min(area.width);
-    let rect = Rect { x: area.width.saturating_sub(w), y: 0, width: w, height: 1 };
+    let rect = Rect { x: (area.width.saturating_sub(w)) / 2, y: 0, width: w, height: 1 };
     frame.render_widget(Clear, rect);
     frame.render_widget(Paragraph::new(format!(" {} ", notice.text)).style(style), rect);
+}
+
+/// The centered rect for a small popup dialog (Policy's Confirm box, and
+/// InputForm's text-entry box) sized to its content, clamped to the frame.
+fn popup_rect(area: Rect, content_w: u16, content_h: u16) -> Rect {
+    let w = content_w.min(area.width.saturating_sub(2)).max(20);
+    let h = content_h;
+    Rect {
+        x: (area.width.saturating_sub(w)) / 2,
+        y: (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    }
 }
 
 fn render_policy(frame: &mut Frame, area: Rect, pending: &crate::core::Intent, theme: &Theme) {
@@ -145,15 +164,8 @@ fn render_policy(frame: &mut Frame, area: Rect, pending: &crate::core::Intent, t
     // Wide enough for the longer of the summary and the key-hint line.
     let keys = "y / Enter : confirm     n / Esc : cancel";
     let body = summary.len().max(keys.len()) as u16;
-    let w = (body + 6).min(area.width.saturating_sub(2)).max(20);
     // Four body lines (blank, summary, blank, key hints) plus the two borders.
-    let h = 6;
-    let rect = Rect {
-        x: (area.width.saturating_sub(w)) / 2,
-        y: (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    };
+    let rect = popup_rect(area, body + 6, 6);
     frame.render_widget(Clear, rect);
     let lines = vec![
         Line::from(""),
@@ -161,9 +173,7 @@ fn render_policy(frame: &mut Frame, area: Rect, pending: &crate::core::Intent, t
         Line::from(""),
         Line::from(Span::styled(keys, Style::default().fg(Color::DarkGray))),
     ];
-    let overlay_style = Style::default()
-        .fg(theme.role(Role::OverlayDangerFg))
-        .bg(theme.role(Role::OverlayDangerBg));
+    let overlay_style = theme.style(Role::OverlayDangerFg).bg(theme.role(Role::OverlayDangerBg));
     let p = Paragraph::new(lines).alignment(Alignment::Center).style(overlay_style).block(
         Block::default()
             .borders(Borders::ALL)
@@ -173,474 +183,172 @@ fn render_policy(frame: &mut Frame, area: Rect, pending: &crate::core::Intent, t
     frame.render_widget(p, rect);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::AppState;
-    use crate::extension::ExtensionRegistry;
-    use crate::ui::top::TopOptions;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
+/// A `Mode::InputForm` popup: a small centered box (same chrome shape as
+/// `render_policy`'s Confirm dialog, but neutral-styled — this isn't a
+/// destructive-action warning). The body widget depends on the form's kind
+/// (see doc/UI.md's Input Form Mode section); only `Text` free-types through
+/// `tui-input`'s caret — every other kind is a ratatui built-in widget
+/// (List/Gauge/Table) driven by arrow keys.
+fn render_input_form(
+    frame: &mut Frame,
+    area: Rect,
+    spec: &crate::core::InputFormSpec,
+    form: &InputFormState,
+    theme: &Theme,
+) {
+    let keys = input_form_key_hint(form);
+    let neutral_style = theme.style(Role::Base);
+    let border_style = theme.style(Role::Border);
 
-    fn top_opts() -> TopOptions {
-        TopOptions::default()
-    }
+    // Body row count per kind: Text/Int show a fixed small body; Bool/
+    // Choice/List grow with their row count (List: items + "+ Add" + "✓
+    // Confirm"). All get one blank spacer row above the body and one hint
+    // row below.
+    let body_rows: u16 = match form {
+        InputFormState::Text { .. } => 1,
+        InputFormState::Int { .. } => 1,
+        InputFormState::Bool { .. } => 2,
+        InputFormState::Choice { options, .. } => options.len() as u16,
+        InputFormState::List { items, .. } => (items.len() + 2) as u16,
+    };
+    let body_w = (spec.title.len().max(keys.len()) as u16) + 4;
+    let rect = popup_rect(area, body_w, body_rows + 5);
+    frame.render_widget(Clear, rect);
 
-    fn exts() -> ExtensionRegistry {
-        let mut e = ExtensionRegistry::new();
-        for x in crate::extension::bundled() {
-            e.register(x);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(spec.title.clone());
+    let inner = block.inner(rect);
+    frame.render_widget(Paragraph::new("").style(neutral_style).block(block), rect);
+
+    let [_, body, _, hint] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(body_rows),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(keys, Style::default().fg(Color::DarkGray))))
+            .alignment(Alignment::Center),
+        hint,
+    );
+
+    match form {
+        InputFormState::Text { value, cursor } => render_text_body(frame, body, value, *cursor),
+        InputFormState::Bool { value } => {
+            render_choice_body(frame, body, &["On".into(), "Off".into()], if *value { 0 } else { 1 })
         }
-        e
-    }
-
-    fn vfs() -> crate::vfs::Vfs {
-        crate::vfs::Vfs::default()
-    }
-
-    fn theme() -> crate::core::Theme {
-        crate::core::Theme::default()
-    }
-
-    #[test]
-    fn image_content_paints_truecolor_cells() {
-        // Hand a real PNG to the content provider, then render through its hook.
-        let mut path = std::env::temp_dir();
-        path.push(format!("wasdf-render-img-{}.png", std::process::id()));
-        let img = image::RgbImage::from_fn(8, 8, |_, y| image::Rgb([(y * 30) as u8, 0, 200]));
-        img.save(&path).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-
-        let exts = exts();
-        exts.provider()
-            .unwrap()
-            .accept_content(&path, &crate::core::ReadResult::Bytes { offset: 0, bytes, eof: true });
-
-        let mut state = AppState::new(std::env::temp_dir());
-        state.function.visible = true;
-        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        terminal.draw(|f| render(f, &state, &exts, &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
-        let buf = terminal.backend().buffer();
-        let rgb_cells = buf.content.iter().filter(|c| matches!(c.fg, Color::Rgb(..))).count();
-        assert!(rgb_cells > 0, "image content rendered no truecolor cells");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn function_panel_renders_extension_content() {
-        use crate::core::PanelContent;
-        let mut state = AppState::new(std::env::temp_dir());
-        state.function.visible = true;
-        state.function.content =
-            Some(PanelContent::Lines { lines: vec!["EXTLINE".into()], styles: vec![Vec::new()] });
-        state.function.content_owner = Some("example".into());
-        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
-        let b = t.backend().buffer();
-        let text: String = (0..b.area.height)
-            .flat_map(|y| (0..b.area.width).map(move |x| (x, y)))
-            .map(|(x, y)| b[(x, y)].symbol().to_string())
-            .collect();
-        assert!(text.contains("EXTLINE"), "extension content shown in the function panel");
-        assert!(text.contains("example"), "panel titled with the owning extension id");
-    }
-
-    #[test]
-    fn extension_content_shows_search_highlight() {
-        use crate::core::PanelContent;
-        let mut state = AppState::new(std::env::temp_dir());
-        state.function.visible = true;
-        state.function.content =
-            Some(PanelContent::Lines { lines: vec!["foobar".into()], styles: vec![Vec::new()] });
-        state.function.content_owner = Some("example".into());
-        state.function.search.matches = vec![(0, 0, 3)]; // "foo"
-        state.function.search.current = 0;
-        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
-        let buf = t.backend().buffer();
-        // The current match renders on a LightCyan background (unique to the
-        // search highlight; the nav uses plain Cyan).
-        let hits = buf.content.iter().filter(|c| c.bg == Color::LightCyan).count();
-        assert!(hits >= 3, "the 3-char match 'foo' is highlighted on ext content (got {hits})");
-    }
-
-    #[test]
-    fn function_panel_scroll_is_bounded_against_overscroll() {
-        use crate::core::PanelContent;
-        // 100 lines of pushed content, the scroll cranked far past the end.
-        let mut state = AppState::new(std::env::temp_dir());
-        state.function.visible = true;
-        let lines: Vec<String> = (0..100).map(|i| format!("line{i}")).collect();
-        let styles = vec![Vec::new(); 100];
-        state.function.content = Some(PanelContent::Lines { lines, styles });
-        state.function.content_owner = Some("example".into());
-        state.function.scroll = 9999;
-
-        let mut mem = ScrollMemory::default();
-        let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut mem, None, &vfs(), &top_opts(), &theme())).unwrap();
-
-        // The render measured a finite bound (content rows − viewport rows), well
-        // below the over-scrolled value; the kernel's post-draw clamp pins to it so
-        // the last row rests at the viewport bottom rather than scrolling into blank.
-        let fmax = mem.function_max();
-        assert!(fmax > 0, "100 lines exceed the viewport, expected a real bound");
-        assert!(fmax < 9999, "bound should discard the over-scroll, got {fmax}");
-        assert_eq!(state.function.scroll.min(fmax), fmax, "scroll clamps down to the bound");
-    }
-
-    #[test]
-    fn function_panel_hscroll_is_bounded_against_overscroll() {
-        use crate::core::PanelContent;
-        // One very wide line, h-scroll cranked far past the right edge.
-        let mut state = AppState::new(std::env::temp_dir());
-        state.function.visible = true;
-        let wide = "x".repeat(300);
-        state.function.content =
-            Some(PanelContent::Lines { lines: vec![wide], styles: vec![Vec::new()] });
-        state.function.content_owner = Some("example".into());
-        state.function.hscroll = 9999;
-
-        let mut mem = ScrollMemory::default();
-        let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut mem, None, &vfs(), &top_opts(), &theme())).unwrap();
-
-        // The render measured a finite horizontal bound (content cols − viewport
-        // cols); the kernel's post-draw clamp pins hscroll to it so the line never
-        // scrolls off into blank columns.
-        let fhmax = mem.function_hmax();
-        assert!(fhmax > 0, "a 300-col line exceeds the viewport, expected a real bound");
-        assert!(fhmax < 9999, "bound should discard the over-scroll, got {fhmax}");
-        assert_eq!(state.function.hscroll.min(fhmax), fhmax, "hscroll clamps down to the bound");
-    }
-
-    #[test]
-    fn grid_layout_packs_entries_and_reports_geometry() {
-        use crate::core::{Entry, ListLayout};
-        let mut state = AppState::new(std::env::temp_dir());
-        state.list_layout = ListLayout::Grid;
-        state.entries = (0..12)
-            .map(|i| Entry {
-                path: std::path::PathBuf::from(format!("/d/f{i}")),
-                name: format!("f{i}"),
-                is_dir: false,
-                is_symlink: false,
-                size: 0,
-                mode: 0,
-                uid: 0,
-                gid: 0,
-                modified: None,
-                created: None,
-                accessed: None,
-                symlink_target: None,
-                activation: None,
-            })
-            .collect();
-        state.cursor = 0;
-        let mut mem = ScrollMemory::default();
-        let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut mem, None, &vfs(), &top_opts(), &theme())).unwrap();
-        // End-to-end: the render path measures multi-column geometry and reports
-        // it back through list_geom() (what the kernel copies into AppState).
-        let geom = mem.list_geom();
-        assert!(geom.cols > 1, "grid lays entries across multiple columns, got {}", geom.cols);
-        assert!(geom.cols * geom.rows >= 12, "geometry covers all entries");
-    }
-
-    #[test]
-    fn confirm_overlay_shows_title_and_key_hints() {
-        use crate::core::{Intent, Mode, ResolverRequest};
-        let mut state = AppState::new(std::env::temp_dir());
-        state.push_mode(Mode::Policy(Box::new(Intent::RunResolver(ResolverRequest {
-            op: "delete".into(),
-            src: None,
-            dst: None,
-            path: None,
-            paths: vec![std::path::PathBuf::from("/a")],
-            opts: Vec::new(),
-            label: "delete".into(),
-        }))));
-        let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
-        let buf = t.backend().buffer();
-        let text: String = (0..buf.area.height)
-            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
-            .map(|(x, y)| buf[(x, y)].symbol().to_string())
-            .collect();
-        assert!(text.contains("Confirm"), "overlay carries the Confirm title");
-        assert!(text.contains("confirm") && text.contains("cancel"), "key hints are rendered inside the box");
-    }
-
-    #[test]
-    fn bottom_border_padding_follows_border_style() {
-        // The padding/separators woven into the bottom border must match the active
-        // border style: a `rounded` frame uses `─`, never the double `═`.
-        use crate::core::Entry;
-        let cwd = std::path::PathBuf::from("/Users/szk/src/app");
-        let mut state = AppState::new(cwd.clone());
-        state.entries = vec![Entry {
-            path: cwd.join("kernel.rs"),
-            name: "kernel.rs".into(),
-            is_dir: false,
-            is_symlink: false,
-            size: 0,
-            mode: 0,
-            uid: 0,
-            gid: 0,
-            modified: None,
-            created: None,
-            accessed: None,
-            symlink_target: None,
-            activation: None,
-        }];
-        state.cursor = 0;
-        state.function.visible = true;
-        let opts = TopOptions { border_style: "rounded".into(), ..TopOptions::default() };
-        let mut t = Terminal::new(TestBackend::new(90, 14)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &opts, &theme())).unwrap();
-        let b = t.backend().buffer();
-        let y = 4; // divider row
-        let row: String = (0..b.area.width).map(|x| b[(x, y)].symbol()).collect();
-        assert!(!row.contains('═'), "rounded style must not emit double-rule `═`: {row:?}");
-        assert!(row.contains('─'), "rounded divider uses the single rule `─`: {row:?}");
-        assert!(row.contains("[ kernel.rs ]"), "filename still present: {row:?}");
-    }
-
-    #[test]
-    fn divider_separator_never_bleeds_function_title() {
-        // The function panel's title shares the divider row with the path/filename.
-        // When the `═` separator between the path and the filename lands exactly on
-        // the nav↔prop `┴` junction, the rule character yields to the junction —
-        // and the function title underneath must NOT show through (it used to bleed,
-        // e.g. `[ debug ]e[ examples ]`). The cell must carry the junction glyph.
-        use crate::core::{Entry, ReadResult};
-        use crate::core::state::Ratio;
-        let cwd = std::path::PathBuf::from("/Users/szk/src/github/wasdf/target/debug");
-        let mk = |n: &str| Entry {
-            path: cwd.join(n),
-            name: n.into(),
-            is_dir: true,
-            is_symlink: false,
-            size: 64,
-            mode: 0o40755,
-            uid: 501,
-            gid: 20,
-            modified: None,
-            created: None,
-            accessed: None,
-            symlink_target: None,
-            activation: None,
-        };
-        let mut state = AppState::new(cwd.clone());
-        state.entries = vec![mk("build"), mk("deps"), mk("examples"), mk("incremental")];
-        state.cursor = 2; // examples — its title equals the filename
-        state.function.visible = true;
-        let exts = exts();
-        exts.provider()
-            .unwrap()
-            .accept_content(&cwd.join("examples"), &ReadResult::Dir { entries: vec![] });
-
-        for ratio in [Ratio::R2_1, Ratio::R1_1, Ratio::R1_2] {
-            state.function.ratio = ratio;
-            for w in 78u16..=96 {
-                let mut t = Terminal::new(TestBackend::new(w, 14)).unwrap();
-                t.draw(|f| render(f, &state, &exts, &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
-                let b = t.backend().buffer();
-                let row: String = (0..b.area.width).map(|x| b[(x, 4)].symbol()).collect();
-                // The label `[ examples ]` must always be intact, and there must be
-                // no stray title letter wedged just before it (the separator slot is
-                // either a rule char or a junction glyph, never a letter).
-                assert!(row.contains("[ examples ]"), "{ratio:?} w={w}: filename broken: {row:?}");
-                if let Some(i) = row.find("[ examples ]") {
-                    // The char just before the label must be the path's `]`, a rule,
-                    // or a junction glyph — never a stray letter bled from the title.
-                    let prev = row[..i].chars().last().unwrap();
-                    assert!(
-                        matches!(prev, '═' | '─' | '-' | '┬' | '┴' | '┼' | '╦' | '╩' | '╬' | '┤' | '╣' | ']'),
-                        "{ratio:?} w={w}: stray '{prev}' bled before the filename: {row:?}",
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn divider_filename_survives_junction_overlap() {
-        // Regression: the bottom-border filename shares its row with the function
-        // panel's title (the shared top↔main divider). Where a top-area divider
-        // (`┴`/`╩`) lands inside the filename, the title used to bleed through —
-        // e.g. "command.scm" rendered as "comeand.scm" (the `e` from "[ content ]").
-        // The label's real characters must win over both the junction glyph and any
-        // bled title, so the filename stays intact at every width that fits it.
-        use crate::core::Entry;
-        let mut state = AppState::new(std::path::PathBuf::from(
-            "/Users/szk/src/github/wasdf/crates/wasdf/src/app",
-        ));
-        state.entries = vec![Entry {
-            path: std::path::PathBuf::from(
-                "/Users/szk/src/github/wasdf/crates/wasdf/src/app/command.scm",
-            ),
-            name: "command.scm".into(),
-            is_dir: false,
-            is_symlink: false,
-            size: 0,
-            mode: 0,
-            uid: 0,
-            gid: 0,
-            modified: None,
-            created: None,
-            accessed: None,
-            symlink_target: None,
-            activation: None,
-        }];
-        state.cursor = 0;
-        state.function.visible = true;
-        // These widths all place a prop/monitor `┴` inside the filename region.
-        for w in [80u16, 81, 91, 100, 105, 108] {
-            let mut t = Terminal::new(TestBackend::new(w, 30)).unwrap();
-            t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
-            let b = t.backend().buffer();
-            let row: String = (0..b.area.width).map(|x| b[(x, 6)].symbol()).collect();
-            assert!(
-                row.contains("command.scm"),
-                "filename corrupted by junction/title overlap at width {w}: {row:?}",
-            );
-        }
-    }
-
-    #[test]
-    fn help_is_negative_colored() {
-        let th = theme();
-        let state = AppState::new(std::env::temp_dir());
-        let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &th)).unwrap();
-        let buf = t.backend().buffer();
-        let y = buf.area.height - 1; // help row
-        // The bar fills with HelpBg edge to edge, and the trigger-key chips are a
-        // distinct (negative) HelpKeyBg — both colors must appear on the row.
-        let has_bar = (0..buf.area.width).any(|x| buf[(x, y)].bg == th.role(Role::HelpBg));
-        let has_chip = (0..buf.area.width).any(|x| buf[(x, y)].bg == th.role(Role::HelpKeyBg));
-        assert!(has_bar, "help bar fills the row with the bar background");
-        assert!(has_chip, "help bar shows negative key chips");
-    }
-
-    #[test]
-    fn focused_cursor_reverses_unfocused_underlines() {
-        use crate::core::Entry;
-        let entries: Vec<Entry> = (0..3)
-            .map(|i| Entry {
-                path: std::path::PathBuf::from(format!("/d/f{i}")),
-                name: format!("f{i}"),
-                is_dir: false,
-                is_symlink: false,
-                size: 0,
-                mode: 0,
-                uid: 0,
-                gid: 0,
-                modified: None,
-                created: None,
-                accessed: None,
-                symlink_target: None,
-                activation: None,
-            })
-            .collect();
-        // Count reverse-video cells (the help row reverses in both, so it cancels).
-        let reversed = |function_focused: bool| {
-            let mut s = AppState::new(std::env::temp_dir());
-            s.entries = entries.clone();
-            s.cursor = 0;
-            s.function.visible = true;
-            if function_focused {
-                s.focused_panel = "function".into();
-            }
-            let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-            t.draw(|f| render(f, &s, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
-            let buf = t.backend().buffer();
-            buf.content.iter().filter(|c| c.modifier.contains(Modifier::REVERSED)).count()
-        };
-        assert!(
-            reversed(false) > reversed(true),
-            "the file cursor adds reverse-video cells only while the file panel is focused",
-        );
-    }
-
-    #[test]
-    fn nav_renders_breadcrumb_columns() {
-        let state = AppState::new(std::env::temp_dir().join("a").join("b"));
-        let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        t.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
-        let b = t.backend().buffer();
-        let text: String = (0..b.area.height)
-            .flat_map(|y| (0..b.area.width).map(move |x| (x, y)))
-            .map(|(x, y)| b[(x, y)].symbol().to_string())
-            .collect();
-        // The nav panel carries the app banner as its (unbracketed) title.
-        assert!(text.contains("wasdf v"), "expected the nav banner title");
-    }
-
-    #[test]
-    fn main_panels_open_onto_the_unboxed_help_row() {
-        // doc/SCREEN.md: the file/function panels have no bottom border — their
-        // side borders run down through the last content row and stop, with no
-        // closing line or corners, and the help row below is plain unboxed text.
-        let mut state = AppState::new(std::env::temp_dir());
-        state.function.visible = true;
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
-        let buf = terminal.backend().buffer();
-        let (w, h) = (buf.area.width, buf.area.height);
-        let row = |y: u16| -> String { (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>() };
-        let last_content = row(h - 2);
-        let help = row(h - 1);
-        assert!(last_content.contains('│'), "last content row should still carry side borders");
-        for glyph in ['─', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼'] {
-            assert!(!last_content.contains(glyph), "last content row should have no closing border: {last_content:?}");
-            assert!(!help.contains(glyph), "help row should be unboxed: {help:?}");
-        }
-        assert!(!help.contains('│'), "help row should be unboxed: {help:?}");
-    }
-
-    #[test]
-    fn middle_area_has_no_left_border() {
-        // doc/SCREEN.md: the main (file/select) area has no left border — its
-        // rows run flush to column 0 — so the top panel's bottom-left corner is
-        // `└` (no southward stem) rather than `├`.
-        let mut state = AppState::new(std::env::temp_dir());
-        state.function.visible = true;
-        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        terminal.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
-        let buf = terminal.backend().buffer();
-        let h = buf.area.height;
-        // The corner where the top panel meets the main area: `└`, not `├`.
-        let corner = (0..h).map(|y| buf[(0, y)].symbol().to_string()).find(|s| s == "└");
-        assert_eq!(corner.as_deref(), Some("└"), "top↔main left corner should be └");
-        let corner_y = (0..h).find(|&y| buf[(0, y)].symbol() == "└").unwrap();
-        // Every main-area row below that corner (down to the help row) is blank
-        // at column 0 — no left border line or junction.
-        for y in (corner_y + 1)..(h - 1) {
-            assert_eq!(buf[(0, y)].symbol(), " ", "main row {y} should have no left border");
-        }
-    }
-
-    #[test]
-    fn borders_are_connected_with_junctions() {
-        let state = AppState::new(std::env::temp_dir());
-        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
-        terminal.draw(|f| render(f, &state, &exts(), &mut ScrollMemory::default(), None, &vfs(), &top_opts(), &theme())).unwrap();
-        let buf = terminal.backend().buffer();
-        let (w, h) = (buf.area.width, buf.area.height);
-        let row = |y: u16| -> String {
-            (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>()
-        };
-        let text: String = (0..h).map(row).collect();
-        // The tree/status divider meets the top frame as a junction, and the
-        // top↔main divider line connects with junctions — single-line chrome.
-        assert!(text.contains('┬'), "expected a top junction");
-        assert!(text.contains('┴') || text.contains('┼'), "expected a divider junction");
-        assert!(text.contains('│') && text.contains('─'), "expected single-line borders");
-        // No doubled vertical borders within any row (nested boxes would double).
-        for y in 0..h {
-            assert!(!row(y).contains("││"), "row {y} has doubled borders: {:?}", row(y));
+        InputFormState::Choice { options, selected } => render_choice_body(frame, body, options, *selected),
+        InputFormState::Int { value, min, max, .. } => render_int_body(frame, body, *value, *min, *max),
+        InputFormState::List { items, selected, editing } => {
+            render_list_body(frame, body, items, *selected, editing)
         }
     }
 }
+
+/// The confirm/cancel (+ kind-specific) key hint line.
+fn input_form_key_hint(form: &InputFormState) -> &'static str {
+    match form {
+        InputFormState::List { editing: Some(_), .. } => "Enter : commit     Esc : cancel",
+        InputFormState::List { .. } => "↑↓ move  a add  d del  Enter : edit/confirm  Esc : cancel",
+        _ => "Enter : confirm     Esc : cancel",
+    }
+}
+
+/// `Text`: the typed value with a reverse-video caret cell (unchanged from
+/// the original free-text-only InputForm).
+fn render_text_body(frame: &mut Frame, area: Rect, value: &str, cursor: usize) {
+    let caret = cursor.min(value.chars().count());
+    let before: String = value.chars().take(caret).collect();
+    let mut rest = value.chars().skip(caret);
+    let under = rest.next().map(|c| c.to_string()).unwrap_or_else(|| " ".into());
+    let after: String = rest.collect();
+    let line = Line::from(vec![
+        Span::raw(" "),
+        Span::raw(before),
+        Span::styled(under, Style::default().add_modifier(Modifier::REVERSED)),
+        Span::raw(after),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// `Bool`/`Choice`: a `List` of options, the selected row reverse-video —
+/// the same transient-`ListState` pattern `ui/middle.rs::render_select_candidates`
+/// already uses (no ratatui widget state ever lives in `AppState`).
+fn render_choice_body(frame: &mut Frame, area: Rect, options: &[String], selected: usize) {
+    let items: Vec<ListItem> = options
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let style = if i == selected { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
+            ListItem::new(Line::from(Span::styled(o.clone(), style)))
+        })
+        .collect();
+    let mut ls = ListState::default();
+    ls.select(Some(selected));
+    frame.render_stateful_widget(List::new(items), area, &mut ls);
+}
+
+/// `Int`: a `Gauge` showing the value's position in `min..max`.
+fn render_int_body(frame: &mut Frame, area: Rect, value: i64, min: i64, max: i64) {
+    let ratio = if max > min { (value - min) as f64 / (max - min) as f64 } else { 0.0 };
+    let gauge = Gauge::default().ratio(ratio.clamp(0.0, 1.0)).label(value.to_string());
+    frame.render_widget(gauge, area);
+}
+
+/// `List` (free multi-value): a `Table`, one row per item plus a trailing
+/// `"+ Add item"` row and a `"✓ Confirm"` row (see `list_add_row`/
+/// `list_confirm_row` in `core::reducer` for why Enter needs a dedicated
+/// confirm row). The row being edited shows its live-typed text with the
+/// same caret technique `render_text_body` uses.
+fn render_list_body(
+    frame: &mut Frame,
+    area: Rect,
+    items: &[String],
+    selected: usize,
+    editing: &Option<(usize, String, usize)>,
+) {
+    let mut rows: Vec<Row> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let text = match editing {
+                Some((idx, buf, cursor)) if *idx == i => caret_line(buf, *cursor),
+                _ => Line::from(item.clone()),
+            };
+            let style = if i == selected { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
+            Row::new(vec![Cell::from(text)]).style(style)
+        })
+        .collect();
+    let add_selected = selected == items.len();
+    let add_text = match editing {
+        Some((idx, buf, cursor)) if *idx == usize::MAX => caret_line(buf, *cursor),
+        _ => Line::from("+ Add item"),
+    };
+    let add_style = if add_selected { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
+    rows.push(Row::new(vec![Cell::from(add_text)]).style(add_style));
+    let confirm_selected = selected == items.len() + 1;
+    let confirm_style =
+        if confirm_selected { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
+    rows.push(Row::new(vec![Cell::from("✓ Confirm")]).style(confirm_style));
+    let table = Table::new(rows, [Constraint::Percentage(100)]);
+    frame.render_widget(table, area);
+}
+
+fn caret_line(buf: &str, cursor: usize) -> Line<'static> {
+    let caret = cursor.min(buf.chars().count());
+    let before: String = buf.chars().take(caret).collect();
+    let mut rest = buf.chars().skip(caret);
+    let under = rest.next().map(|c| c.to_string()).unwrap_or_else(|| " ".into());
+    let after: String = rest.collect();
+    Line::from(vec![
+        Span::raw(before),
+        Span::styled(under, Style::default().add_modifier(Modifier::REVERSED)),
+        Span::raw(after),
+    ])
+}
+

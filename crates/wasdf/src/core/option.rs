@@ -53,6 +53,10 @@ pub struct OptionDef {
     /// is the canonical representation stored in `values`, persisted to
     /// `config.scm`, and returned by `get()`.
     pub default: String,
+    /// The id of the extension that declared this option, or `None` for a core
+    /// option. Drives settings placement: core options group by `category` at the
+    /// settings root; extension options group under `@/settings/Extensions/<owner>`.
+    pub owner: Option<String>,
 }
 
 // ── OptionStore ───────────────────────────────────────────────────────────────
@@ -155,19 +159,22 @@ impl OptionStore {
 
     // ── Typed accessors ───────────────────────────────────────────────────────
 
+    // The value-string parsing is shared with dynamically loaded extensions via
+    // `wasdf_sdk::settings`, so both sides read a bool / int / list identically.
+
     /// `"#t"` → true; anything else (including absent) → false.
     pub fn get_bool(&self, key: &str) -> bool {
-        self.get(key).as_deref() == Some("#t")
+        wasdf_sdk::settings::parse_bool(self.get(key).as_deref())
     }
 
     /// Parse the value as `u32`; returns `0` on absent or parse failure.
     pub fn get_u32(&self, key: &str) -> u32 {
-        self.get(key).and_then(|s| s.parse().ok()).unwrap_or(0)
+        wasdf_sdk::settings::parse_u32(self.get(key).as_deref())
     }
 
     /// Parse the value as `i64`; returns `0` on absent or parse failure.
     pub fn get_i64(&self, key: &str) -> i64 {
-        self.get(key).and_then(|s| s.parse().ok()).unwrap_or(0)
+        wasdf_sdk::settings::parse_i64(self.get(key).as_deref())
     }
 
     /// Get the value as a `String`; returns `""` for absent or unparseable.
@@ -177,11 +184,7 @@ impl OptionStore {
 
     /// Split a `list` value on `,`, trim each part, drop empties.
     pub fn get_list(&self, key: &str) -> Vec<String> {
-        self.get_str(key)
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
+        wasdf_sdk::settings::parse_list(self.get(key).as_deref())
     }
 
     // ── Schema queries ────────────────────────────────────────────────────────
@@ -200,6 +203,58 @@ impl OptionStore {
                 (cat.clone(), fields)
             })
             .collect()
+    }
+
+    /// Categories that contain at least one **core** (extension-unowned) option,
+    /// each with only its core defs. Extension options are excluded — they group
+    /// under `@/settings/Extensions/<owner>` instead of as a flat category.
+    pub fn core_categories(&self) -> Vec<(String, Vec<&OptionDef>)> {
+        self.category_order
+            .iter()
+            .filter_map(|cat| {
+                let defs: Vec<&OptionDef> = self
+                    .def_order
+                    .iter()
+                    .filter_map(|k| self.defs.get(k))
+                    .filter(|d| &d.category == cat && d.owner.is_none())
+                    .collect();
+                (!defs.is_empty()).then(|| (cat.clone(), defs))
+            })
+            .collect()
+    }
+
+    /// The distinct extension owners that declared options, in first-seen order.
+    pub fn owners(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for d in self.def_order.iter().filter_map(|k| self.defs.get(k)) {
+            if let Some(o) = &d.owner {
+                if !out.contains(o) {
+                    out.push(o.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// The option defs declared by a given extension, in insertion order.
+    pub fn options_for_owner(&self, owner: &str) -> Vec<&OptionDef> {
+        self.def_order
+            .iter()
+            .filter_map(|k| self.defs.get(k))
+            .filter(|d| d.owner.as_deref() == Some(owner))
+            .collect()
+    }
+
+    /// A snapshot of an extension's own option values as a [`wasdf_sdk::Settings`],
+    /// so the owning extension reads them through the shared SDK accessors. The
+    /// same key→value snapshot is what a dynamically loaded extension is handed
+    /// over the ABI, keeping bundled and dynamic reads identical.
+    pub fn settings_for(&self, owner: &str) -> wasdf_sdk::Settings {
+        wasdf_sdk::Settings::from_pairs(
+            self.options_for_owner(owner)
+                .into_iter()
+                .map(|d| (d.key.clone(), self.get_str(&d.key))),
+        )
     }
 
     /// Look up the def for a key.
@@ -226,6 +281,7 @@ mod tests {
             label: key.into(),
             kind: OptionKind::Bool,
             default: default.into(),
+            owner: None,
         }
     }
 
@@ -236,6 +292,7 @@ mod tests {
             label: key.into(),
             kind: OptionKind::Int { min, max },
             default: default.into(),
+            owner: None,
         }
     }
 
@@ -246,6 +303,7 @@ mod tests {
             label: key.into(),
             kind: OptionKind::Choice(opts.iter().map(|s| s.to_string()).collect()),
             default: default.into(),
+            owner: None,
         }
     }
 
@@ -256,6 +314,7 @@ mod tests {
             label: key.into(),
             kind: OptionKind::List,
             default: default.into(),
+            owner: None,
         }
     }
 
@@ -354,6 +413,7 @@ mod tests {
                 label: "x".into(),
                 kind: OptionKind::Bool,
                 default: "#f".into(),
+                owner: None,
             },
             OptionDef {
                 key: "b.y".into(),
@@ -361,6 +421,7 @@ mod tests {
                 label: "y".into(),
                 kind: OptionKind::Bool,
                 default: "#f".into(),
+                owner: None,
             },
             OptionDef {
                 key: "a.z".into(),
@@ -368,6 +429,7 @@ mod tests {
                 label: "z".into(),
                 kind: OptionKind::Bool,
                 default: "#f".into(),
+                owner: None,
             },
         ];
         let store = OptionStore::new(defs);
@@ -383,5 +445,34 @@ mod tests {
         let store = OptionStore::new(vec![int_def("n", "5", 1, 99)]);
         let d = store.def("n").expect("def exists");
         assert_eq!(d.kind, OptionKind::Int { min: 1, max: 99 });
+    }
+
+    #[test]
+    fn owner_grouping_and_sdk_settings_snapshot() {
+        let owned = |key: &str, cat: &str, def: &str, owner: &str| OptionDef {
+            key: key.into(),
+            category: cat.into(),
+            label: key.into(),
+            kind: OptionKind::Int { min: 0, max: 99 },
+            default: def.into(),
+            owner: Some(owner.into()),
+        };
+        let store = OptionStore::new(vec![
+            int_def("core.n", "1", 0, 9),        // core (owner None)
+            owned("preview.tab-width", "Preview", "4", "preview"),
+            owned("preview.pager", "Preview", "2", "preview"),
+        ]);
+        assert_eq!(store.owners(), vec!["preview"]);
+        assert_eq!(store.options_for_owner("preview").len(), 2);
+        // core_categories excludes the extension-owned "Preview" category.
+        let core = store.core_categories();
+        assert!(core.iter().any(|(c, _)| c == "Test")); // int_def uses "Test"
+        assert!(!core.iter().any(|(c, _)| c == "Preview"));
+        // settings_for produces a wasdf_sdk::Settings the owner reads through.
+        store.set("preview.tab-width", "6");
+        let s = store.settings_for("preview");
+        assert_eq!(s.get_u32("preview.tab-width"), 6);
+        assert_eq!(s.get_u32("preview.pager"), 2);
+        assert_eq!(s.get("core.n"), None, "only the owner's keys are snapshotted");
     }
 }

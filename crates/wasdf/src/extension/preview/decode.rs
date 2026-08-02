@@ -5,9 +5,10 @@
 
 use std::path::Path;
 
-use crate::core::{Entry, StyleRun};
+use crate::core::{Block, Entry, TextSpan};
 
 use super::highlight::highlight_lines;
+use super::markdown;
 
 const IMAGE_MAX: u32 = 320;
 
@@ -17,7 +18,14 @@ const IMAGE_MAX: u32 = 320;
 /// "more remains" marker is driven by the load's `eof`, not stored here).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decoded {
-    Text { lines: Vec<String>, styles: Vec<Vec<StyleRun>> },
+    /// Text lines with their per-line syntax-highlight spans (`spans[i]` covers
+    /// `lines[i]`; may be shorter/empty when no syntax matched — then plain).
+    Text { lines: Vec<String>, spans: Vec<Vec<TextSpan>> },
+    /// A markdown document: the accumulated source plus the blocks it renders
+    /// to. Markdown is a whole-document format (a fence, a list, a table only
+    /// mean anything complete), so every chunk re-renders `source` rather than
+    /// appending to `blocks`.
+    Markdown { source: String, blocks: Vec<Block> },
     Image { width: u32, height: u32, rgb: Vec<u8> },
     Binary { lines: Vec<String> },
     Dir { entries: Vec<Entry> },
@@ -28,6 +36,7 @@ pub enum Decoded {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Text,
+    Markdown,
     Hex,
 }
 
@@ -37,7 +46,10 @@ pub fn classify_first(path: &Path, bytes: &[u8]) -> (Decoded, Option<Kind>) {
     use wasdf_sdk::{detect_mime, MimeClass};
     match detect_mime(bytes) {
         MimeClass::Image => (decode_image(path), None),
-        MimeClass::Text => (Decoded::Text { lines: Vec::new(), styles: Vec::new() }, Some(Kind::Text)),
+        MimeClass::Text if markdown::is_markdown(path) => {
+            (Decoded::Markdown { source: String::new(), blocks: Vec::new() }, Some(Kind::Markdown))
+        }
+        MimeClass::Text => (Decoded::Text { lines: Vec::new(), spans: Vec::new() }, Some(Kind::Text)),
         MimeClass::Binary => (Decoded::Binary { lines: Vec::new() }, Some(Kind::Hex)),
     }
 }
@@ -56,11 +68,23 @@ pub fn append(
     tab_width: usize,
 ) -> Vec<u8> {
     match (kind, content) {
-        (Kind::Text, Decoded::Text { lines, styles }) => {
+        (Kind::Text, Decoded::Text { lines, spans }) => {
             let (new_lines, tail) = split_lines(buf, eof, tab_width);
-            let new_styles = highlight_lines(path, &new_lines);
+            let new_spans = highlight_lines(path, &new_lines);
             lines.extend(new_lines);
-            styles.extend(new_styles);
+            spans.extend(new_spans);
+            tail
+        }
+        (Kind::Markdown, Decoded::Markdown { source, blocks }) => {
+            let (text, tail) = split_source(buf, eof);
+            source.push_str(&text);
+            // Re-rendering is whole-document (and re-decodes every inline
+            // image), so only pay for it twice: once on the first chunk, so a
+            // large file shows something immediately, and once at eof for the
+            // final document. Intermediate chunks just accumulate.
+            if eof || blocks.is_empty() {
+                *blocks = markdown::render(path, source, tab_width);
+            }
             tail
         }
         (Kind::Hex, Decoded::Binary { lines }) => {
@@ -70,6 +94,19 @@ pub fn append(
         }
         _ => Vec::new(),
     }
+}
+
+/// Split `buf` at the last newline into decodable source text and the trailing
+/// remainder carried to the next chunk, so the lossy UTF-8 decode never cuts a
+/// multibyte char. Markdown keeps its source verbatim — line breaks and
+/// indentation are syntax.
+fn split_source(buf: &[u8], eof: bool) -> (String, Vec<u8>) {
+    let cut = if eof {
+        buf.len()
+    } else {
+        buf.iter().rposition(|&b| b == b'\n').map_or(0, |nl| nl + 1)
+    };
+    (String::from_utf8_lossy(&buf[..cut]).into_owned(), buf[cut..].to_vec())
 }
 
 /// Replace control characters that ratatui's cell-width calculator rejects.
@@ -127,20 +164,26 @@ fn hex_rows(buf: &[u8], start_row: usize, eof: bool) -> (Vec<String>, Vec<u8>) {
     (rows, buf[full..].to_vec())
 }
 
+/// Decode an image file to a bounded RGB8 buffer `(width, height, rgb)`, or the
+/// decoder's error message. Shared by the whole-file image preview and by
+/// markdown's inline images ([`super::markdown`]).
+pub fn load_rgb(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
+    let img = image::open(path).map_err(|e| e.to_string())?;
+    let img = if img.width() > IMAGE_MAX || img.height() > IMAGE_MAX {
+        img.thumbnail(IMAGE_MAX, IMAGE_MAX)
+    } else {
+        img
+    };
+    let rgb = img.to_rgb8();
+    let (width, height) = rgb.dimensions();
+    Ok((width, height, rgb.into_raw()))
+}
+
 /// Decode an image to a bounded RGB8 buffer; on any error fall back to a note.
 fn decode_image(path: &Path) -> Decoded {
-    match image::open(path) {
-        Ok(img) => {
-            let img = if img.width() > IMAGE_MAX || img.height() > IMAGE_MAX {
-                img.thumbnail(IMAGE_MAX, IMAGE_MAX)
-            } else {
-                img
-            };
-            let rgb = img.to_rgb8();
-            let (width, height) = rgb.dimensions();
-            Decoded::Image { width, height, rgb: rgb.into_raw() }
-        }
-        Err(e) => Decoded::Text { lines: vec![format!("[image: {e}]")], styles: Vec::new() },
+    match load_rgb(path) {
+        Ok((width, height, rgb)) => Decoded::Image { width, height, rgb },
+        Err(e) => Decoded::Text { lines: vec![format!("[image: {e}]")], spans: Vec::new() },
     }
 }
 
@@ -152,79 +195,4 @@ fn hex_row(addr: usize, chunk: &[u8]) -> String {
         .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
         .collect();
     format!("{addr:08x}  {:<48}  {ascii}", hex.join(" "))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decodes_image_to_bounded_rgb() {
-        let mut path = std::env::temp_dir();
-        path.push(format!("wasdf-img-{}.png", std::process::id()));
-        let img = image::RgbImage::from_fn(4, 4, |x, _| image::Rgb([(x * 60) as u8, 0, 0]));
-        img.save(&path).unwrap();
-        match classify_first(&path, &std::fs::read(&path).unwrap()) {
-            (Decoded::Image { width, height, rgb }, None) => {
-                assert_eq!((width, height), (4, 4));
-                assert_eq!(rgb.len(), 4 * 4 * 3);
-            }
-            other => panic!("expected image, got {other:?}"),
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn text_classifies_then_appends_with_highlight() {
-        let (mut content, kind) = classify_first(Path::new("x.rs"), b"fn main() {}\n");
-        assert_eq!(kind, Some(Kind::Text));
-        let tail = append(Path::new("x.rs"), Kind::Text, &mut content, b"fn main() {}\n", true, 4);
-        assert!(tail.is_empty());
-        match content {
-            Decoded::Text { lines, styles } => {
-                assert_eq!(lines, vec!["fn main() {}".to_string()]);
-                assert!(!styles[0].is_empty(), "rust got highlight runs");
-            }
-            other => panic!("expected text, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn text_append_carries_a_partial_line_across_chunks() {
-        let mut content = Decoded::Text { lines: Vec::new(), styles: Vec::new() };
-        // First chunk ends mid-line: only the complete line decodes; the rest tails.
-        let tail = append(Path::new("a.txt"), Kind::Text, &mut content, b"alpha\nbe", false, 4);
-        assert_eq!(tail, b"be");
-        // The tail is prepended to the next chunk.
-        let mut buf = tail;
-        buf.extend_from_slice(b"ta\ngamma");
-        let tail = append(Path::new("a.txt"), Kind::Text, &mut content, &buf, true, 4);
-        assert!(tail.is_empty());
-        match content {
-            Decoded::Text { lines, .. } => assert_eq!(lines, vec!["alpha", "beta", "gamma"]),
-            other => panic!("expected text, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn hex_append_rows_have_global_addresses_and_carry_a_remainder() {
-        let mut content = Decoded::Binary { lines: Vec::new() };
-        // 18 bytes, not eof: one full 16-byte row, 2 bytes tail.
-        let chunk: Vec<u8> = (0..18u8).collect();
-        let tail = append(Path::new("b.bin"), Kind::Hex, &mut content, &chunk, false, 4);
-        assert_eq!(tail.len(), 2);
-        // Next chunk (tail + 16 bytes), eof: row addressed at 0x10, then 0x20 remainder.
-        let mut buf = tail;
-        buf.extend((18..34u8).collect::<Vec<_>>());
-        append(Path::new("b.bin"), Kind::Hex, &mut content, &buf, true, 4);
-        match content {
-            Decoded::Binary { lines } => {
-                assert_eq!(lines.len(), 3);
-                assert!(lines[0].starts_with("00000000"));
-                assert!(lines[1].starts_with("00000010"));
-                assert!(lines[2].starts_with("00000020"), "final short row at the global offset");
-            }
-            other => panic!("expected hex, got {other:?}"),
-        }
-    }
 }

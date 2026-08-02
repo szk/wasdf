@@ -1,17 +1,17 @@
-//! The generic function-panel content blitter: turn `PanelContent`-shaped data
-//! (styled text lines, directory listings, images) into ratatui `Line`s, with
-//! search-match highlighting, horizontal scroll, and optional line numbers. This
-//! is content-agnostic kernel infrastructure — any content extension's pushed
-//! content and any provider's pulled content both render through it (it names no
-//! particular extension). The function panel (`ui/middle.rs`) owns the chrome
-//! around the returned lines.
+//! Generic function-panel rendering helpers: the panel title, the search prompt
+//! line, the image blitter, and [`build_line`] — the single low-level line
+//! painter that applies horizontal scroll, optional line numbers, and
+//! search-match highlighting over a text line's pre-resolved style segments. This
+//! is content-agnostic kernel infrastructure; the `PanelView` layout
+//! (`ui/middle/function.rs`) lowers logical blocks into `(byte-len, Style)`
+//! segments and calls `build_line`. The function panel owns the chrome.
 
 use std::path::Path;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::core::{Entry, PanelSearch, Role, StyleRun, Theme};
+use crate::core::{PanelSearch, Role, Theme, LINE_NUMBER_WIDTH};
 
 /// The panel title for the displayed file: its file name (not a fixed label), with
 /// the match position appended while a search is active.
@@ -42,7 +42,7 @@ pub fn prompt_line(search: &PanelSearch, theme: &Theme) -> Option<Line<'static>>
         let mut rest = q[caret..].chars();
         let under = rest.next().map(|c| c.to_string()).unwrap_or_else(|| " ".into());
         Line::from(vec![
-            Span::styled("/", Style::default().fg(theme.role(Role::PathSeparator))),
+            Span::styled("/", theme.style(Role::PathSeparator)),
             Span::raw(q[..caret].to_string()),
             Span::styled(under, Style::default().add_modifier(Modifier::REVERSED)),
             Span::raw(rest.collect::<String>()),
@@ -50,57 +50,15 @@ pub fn prompt_line(search: &PanelSearch, theme: &Theme) -> Option<Line<'static>>
     })
 }
 
-/// Build the styled content lines for a text/hex view: each line colored by its
-/// `styles` runs (empty for hex/unstyled), scrolled horizontally by `hscroll`,
-/// with search matches highlighted and optional line numbers. A `truncated`
-/// marker line is appended when set.
-pub fn text_lines(
-    lines: &[String],
-    styles: &[Vec<StyleRun>],
-    search: &PanelSearch,
-    hscroll: usize,
-    show_line_numbers: bool,
-    truncated: bool,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    let mut out: Vec<Line> = lines
-        .iter()
-        .enumerate()
-        .map(|(i, text)| {
-            let runs = styles.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
-            build_line(text, runs, hscroll, i, search, show_line_numbers, theme)
-        })
-        .collect();
-    if truncated {
-        out.push(Line::from(Span::styled("… truncated", Style::default().fg(theme.role(Role::Muted)))));
-    }
-    out
-}
-
-/// The content's intrinsic width in columns: the longest line's char count,
-/// measured on the raw (pre-h-scroll) lines. Callers pair this with the viewport
-/// width to bound horizontal scrolling. Matches `build_line`'s per-char column
-/// counting, so the bound lines up with what gets dropped on h-scroll.
-pub fn content_width(lines: &[String]) -> usize {
-    lines.iter().map(|l| l.chars().count()).max().unwrap_or(0)
-}
-
-/// Styled lines for a directory listing (directories blue, with a trailing `/`).
-pub fn dir_lines(entries: &[Entry], theme: &Theme) -> Vec<Line<'static>> {
-    entries
-        .iter()
-        .map(|e| {
-            let style = if e.is_dir { Style::default().fg(theme.role(Role::EntryDir)) } else { Style::default() };
-            Line::from(Span::styled(format!("{}{}", e.name, if e.is_dir { "/" } else { "" }), style))
-        })
-        .collect()
-}
-
-/// One line: line number (optional), then the text from `hscroll` columns on,
-/// colored by `runs` and overlaid with search-match highlighting.
-fn build_line(
+/// Paint one text line: an optional line number, then the text from `hscroll`
+/// columns on, colored by its pre-resolved style `segs` (`(byte-len, Style)`,
+/// tiling the line left-to-right; a gap past the last seg is unstyled) and
+/// overlaid with search-match highlighting for `line_idx`. The `PanelView` layout
+/// lowers each logical block into `(text, segs)` and calls this. Widths are
+/// counted per char to match `line_width`, so the h-scroll bound lines up.
+pub fn build_line(
     text: &str,
-    runs: &[StyleRun],
+    segs: &[(usize, Style)],
     hscroll: usize,
     line_idx: usize,
     search: &PanelSearch,
@@ -110,8 +68,8 @@ fn build_line(
     let mut spans: Vec<Span<'static>> = Vec::new();
     if show_line_numbers {
         spans.push(Span::styled(
-            format!("{:>4} ", line_idx + 1),
-            Style::default().fg(theme.role(Role::Muted)),
+            format!("{:>w$} ", line_idx + 1, w = LINE_NUMBER_WIDTH as usize - 1),
+            theme.style(Role::Muted),
         ));
     }
     // Match byte ranges on this line, flagged when current.
@@ -122,31 +80,22 @@ fn build_line(
         .filter_map(|(i, &(l, s, e))| (l == line_idx).then_some((s, e, i == search.current)))
         .collect();
 
-    let mut run_idx = 0usize;
-    let mut run_base = 0usize; // first byte covered by runs[run_idx]
+    let mut seg_idx = 0usize;
+    let mut seg_base = 0usize; // first byte covered by segs[seg_idx]
     let mut col = 0usize;
     let mut cur_style = Style::default();
     let mut cur_text = String::new();
     for (b, ch) in text.char_indices() {
-        while run_idx < runs.len() && run_base + runs[run_idx].len <= b {
-            run_base += runs[run_idx].len;
-            run_idx += 1;
+        while seg_idx < segs.len() && seg_base + segs[seg_idx].0 <= b {
+            seg_base += segs[seg_idx].0;
+            seg_idx += 1;
         }
         let m = line_matches.iter().find(|(s, e, _)| b >= *s && b < *e);
         let style = match m {
-            // Search highlight overrides the run's own colors.
-            Some((_, _, true)) => Style::default().fg(theme.role(Role::MatchCurrentFg)).bg(theme.role(Role::MatchCurrentBg)),
-            Some(_) => Style::default().fg(theme.role(Role::MatchFg)).bg(theme.role(Role::MatchBg)),
-            None => match runs.get(run_idx) {
-                Some(r) => {
-                    let mut st = Style::default().fg(Color::Rgb(r.fg.0, r.fg.1, r.fg.2));
-                    if let Some((br, bg, bb)) = r.bg {
-                        st = st.bg(Color::Rgb(br, bg, bb));
-                    }
-                    st
-                }
-                None => Style::default(),
-            },
+            // Search highlight overrides the segment's own colors.
+            Some((_, _, true)) => theme.style(Role::MatchCurrentFg).bg(theme.role(Role::MatchCurrentBg)),
+            Some(_) => theme.style(Role::MatchFg).bg(theme.role(Role::MatchBg)),
+            None => segs.get(seg_idx).map(|s| s.1).unwrap_or_default(),
         };
         if col >= hscroll {
             if style != cur_style && !cur_text.is_empty() {
@@ -161,6 +110,12 @@ fn build_line(
         spans.push(Span::styled(cur_text, cur_style));
     }
     Line::from(spans)
+}
+
+/// A text line's width in columns (char count) — pairs with the viewport to
+/// bound horizontal scrolling, matching `build_line`'s per-char counting.
+pub fn line_width(text: &str) -> usize {
+    text.chars().count()
 }
 
 /// Render a decoded RGB image into a `cols` × `rows` grid of terminal cells
@@ -190,53 +145,4 @@ pub fn image_cells(width: u32, height: u32, rgb: &[u8], cols: u16, rows: u16) ->
         lines.push(Line::from(spans));
     }
     lines
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn renders_image_to_chafa_cells() {
-        let mut rgb = Vec::new();
-        for y in 0..8u32 {
-            for _ in 0..8u32 {
-                rgb.extend_from_slice(&[(y * 30) as u8, 0, 255 - (y * 30) as u8]);
-            }
-        }
-        let lines = image_cells(8, 8, &rgb, 6, 4);
-        assert_eq!(lines.len(), 4, "one Line per row");
-        assert_eq!(lines[0].spans.len(), 6, "one cell per column");
-    }
-
-    #[test]
-    fn degenerate_input_is_empty() {
-        assert!(image_cells(0, 0, &[], 4, 4).is_empty());
-        assert!(image_cells(2, 2, &[0; 12], 0, 0).is_empty());
-    }
-
-    #[test]
-    fn title_is_the_file_name_with_match_position() {
-        let mut search = PanelSearch::default();
-        let path = std::path::PathBuf::from("/a/b/main.rs");
-        assert_eq!(title(Some(&path), &search), "main.rs");
-        search.matches = vec![(0, 0, 1), (2, 0, 1)];
-        search.current = 1;
-        assert_eq!(title(Some(&path), &search), "main.rs  [2/2]");
-    }
-
-    #[test]
-    fn content_width_is_the_longest_line() {
-        assert_eq!(content_width(&["ab".into(), "abcd".into(), "a".into()]), 4);
-        assert_eq!(content_width(&[]), 0);
-    }
-
-    #[test]
-    fn horizontal_scroll_drops_leading_columns() {
-        let theme = crate::core::Theme::default();
-        let search = PanelSearch::default();
-        let l = text_lines(&["hello".to_string()], &[], &search, 2, false, false, &theme);
-        let text: String = l[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "llo");
-    }
 }

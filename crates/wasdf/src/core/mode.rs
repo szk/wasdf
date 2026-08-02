@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use crate::core::event::ResolverRequest;
 use crate::core::extension_value::ExtensionValue;
 use crate::core::intent::{ExtensionIntent, Intent};
+use crate::core::state::Entry;
 
 /// The active display frame of the function panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,10 +23,22 @@ pub enum Mode {
     File,
     Select(SelectSpec),
     Policy(Box<Intent>),
+    /// A small popup text-entry dialog — the unified replacement for the old
+    /// candidate-list (`emit_static`) and free-text (`emit_path_input`) Select
+    /// flows. Shares its chrome with `Policy`'s Confirm box (see
+    /// `ui/render.rs`); Enter confirms (emits `spec.template` with the typed
+    /// text under `KEY_ITEM`), Esc cancels. Runtime text/cursor state lives in
+    /// `AppState::input_form`, mirroring how `SelectState` sits beside `Select`.
+    InputForm(InputFormSpec),
     Extension {
         extension: String,
         mode: String,
         state: ExtensionValue,
+        /// An **overlay** mode (`true`) sits on top of the mode below but lets
+        /// unhandled keys fall through to it (e.g. an info panel that adds `o`
+        /// while `wasd` keeps navigating the file list). A non-overlay extension
+        /// mode is **modal** — it captures all keys like Select / Policy.
+        overlay: bool,
     },
 }
 
@@ -36,18 +49,102 @@ impl Mode {
             Mode::File => "file".into(),
             Mode::Select(spec) => format!("select:{}", spec.id),
             Mode::Policy(_) => "policy".into(),
+            // Fixed — every instance behaves identically (Enter/Esc/typing), so
+            // there's no per-instance keymap scope to distinguish.
+            Mode::InputForm(_) => "input-form".into(),
             Mode::Extension { extension, mode, .. } => format!("{extension}:{mode}"),
         }
+    }
+
+    /// Whether this mode **captures** key input (a modal takeover) and so stops
+    /// the keymap's mode-stack walk, versus an **overlay** that falls through to
+    /// the mode beneath it on any key it does not itself bind. File / Select /
+    /// Policy / InputForm capture; an extension mode captures unless it
+    /// declared itself an overlay.
+    pub fn captures_keys(&self) -> bool {
+        match self {
+            Mode::File | Mode::Select(_) | Mode::Policy(_) | Mode::InputForm(_) => true,
+            Mode::Extension { overlay, .. } => !overlay,
+        }
+    }
+}
+
+/// Which widget a `Mode::InputForm` popup renders and how it edits its value.
+/// The wire encoding of the value (what `spec.initial` holds and what gets
+/// inserted under `KEY_ITEM` on confirm) is chosen per kind to match what the
+/// existing consumers already read — see doc/UI.md's Input Form Mode section.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputKind {
+    /// Free text, edited via `tui-input`. `spec.initial`/the confirmed value
+    /// are the raw string.
+    Text,
+    /// A List with two rows, "On"/"Off". Wire value: `"#t"` / `"#f"`.
+    Bool,
+    /// A List, one row per option. Wire value: the chosen option string.
+    Choice(Vec<String>),
+    /// A Gauge showing the value's position in `min..max`. Wire value: the
+    /// decimal string.
+    Int { min: i64, max: i64 },
+    /// A Table, one row per item, free multi-value. Wire value: comma-joined.
+    List,
+}
+
+/// The spec for a `Mode::InputForm` popup: immutable per instance (the typed
+/// value/cursor/selection are runtime state in `AppState::input_form`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputFormSpec {
+    /// Shown as the popup box's border title (may include a value hint, e.g.
+    /// `"coloring (none | LS_COLORS | Light | Dark | Custom)"`).
+    pub title: String,
+    /// Prefilled value, encoded per `kind` (see [`InputKind`]).
+    pub initial: String,
+    pub kind: InputKind,
+    /// Emitted on confirm with the encoded value inserted under `KEY_ITEM` —
+    /// exactly the same contract `Select`'s `OnConfirm::Emit` used, so every
+    /// existing `*-apply` handler needs no changes. Nothing is emitted before
+    /// confirm; there is no live-apply.
+    pub template: ExtensionIntent,
+}
+
+impl InputFormSpec {
+    /// The free-text popup (theme new/duplicate/rename, archive pack).
+    pub fn emit_input_form(
+        title: impl Into<String>,
+        template: ExtensionIntent,
+        initial: Option<String>,
+    ) -> Self {
+        InputFormSpec {
+            title: title.into(),
+            initial: initial.unwrap_or_default(),
+            kind: InputKind::Text,
+            template,
+        }
+    }
+
+    /// A typed-widget popup (Bool/Choice/Int/List/Color).
+    pub fn emit_input_widget(
+        title: impl Into<String>,
+        template: ExtensionIntent,
+        kind: InputKind,
+        initial: impl Into<String>,
+    ) -> Self {
+        InputFormSpec { title: title.into(), initial: initial.into(), kind, template }
     }
 }
 
 /// Where a Select instance draws its candidates from.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectSource {
+    /// Deep search: a recursive walk from `AppState.cwd`, ranked async via
+    /// `Plan::Search`. See SEARCH_RENEW.md's deep/shallow vocabulary.
     FileWalk,
     Commands,
-    PathCompletion,
     Static(Vec<Candidate>),
+    /// Shallow filter: a fixed, already-in-hand `Entry` pool (the file
+    /// panel's current listing, or a frozen deep-search result view) ranked
+    /// **synchronously** in the reducer, no I/O, no plan. Works on virtual
+    /// paths, unlike `FileWalk`.
+    Entries(Vec<Entry>),
 }
 
 /// The input field behavior of a Select instance.
@@ -80,9 +177,6 @@ pub enum OnConfirm {
         template: ResolverRequest,
         fill: ResolveFill,
     },
-    /// Re-inject this extension intent template with the confirm shape inserted
-    /// under the reserved `item` key.
-    Emit(ExtensionIntent),
 }
 
 /// A renderer hint for the function panel during Select.
@@ -157,6 +251,22 @@ impl SelectSpec {
         }
     }
 
+    /// The shallow-filter picker (`f` on a virtual dir, or the file-search
+    /// result view's own `f`/refine): rank a fixed `Entry` pool synchronously,
+    /// navigate on confirm. Shares `commit_file_search`'s commit path with
+    /// `file_search` — see SEARCH_RENEW.md decision 4.
+    pub fn filter_list(entries: Vec<Entry>) -> Self {
+        SelectSpec {
+            id: "filter-list".into(),
+            source: SelectSource::Entries(entries),
+            input: SelectInput::Fuzzy,
+            on_confirm: OnConfirm::Navigate,
+            initial_query: None,
+            function_hint: Some(FunctionHint::DirListing),
+            command_line: Vec::new(),
+        }
+    }
+
     /// The command palette (x): static candidates, fuzzy, run the command.
     pub fn command_palette(candidates: Vec<Candidate>) -> Self {
         SelectSpec {
@@ -191,64 +301,12 @@ impl SelectSpec {
             command_line: Vec::new(),
         }
     }
-
-    /// An extension path/text picker confirmed through Emit (covers extension
-    /// path and text entry; extensions use Emit, not the core Resolve flow).
-    pub fn emit_path_input(
-        id: impl Into<String>,
-        template: ExtensionIntent,
-        initial: Option<String>,
-        hint: Option<FunctionHint>,
-    ) -> Self {
-        SelectSpec {
-            id: id.into(),
-            source: SelectSource::PathCompletion,
-            input: SelectInput::Path,
-            on_confirm: OnConfirm::Emit(template),
-            initial_query: initial,
-            function_hint: hint,
-            command_line: Vec::new(),
-        }
-    }
-
-    /// An extension Static picker confirmed through Emit.
-    pub fn emit_static(
-        id: impl Into<String>,
-        candidates: Vec<Candidate>,
-        template: ExtensionIntent,
-        hint: Option<FunctionHint>,
-    ) -> Self {
-        SelectSpec {
-            id: id.into(),
-            source: SelectSource::Static(candidates),
-            input: SelectInput::Fuzzy,
-            on_confirm: OnConfirm::Emit(template),
-            initial_query: None,
-            function_hint: hint,
-            command_line: Vec::new(),
-        }
-    }
 }
 
-/// The result of confirming a Select. Exactly three shapes; whether a value
-/// came from a candidate or free input is never distinguished by type.
+/// The result of confirming a Select. Whether a value came from a candidate
+/// or free input is never distinguished by type.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfirmShape {
     Single(Candidate),
-    Many(Vec<Candidate>),
     InputOnly(String),
-}
-
-impl ConfirmShape {
-    /// Lower the shape into the ExtensionValue stored under the reserved item
-    /// key for Emit.
-    pub fn to_value(&self) -> ExtensionValue {
-        match self {
-            ConfirmShape::Single(c) => c.value.clone(),
-            ConfirmShape::Many(items) => {
-                ExtensionValue::List(items.iter().map(|c| c.value.clone()).collect())
-            }
-            ConfirmShape::InputOnly(s) => ExtensionValue::String(s.clone()),
-        }
-    }
 }

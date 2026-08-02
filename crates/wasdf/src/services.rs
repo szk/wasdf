@@ -3,6 +3,7 @@
 
 pub mod command;
 pub mod matcher;
+pub mod messages;
 pub mod resolver;
 
 pub use command::CommandRegistry;

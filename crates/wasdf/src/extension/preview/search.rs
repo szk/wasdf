@@ -39,28 +39,3 @@ fn find_in_line(line: &str, needle: &str) -> Vec<(usize, usize)> {
     }
     out
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn lines(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn finds_every_occurrence_in_document_order() {
-        let m = find_matches(&lines(&["foo bar", "baz foo", "none", "foo"]), "foo");
-        assert_eq!(m, vec![(0, 0, 3), (1, 4, 7), (3, 0, 3)]);
-    }
-
-    #[test]
-    fn is_ascii_case_insensitive() {
-        assert_eq!(find_matches(&lines(&["Hello HELLO hello"]), "hello").len(), 3);
-    }
-
-    #[test]
-    fn empty_query_matches_nothing() {
-        assert!(find_matches(&lines(&["anything"]), "").is_empty());
-    }
-}

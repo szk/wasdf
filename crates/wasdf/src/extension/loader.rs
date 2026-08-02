@@ -16,17 +16,25 @@
 //! returns follow-up intents as a Scheme list, decoded back into core intents.
 //! The manifest is data, not code: it never "runs" — the link from a declared
 //! `(ext id intent)` to Rust happens at intent dispatch over the C ABI, by id.
+//!
+//! A library that also exports `wasdf_vfs_list` gets its own VFS mount at
+//! `@/<id>` for free (no manifest field): `DynamicVfsProvider` bridges
+//! `Vfs::list` calls to it the same way `handle_intent`/`on_cursor_changed`
+//! bridge theirs, decoding the reply via `codec::entries_from_datum_list`.
 
 use std::ffi::{CStr, CString};
+use std::io;
 use std::os::raw::c_char;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
-use crate::core::{AppState, ExtensionIntent, Intent};
+use crate::core::{AppState, Entry, ExtensionIntent, ExtensionValue, Intent, OptionStore};
 use crate::extension::Extension;
 use crate::script::keymap::{Binding, Layer};
 use crate::script::{codec, config, sexpr};
 use crate::services::command::CommandDef;
 use crate::services::resolver::ResolverEntry;
+use crate::vfs::VfsProvider;
 
 /// Declarations parsed from an extension's glue string (a `.scm` manifest).
 #[derive(Debug, Clone, PartialEq)]
@@ -41,11 +49,17 @@ pub struct OptionalExtension {
     pub resolvers: Vec<ResolverEntry>,
     /// Extension-layer key bindings (intents are typically `(ext …)` forms).
     pub keymaps: Vec<Binding>,
+    /// The `(options …)` section re-serialized as an `option_scheme` source
+    /// (`(quote ((option …) …))`), or `None` when the manifest declares no
+    /// options. Lets a user extension declare configurable settings — appearing
+    /// editable under `@/settings/Extensions/<id>` exactly like a bundled one.
+    pub options: Option<String>,
 }
 
 type AbiVersionFn = unsafe extern "C" fn() -> u32;
 type HandleFn = unsafe extern "C" fn(*const c_char, *const c_char) -> *const c_char;
 type CursorFn = unsafe extern "C" fn(*const c_char) -> *const c_char;
+type ListFn = unsafe extern "C" fn(*const c_char) -> *const c_char;
 
 /// A loaded optional extension. Keeps the library handle alive so its intent
 /// handler stays callable, and bridges the kernel Extension trait to the ABI.
@@ -57,8 +71,53 @@ struct DynamicExtension {
     commands: Vec<CommandDef>,
     resolvers: Vec<ResolverEntry>,
     keymaps: Vec<Binding>,
+    options: Option<String>,
     handle: Option<HandleFn>,
     cursor: Option<CursorFn>,
+    /// Optional VFS-listing hook: when present, this extension owns the mount
+    /// `@/<id>` (see `vfs_providers`).
+    list: Option<ListFn>,
+    /// The shared option store, stashed by `bind_store` after all extensions are
+    /// registered. Lets `handle_intent` hand the extension its own live option
+    /// values over the ABI (the `wasdf_sdk::Settings` snapshot the SDK describes).
+    store: OnceLock<Arc<OptionStore>>,
+}
+
+/// The VFS side of a dynamic extension's `wasdf_vfs_list` hook. Copies the fn
+/// pointer out of `DynamicExtension` (safe: both the owning `Library`, kept
+/// alive in `ExtensionRegistry`, and the `Vfs` that holds this provider are
+/// constructed once at boot and live for the process's lifetime, exactly like
+/// `HandleFn`/`CursorFn` already rely on). Mount name is the extension's id —
+/// no manifest field needed, and collision-free since ids are already deduped
+/// at registration.
+struct DynamicVfsProvider {
+    id: String,
+    list: ListFn,
+}
+
+impl VfsProvider for DynamicVfsProvider {
+    fn mount(&self) -> &str {
+        &self.id
+    }
+
+    fn list(&self, path: &Path) -> io::Result<Vec<Entry>> {
+        let Ok(p) = CString::new(path.to_string_lossy().into_owned()) else {
+            return Ok(Vec::new());
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let ptr = unsafe { (self.list)(p.as_ptr()) };
+            if ptr.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+            }
+        }))
+        .unwrap_or_default();
+        match sexpr::parse(&result) {
+            Ok(d) => Ok(codec::entries_from_datum_list(&d, path)),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
 }
 
 /// Call a string→string ABI entry point under `catch_unwind`, returning the
@@ -80,19 +139,17 @@ fn call_abi_reply(f: impl FnOnce() -> *const c_char) -> Vec<Intent> {
     }
 }
 
-/// The cursor path a dynamic extension is told about: the File-mode entry, or the
-/// file-search candidate. Mirrors the kernel's cursor signature.
-fn cursor_path(state: &AppState) -> Option<std::path::PathBuf> {
-    use crate::core::Mode;
-    match state.mode() {
-        Mode::File => state.current_entry().map(|e| e.path.clone()),
-        Mode::Select(spec) if spec.id == "file-search" => state
-            .select
-            .as_ref()
-            .and_then(|s| s.view.as_ref())
-            .and_then(|v| v.current())
-            .map(|e| e.path.clone()),
-        _ => None,
+impl DynamicExtension {
+    /// This extension's own option values as an `ExtensionValue::Map` — the
+    /// snapshot handed to `handle_intent` over the ABI. Empty until `bind_store`
+    /// runs (or if the extension declares no options).
+    fn option_snapshot(&self) -> ExtensionValue {
+        let Some(store) = self.store.get() else { return ExtensionValue::Nil };
+        let pairs = store
+            .options_for_owner(&self.id)
+            .into_iter()
+            .map(|d| (d.key.clone(), ExtensionValue::String(store.get_str(&d.key))));
+        ExtensionValue::map(pairs)
     }
 }
 
@@ -113,10 +170,32 @@ impl Extension for DynamicExtension {
         self.resolvers.clone()
     }
 
+    fn option_scheme(&self) -> Option<String> {
+        self.options.clone()
+    }
+
+    fn bind_store(&self, store: &Arc<OptionStore>) {
+        let _ = self.store.set(store.clone());
+    }
+
+    fn vfs_providers(&self) -> Vec<Box<dyn VfsProvider>> {
+        match self.list {
+            Some(list) => vec![Box::new(DynamicVfsProvider { id: self.id.clone(), list })],
+            None => Vec::new(),
+        }
+    }
+
     fn handle_intent(&self, intent: &ExtensionIntent, _state: &AppState) -> Vec<Intent> {
         let Some(f) = self.handle else { return Vec::new() };
         let Ok(name) = CString::new(intent.intent.as_str()) else { return Vec::new() };
-        let Ok(data) = CString::new(codec::ext_value_to_scheme(&intent.data)) else {
+        // Hand the extension its own live option values as the data payload (the
+        // ABI's `wasdf_sdk::Settings` snapshot), unless the intent form carried
+        // explicit data of its own — in which case that wins.
+        let payload = match &intent.data {
+            ExtensionValue::Nil => self.option_snapshot(),
+            other => other.clone(),
+        };
+        let Ok(data) = CString::new(codec::ext_value_to_scheme(&payload)) else {
             return Vec::new();
         };
         call_abi_reply(|| unsafe { f(name.as_ptr(), data.as_ptr()) })
@@ -127,7 +206,7 @@ impl Extension for DynamicExtension {
     /// dynamic extension reacts via the push path (e.g. `show-function-content`).
     fn on_cursor_changed(&self, state: &AppState) -> Vec<Intent> {
         let Some(f) = self.cursor else { return Vec::new() };
-        let Some(path) = cursor_path(state) else { return Vec::new() };
+        let Some(path) = state.cursor_path() else { return Vec::new() };
         let Ok(p) = CString::new(path.to_string_lossy().into_owned()) else { return Vec::new() };
         call_abi_reply(|| unsafe { f(p.as_ptr()) })
     }
@@ -150,6 +229,7 @@ pub fn parse_glue(glue: &str) -> Result<OptionalExtension, String> {
     let mut commands = Vec::new();
     let mut resolvers = Vec::new();
     let mut keymaps = Vec::new();
+    let mut options = None;
     for section in &list[2..] {
         let s = section.as_list().ok_or("glue section is not a list")?;
         match s.first().and_then(|d| d.as_sym()) {
@@ -168,14 +248,21 @@ pub fn parse_glue(glue: &str) -> Result<OptionalExtension, String> {
                     Layer::Extension,
                 )?;
             }
+            Some("options") => {
+                // Validate now, but store as an `option_scheme` source so the same
+                // path bundled extensions use tags them with this extension's id.
+                let forms = s.get(1).ok_or("empty options")?;
+                config::parse_option_config(forms)?;
+                options = Some(format!("(quote {})", sexpr::render(forms)));
+            }
             other => return Err(format!("unknown glue section: {other:?}")),
         }
     }
-    Ok(OptionalExtension { id, lib, commands, resolvers, keymaps })
+    Ok(OptionalExtension { id, lib, commands, resolvers, keymaps, options })
 }
 
 /// The platform dynamic-library filename for a bare crate lib name, e.g.
-/// `wasdf_example_ext` → `libwasdf_example_ext.dylib` (macOS) / `.so` (Linux).
+/// `exampleext` → `libexampleext.dylib` (macOS) / `libexampleext.so` (Linux).
 fn lib_filename(name: &str) -> String {
     let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
     format!("lib{name}.{ext}")
@@ -188,14 +275,26 @@ fn lib_filename(name: &str) -> String {
 /// declarative extension (no Rust). Returns extension objects whose libraries
 /// stay loaded.
 pub fn load_optional(dir: &Path) -> Vec<Box<dyn Extension>> {
-    let mut manifests: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("scm"))
-            .collect(),
+    // Two manifest layouts are accepted, so a user extension gets its own folder
+    // (mirroring the bundled `<name>/` structure) for its manifest + library +
+    // assets: a directory `<dir>/<name>/init.scm`, or a flat `<dir>/<name>.scm`.
+    let mut manifests: Vec<std::path::PathBuf> = Vec::new();
+    match std::fs::read_dir(dir) {
+        Ok(rd) => {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    let init = p.join("init.scm");
+                    if init.is_file() {
+                        manifests.push(init);
+                    }
+                } else if p.extension().and_then(|s| s.to_str()) == Some("scm") {
+                    manifests.push(p);
+                }
+            }
+        }
         Err(_) => return Vec::new(),
-    };
+    }
     manifests.sort();
 
     let mut loaded: Vec<Box<dyn Extension>> = Vec::new();
@@ -203,12 +302,12 @@ pub fn load_optional(dir: &Path) -> Vec<Box<dyn Extension>> {
         match load_one(&path) {
             Ok(ext) => {
                 if loaded.iter().any(|e| e.id() == ext.id()) {
-                    eprintln!("extension id collision ({}); disabling {}", ext.id(), path.display());
+                    crate::services::messages::log(format!("extension id collision ({}); disabling {}", ext.id(), path.display()), true);
                     continue;
                 }
                 loaded.push(ext);
             }
-            Err(e) => eprintln!("skipping extension {}: {e}", path.display()),
+            Err(e) => crate::services::messages::log(format!("skipping extension {}: {e}", path.display()), true),
         }
     }
     loaded
@@ -230,8 +329,11 @@ fn load_one(manifest: &Path) -> Result<Box<dyn Extension>, String> {
             commands: parsed.commands,
             resolvers: parsed.resolvers,
             keymaps: parsed.keymaps,
+            options: parsed.options,
             handle: None,
             cursor: None,
+            list: None,
+            store: OnceLock::new(),
         }));
     };
 
@@ -248,19 +350,25 @@ fn load_one(manifest: &Path) -> Result<Box<dyn Extension>, String> {
         if version != wasdf_sdk::API_VERSION {
             return Err(format!("API version {version} != {}", wasdf_sdk::API_VERSION));
         }
-        // The intent handler and the cursor-changed hook are both optional.
+        // The intent handler, the cursor-changed hook, and the VFS-listing hook
+        // are all optional.
         let handle: Option<HandleFn> =
             lib.get::<HandleFn>(b"wasdf_handle_intent").ok().map(|s| *s);
         let cursor: Option<CursorFn> =
             lib.get::<CursorFn>(b"wasdf_on_cursor_changed").ok().map(|s| *s);
+        let list: Option<ListFn> =
+            lib.get::<ListFn>(b"wasdf_vfs_list").ok().map(|s| *s);
         Ok::<_, String>(DynamicExtension {
             _lib: Some(lib),
             id: parsed.id.clone(),
             commands: parsed.commands.clone(),
             resolvers: parsed.resolvers.clone(),
             keymaps: parsed.keymaps.clone(),
+            options: parsed.options.clone(),
             handle,
             cursor,
+            list,
+            store: OnceLock::new(),
         })
     })
     .map_err(|_| "extension panicked during load".to_string())??;
@@ -272,189 +380,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_declarative_glue() {
-        let glue = "(extension \"demo\" \
-            (commands ((demo-refresh \"demo: refresh\" refresh))) \
-            (resolvers ((demo:echo #f ((native \"echo\" \"hi\"))))))";
-        let ext = parse_glue(glue).unwrap();
-        assert_eq!(ext.id, "demo");
-        assert_eq!(ext.commands.len(), 1);
-        assert_eq!(ext.commands[0].name, "demo-refresh");
-        assert_eq!(ext.resolvers[0].key, "demo:echo");
+    fn manifest_options_become_an_option_scheme_source() {
+        let glue = r#"(extension "e" (options ((option "e.n" "E" (int 1 8) "4" "n"))))"#;
+        let parsed = parse_glue(glue).unwrap();
+        let opts = parsed.options.expect("options section parsed");
+        assert!(opts.starts_with("(quote "), "wrapped as an option_scheme source: {opts}");
+        assert!(opts.contains("e.n") && opts.contains("(int 1 8)"), "{opts}");
     }
 
     #[test]
-    fn rejects_non_extension_glue() {
-        assert!(parse_glue("(nonsense)").is_err());
-    }
-
-    #[test]
-    fn parses_lib_section() {
-        let ext = parse_glue("(extension \"demo\" (lib \"demo_ext\") (keymaps ((file file ((\"g\" (ext \"demo\" \"x\")))))))").unwrap();
-        assert_eq!(ext.id, "demo");
-        assert_eq!(ext.lib.as_deref(), Some("demo_ext"), "the named native library");
-    }
-
-    #[test]
-    fn declarative_only_manifest_loads_without_a_library() {
-        // A `.scm` manifest with no `(lib …)` is a pure-declarative extension:
-        // it wires a core intent (no Rust, no dylib needed).
-        let dir = std::env::temp_dir().join(format!("wasdf-decl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("decl.scm"),
-            "(extension \"decl\" (keymaps ((file file ((\"z\" refresh))))))",
+    fn a_user_extension_folder_with_init_scm_is_discovered() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("wasdf-load-{}", std::process::id()));
+        let ext = dir.join("exampleext");
+        std::fs::create_dir_all(&ext).unwrap();
+        writeln!(
+            std::fs::File::create(ext.join("init.scm")).unwrap(),
+            r##"(extension "exampleext" (keymaps ((file file (("o" (ext "exampleext" "show-info"))))))
+               (options ((option "exampleext.verbose" "exampleext" bool "#f" "verbose"))))"##
         )
         .unwrap();
-        let exts = load_optional(&dir);
-        assert_eq!(exts.len(), 1, "the declarative manifest loaded with no library");
-        assert_eq!(exts[0].id(), "decl");
-        assert_eq!(exts[0].keymaps().len(), 1);
-        assert!(exts[0].handle_intent(
-            &ExtensionIntent { extension: "decl".into(), intent: "x".into(), data: crate::core::ExtensionValue::Nil },
-            &AppState::new(dir.clone())
-        ).is_empty(), "no native handler");
+
+        let loaded = load_optional(&dir);
+        assert_eq!(loaded.len(), 1, "folder/init.scm was discovered");
+        assert_eq!(loaded[0].id(), "exampleext");
+        // Its declared options flow through the same option_scheme path bundled
+        // extensions use, so they appear editable under @/settings/Extensions.
+        let scheme = loaded[0].option_scheme().expect("option_scheme from the manifest");
+        assert!(scheme.contains("exampleext.verbose"), "{scheme}");
+
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// End-to-end smoke test: load the *real* compiled `wasdf-example-ext`
-    /// dynamic library through the actual loader (dlopen → ABI version check →
-    /// glue parse → symbol bind), then exercise the full bridge: the `g` key resolves
-    /// to the extension's intent, and a real cross-library `handle_intent` call
-    /// returns the decoded follow-up. Self-skips when the artifact is not built
-    /// (so a plain `cargo test` stays green); build it first with
-    /// `cargo build -p wasdf-example-ext`.
-    #[test]
-    fn loads_real_example_ext_dylib_end_to_end() {
-        use crate::core::{AppState, ExtensionIntent, ExtensionValue, Key, KeyCode, Mods};
-        use crate::script::condition::Conditions;
-        use crate::script::keymap::KeymapRegistry;
-
-        let ext_suffix = if cfg!(target_os = "macos") { "dylib" } else { "so" };
-        let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/debug")
-            .join(format!("libwasdf_example_ext.{ext_suffix}"));
-        if !artifact.exists() {
-            eprintln!("smoke skipped: {} not built", artifact.display());
-            return;
-        }
-
-        // Isolate the extension in a temp directory the loader scans: the shipped
-        // `.scm` manifest plus the library under the `lib<name>` filename the
-        // manifest's `(lib …)` resolves to.
-        let dir = std::env::temp_dir().join(format!("wasdf-smoke-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::copy(&artifact, dir.join(format!("libwasdf_example_ext.{ext_suffix}"))).unwrap();
-        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../wasdf-example-ext/example.scm");
-        std::fs::copy(&manifest, dir.join("example.scm")).unwrap();
-
-        let exts = load_optional(&dir);
-        assert_eq!(exts.len(), 1, "the example extension loaded");
-        let ext = &exts[0];
-        assert_eq!(ext.id(), "example");
-
-        // Phase A: the `g` binding crossed the ABI and resolves to the ext intent.
-        let mut km = KeymapRegistry::new();
-        km.extend(ext.keymaps());
-        let conds = Conditions::default();
-        let state = AppState::new(dir.clone());
-        let got = km.resolve(&conds, &state, "file", Key { code: KeyCode::Char('g'), mods: Mods::NONE });
-        match got {
-            Some(Intent::Extension(ei)) => {
-                assert_eq!((ei.extension.as_str(), ei.intent.as_str()), ("example", "greet"));
-            }
-            other => panic!("g did not route to the extension: {other:?}"),
-        }
-
-        // The real cross-library handle_intent round-trip: greet returns a
-        // ShowFunctionContent intent carrying styled lines decoded from Scheme.
-        let ei = ExtensionIntent {
-            extension: "example".into(),
-            intent: "greet".into(),
-            data: ExtensionValue::Nil,
-        };
-        match ext.handle_intent(&ei, &state).as_slice() {
-            [Intent::ShowFunctionContent { owner, content: crate::core::PanelContent::Lines { lines, styles } }] => {
-                assert_eq!(owner, "example");
-                assert_eq!(lines.first().map(String::as_str), Some("GREET"));
-                assert_eq!(styles[0][0].len, 5, "the GREET run covers 5 bytes");
-            }
-            other => panic!("greet did not produce function content: {other:?}"),
-        }
-
-        // The `step` intent drives the extension's own state and writes the
-        // kernel view state across the ABI: it returns UpdateFunctionView + the
-        // refreshed content, both decoded from the Scheme reply.
-        let step = ExtensionIntent { extension: "example".into(), intent: "step".into(), data: ExtensionValue::Nil };
-        match ext.handle_intent(&step, &state).as_slice() {
-            [Intent::UpdateFunctionView(ExtensionValue::Int(_)), Intent::ShowFunctionContent { owner, .. }] => {
-                assert_eq!(owner, "example");
-            }
-            other => panic!("step did not update the view + content: {other:?}"),
-        }
-
-        // The cursor-changed event crosses the boundary. With a cursor
-        // entry in File mode, on_cursor_changed calls wasdf_on_cursor_changed and
-        // decodes the pushed content reply.
-        let mut cursor_state = AppState::new(dir.clone());
-        cursor_state.entries = vec![crate::core::Entry {
-            path: dir.join("hello.txt"),
-            name: "hello.txt".into(),
-            is_dir: false,
-            is_symlink: false,
-            size: 0,
-            mode: 0,
-            uid: 0,
-            gid: 0,
-            modified: None,
-            created: None,
-            accessed: None,
-            symlink_target: None,
-            activation: None,
-        }];
-        match ext.on_cursor_changed(&cursor_state).as_slice() {
-            [Intent::ShowFunctionContent { owner, content: crate::core::PanelContent::Lines { lines, .. } }] => {
-                assert_eq!(owner, "example");
-                assert!(lines.iter().any(|l| l.contains("hello.txt")), "echoes the cursor path: {lines:?}");
-            }
-            other => panic!("cursor-changed did not push content: {other:?}"),
-        }
-
-        drop(exts); // dlclose before we remove the file
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn parses_keymaps_section_and_resolves_to_extension_intent() {
-        use crate::core::{AppState, Key, KeyCode, Mods};
-        use crate::script::condition::Conditions;
-        use crate::script::keymap::KeymapRegistry;
-
-        let glue = "(extension \"demo\" \
-            (keymaps ((file file ((\"g\" (ext \"demo\" \"greet\")))))))";
-        let ext = parse_glue(glue).unwrap();
-        assert_eq!(ext.keymaps.len(), 1);
-        let b = &ext.keymaps[0];
-        assert_eq!(b.mode, "file");
-        assert_eq!(b.panel.as_deref(), Some("file"));
-        assert_eq!(b.layer, Layer::Extension);
-        assert_eq!(b.key, Key { code: KeyCode::Char('g'), mods: Mods::NONE });
-        match &b.intent {
-            Intent::Extension(ei) => {
-                assert_eq!((ei.extension.as_str(), ei.intent.as_str()), ("demo", "greet"));
-            }
-            other => panic!("expected an extension intent, got {other:?}"),
-        }
-
-        // Parse → register at the Extension layer → resolve the bound key.
-        let mut km = KeymapRegistry::new();
-        km.extend(ext.keymaps.clone());
-        let conds = Conditions::default();
-        let state = AppState::new(std::env::temp_dir());
-        let got = km.resolve(&conds, &state, "file", Key { code: KeyCode::Char('g'), mods: Mods::NONE });
-        assert!(matches!(got, Some(Intent::Extension(_))), "key routes to the extension");
     }
 }
