@@ -229,7 +229,7 @@ pub fn would_overwrite(req: &ResolverRequest, cwd: &Path) -> bool {
 }
 
 /// True when `cmd` is an absolute runnable file or is found on PATH.
-fn is_runnable(cmd: &str) -> bool {
+pub(crate) fn is_runnable(cmd: &str) -> bool {
     let p = Path::new(cmd);
     if p.is_absolute() {
         return p.is_file();
@@ -244,87 +244,13 @@ fn is_runnable(cmd: &str) -> bool {
     false
 }
 
-/// The embedded default resolver entries (the Scheme `defresolvers` analogue).
-pub fn defaults() -> Vec<ResolverEntry> {
-    use ArgEl::{Lit, Ph};
-    use Kind::Native;
-    use Slot::{Dst, Opts, Path, Paths, Src};
-    let lit = |s: &str| Lit(s.to_string());
-    let opt = |token: &str, label: &str| OptDef { token: token.into(), label: label.into() };
-    vec![
-        ResolverEntry {
-            key: "copy".into(),
-            destructive: false,
-            options: vec![opt("-v", "verbose"), opt("-n", "no-clobber")],
-            candidates: vec![Candidate {
-                kind: Native,
-                argv: vec![lit("cp"), lit("-R"), Ph(Opts), Ph(Paths), Ph(Dst)],
-            }],
-        },
-        ResolverEntry {
-            key: "move".into(),
-            destructive: false,
-            options: vec![opt("-v", "verbose"), opt("-n", "no-clobber")],
-            candidates: vec![Candidate {
-                kind: Native,
-                argv: vec![lit("mv"), Ph(Opts), Ph(Paths), Ph(Dst)],
-            }],
-        },
-        ResolverEntry {
-            key: "delete".into(),
-            destructive: true,
-            options: vec![],
-            candidates: vec![Candidate {
-                kind: Native,
-                argv: vec![lit("rm"), lit("-rf"), Ph(Paths)],
-            }],
-        },
-        ResolverEntry {
-            key: "rename".into(),
-            destructive: false,
-            options: vec![],
-            candidates: vec![Candidate {
-                kind: Native,
-                argv: vec![lit("mv"), Ph(Src), Ph(Dst)],
-            }],
-        },
-        ResolverEntry {
-            key: "mkdir".into(),
-            destructive: false,
-            options: vec![],
-            candidates: vec![Candidate {
-                kind: Native,
-                argv: vec![lit("mkdir"), lit("-p"), Ph(Path)],
-            }],
-        },
-        ResolverEntry {
-            key: "touch".into(),
-            destructive: false,
-            options: vec![],
-            candidates: vec![Candidate {
-                kind: Native,
-                argv: vec![lit("touch"), Ph(Path)],
-            }],
-        },
-        ResolverEntry {
-            key: "open".into(),
-            destructive: false,
-            options: vec![],
-            candidates: vec![
-                Candidate { kind: Kind::NativeMacos, argv: vec![lit("open"), Ph(Path)] },
-                Candidate { kind: Kind::NativeLinux, argv: vec![lit("xdg-open"), Ph(Path)] },
-            ],
-        },
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn chain() -> ResolverChain {
         let mut c = ResolverChain::new();
-        c.extend(defaults());
+        c.extend(crate::app::defaults::resolvers());
         c
     }
 

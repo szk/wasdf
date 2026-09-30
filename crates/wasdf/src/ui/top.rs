@@ -19,25 +19,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::core::{AppState, Mode, Role, SubLayout, Theme};
-use crate::ui::chrome::{self, PanelFrame};
-use crate::ui::render::split_h;
+use crate::ui::chrome::{self, PanelArea, PanelFrame};
 
 // ── TopOptions ────────────────────────────────────────────────────────────────
 
-/// Options that control the top-panel layout. Extracted once from
-/// `Arc<RwLock<Options>>` at the start of each render frame.
+/// The per-frame snapshot of the display options the renderers read (the
+/// panel geometry itself comes from the layout).
 pub struct TopOptions {
     pub border_style: String,
-    /// Relative width weight for the nav panel (default 5).
-    pub nav_weight: u32,
-    /// Whether the prop panel is shown (default true).
-    pub prop_visible: bool,
-    /// Relative width weight for the prop panel (default 2).
-    pub prop_weight: u32,
-    /// Whether the monitor panel is shown (default true).
-    pub monitor_visible: bool,
-    /// Relative width weight for the monitor panel (default 2).
-    pub monitor_weight: u32,
     /// Per-metric monitor customization.
     pub monitor: MonitorOptions,
     /// Scrollbar glyphs.
@@ -53,11 +42,6 @@ impl Default for TopOptions {
     fn default() -> Self {
         TopOptions {
             border_style: "single".into(),
-            nav_weight: 5,
-            prop_visible: true,
-            prop_weight: 2,
-            monitor_visible: true,
-            monitor_weight: 2,
             monitor: MonitorOptions::default(),
             scrollbar: crate::ui::chrome::ScrollbarChars::default(),
             file_row_size_graph: true,
@@ -135,55 +119,51 @@ impl MonitorOptions {
 
 const NAME_CAP: usize = 14;
 
-/// Render the top panel, splitting it into nav / prop / monitor.
-///
-/// `func_x` is the absolute column of the function panel's left border when it
-/// is visible; `None` means no function panel. This is used to position the
-/// path/filename labels in the nav panel's bottom border.
-pub fn render_top(
-    frame: &mut Frame,
-    area: Rect,
+/// The path and file-name labels (doc/UI.md, Screen chrome): the path on the
+/// top border of the file panel — in the select layout, of the panel in its
+/// place — and, while the function panel previews a file and shares that line,
+/// the file name after the junction. `function` is the function panel's rect
+/// when it is shown; `function_title` is the title it drew.
+pub fn border_labels(
     state: &AppState,
-    vfs: &crate::vfs::Vfs,
-    panels: &mut Vec<PanelFrame>,
-    opts: &TopOptions,
-    func_x: Option<u16>,
-    theme: &Theme,
-) {
-    let (nav_r, prop_r, mon_r) = layout_panels(area, opts);
-
-    // The bottom border is one connected line spanning the whole top area, so the
-    // labels are budgeted against the full top width (`area`), not the nav panel's
-    // slice. It carries the file panel's focus so the labels are themed focus-aware
-    // (they live on the nav border but belong to the file/function panels).
+    anchor: Rect,
+    function: Option<Rect>,
+    function_title: Option<&str>,
+    border_style: &str,
+) -> Vec<chrome::BorderLabel> {
+    // Only a function panel on the same line joins the path's line; one placed
+    // elsewhere keeps its own title on its own border.
+    let beside = function.filter(|f| f.y == anchor.y && f.x > anchor.x);
+    let span = match beside {
+        Some(f) => Rect { width: f.x + f.width - anchor.x, ..anchor },
+        None => anchor,
+    };
     let cwd_str = state.cwd.to_string_lossy().into_owned();
-    // The cursor filename is placed after the function-panel junction only while
-    // the function panel previews file content — that is the one frame where its
-    // title *is* the shown file's name (doc/UI.md). In Command / Exec / Select the
-    // function panel keeps its own mode title, so no filename is drawn there.
-    let name: Option<String> = if !matches!(state.mode(), Mode::Select(_))
+    // The file name is placed after the junction only while the function panel
+    // previews file content — the one frame where its title *is* the shown
+    // file's name. In Command / Exec / Select it keeps its own mode title.
+    let name: Option<String> = if beside.is_some()
+        && !matches!(state.mode(), Mode::Select(_))
         && state.function.visible
         && state.function.sublayout == SubLayout::Content
     {
-        state.current_entry().map(|e| e.name.clone())
+        function_title.map(str::to_string)
     } else {
         None
     };
-    let (nav_bottom, nav_name) =
-        plan_bottom_labels(&cwd_str, name.as_deref(), area, func_x, &opts.border_style);
-    // The two bottom-border labels follow independent focus: the path is the file
-    // panel's title, the filename is the function panel's. (They sit on the nav
-    // border but each reflects its own owner's focus, not the nav panel's.)
-    let file_focused = state.focused_panel == crate::core::PANEL_FILE;
-    let func_focused = state.focused_panel == crate::core::PANEL_FUNCTION;
-
-    render_nav(frame, nav_r, state, vfs, panels, nav_bottom, nav_name, file_focused, func_focused, theme);
-    if let Some(r) = prop_r {
-        render_prop(frame, r, state, panels, theme);
+    let (path, named) = plan_bottom_labels(&cwd_str, name.as_deref(), span, beside.map(|f| f.x), border_style);
+    let right = span.x + span.width - 1;
+    let mut out = vec![chrome::BorderLabel {
+        x: span.x + 2,
+        y: span.y,
+        right,
+        text: path,
+        focused: state.focused_panel == crate::core::PANEL_FILE,
+    }];
+    if let Some((x, text)) = named {
+        out.push(chrome::BorderLabel { x, y: span.y, right, text, focused: state.focused_panel == crate::core::PANEL_FUNCTION });
     }
-    if let Some(r) = mon_r {
-        render_monitor(frame, r, state, panels, &opts.border_style, &opts.monitor, theme);
-    }
+    out
 }
 
 /// Lay out the top area's bottom-border labels — the current **path** (left,
@@ -318,70 +298,6 @@ fn bracket_truncated(text: &str, max_width: usize) -> String {
     format!("[ {}… ]", text.chars().take(avail).collect::<String>())
 }
 
-// ── 3-way layout ─────────────────────────────────────────────────────────────
-
-/// Minimum content widths (excluding chrome borders) for each panel.
-const MIN_NAV: u16 = 22;
-const MIN_PROP: u16 = 18;
-const MIN_MON: u16 = 16;
-
-/// Compute which panels are shown and their rects given the available area.
-/// Optional panels collapse gracefully when the terminal is too narrow:
-/// monitor drops first, then prop.
-fn layout_panels(area: Rect, opts: &TopOptions) -> (Rect, Option<Rect>, Option<Rect>) {
-    let w = area.width;
-
-    let (show_prop, show_mon) = if opts.prop_visible && opts.monitor_visible {
-        if w >= MIN_NAV + MIN_PROP + MIN_MON { (true, true) }
-        else if w >= MIN_NAV + MIN_PROP { (true, false) }
-        else { (false, false) }
-    } else if opts.prop_visible {
-        (w >= MIN_NAV + MIN_PROP, false)
-    } else if opts.monitor_visible {
-        (false, w >= MIN_NAV + MIN_MON)
-    } else {
-        (false, false)
-    };
-
-    if !show_prop && !show_mon {
-        return (area, None, None);
-    }
-
-    let nw = opts.nav_weight.max(1) as u32;
-    let pw = opts.prop_weight.max(1) as u32;
-    let mw = opts.monitor_weight.max(1) as u32;
-
-    if show_prop && show_mon {
-        let tw = nw + pw + mw;
-        let nav_px = ((w as u32 * nw / tw) as u16)
-            .max(MIN_NAV)
-            .min(w.saturating_sub(MIN_PROP + MIN_MON));
-        // Remaining area after nav (split_h overlaps by 1 for shared border).
-        let rest_w = w.saturating_sub(nav_px) + 1;
-        let prop_px = ((rest_w as u32 * pw / (pw + mw)) as u16)
-            .max(MIN_PROP)
-            .min(rest_w.saturating_sub(MIN_MON));
-        let (nav_r, rest) = split_h(area, nav_px);
-        let (prop_r, mon_r) = split_h(rest, prop_px);
-        (nav_r, Some(prop_r), Some(mon_r))
-    } else if show_prop {
-        let tw = nw + pw;
-        let nav_px = ((w as u32 * nw / tw) as u16)
-            .max(MIN_NAV)
-            .min(w.saturating_sub(MIN_PROP));
-        let (nav_r, prop_r) = split_h(area, nav_px);
-        (nav_r, Some(prop_r), None)
-    } else {
-        // show_mon only
-        let tw = nw + mw;
-        let nav_px = ((w as u32 * nw / tw) as u16)
-            .max(MIN_NAV)
-            .min(w.saturating_sub(MIN_MON));
-        let (nav_r, mon_r) = split_h(area, nav_px);
-        (nav_r, None, Some(mon_r))
-    }
-}
-
 // ── Nav panel ─────────────────────────────────────────────────────────────────
 
 /// One column of the navigator.
@@ -393,27 +309,17 @@ struct NavColumn {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_nav(
+pub fn render_nav(
     frame: &mut Frame,
-    area: Rect,
+    pa: PanelArea,
     state: &AppState,
     vfs: &crate::vfs::Vfs,
     panels: &mut Vec<PanelFrame>,
-    nav_bottom: String,
-    nav_name: Option<(u16, String)>,
-    file_focused: bool,
-    func_focused: bool,
     theme: &Theme,
 ) {
     let banner = format!("/ wasdf v{} /", env!("CARGO_PKG_VERSION"));
-    let mut pf = PanelFrame::new(area)
-        .banner(banner)
-        .bottom_info(nav_bottom)
-        .bottom_focused(file_focused);
-    if let Some((x, t)) = nav_name {
-        pf = pf.bottom_right(x, t, func_focused);
-    }
-    let inner = chrome::inner(area);
+    let pf = pa.frame().banner(banner);
+    let inner = pa.inner();
     if inner.width < 4 || inner.height < 1 {
         panels.push(pf);
         return;
@@ -596,8 +502,8 @@ fn nav_put(buf: &mut Buffer, inner: Rect, x: u16, y: u16, ch: char, style: Style
 // ── Prop panel ────────────────────────────────────────────────────────────────
 
 /// The prop panel: SIZE / OWNR / PERM / TIME / INFO.
-fn render_prop(frame: &mut Frame, area: Rect, state: &AppState, panels: &mut Vec<PanelFrame>, theme: &Theme) {
-    let inner = chrome::inner(area);
+pub fn render_prop(frame: &mut Frame, pa: PanelArea, state: &AppState, panels: &mut Vec<PanelFrame>, theme: &Theme) {
+    let inner = pa.inner();
     let w = inner.width as usize;
 
     let lines = match state.current_entry() {
@@ -622,7 +528,7 @@ fn render_prop(frame: &mut Frame, area: Rect, state: &AppState, panels: &mut Vec
         None => vec![Line::from("(empty)")],
     };
     frame.render_widget(Paragraph::new(lines), inner);
-    panels.push(PanelFrame::new(area));
+    panels.push(pa.frame());
 }
 
 // ── Monitor panel ─────────────────────────────────────────────────────────────
@@ -630,16 +536,17 @@ fn render_prop(frame: &mut Frame, area: Rect, state: &AppState, panels: &mut Vec
 /// The monitor panel: CPU load, memory, disk, network throughput. Each metric's
 /// visibility, gauge/value, ratio, refresh cadence, and gauge style are driven by
 /// its `MetricCfg` (configured under `@/settings/Layout/Monitor/<Metric>`).
-fn render_monitor(
+pub fn render_monitor(
     frame: &mut Frame,
-    area: Rect,
+    pa: PanelArea,
     state: &AppState,
     panels: &mut Vec<PanelFrame>,
     border_style: &str,
     mon: &MonitorOptions,
     theme: &Theme,
 ) {
-    let inner = chrome::inner(area);
+    let area = pa.rect;
+    let inner = pa.inner();
     let w = inner.width as usize;
 
     let mut lines: Vec<Line> = Vec::new();
@@ -690,9 +597,9 @@ fn render_monitor(
         format!("[ {time_mm} ]{h_sep}"),
     ];
     if let Some(info) = candidates.iter().find(|s| s.chars().count() <= avail) {
-        panels.push(PanelFrame::new(area).info(info.clone()));
+        panels.push(pa.frame().info(info.clone()));
     } else {
-        panels.push(PanelFrame::new(area));
+        panels.push(pa.frame());
     }
 }
 

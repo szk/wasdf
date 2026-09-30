@@ -26,4 +26,4 @@
   (keymaps ((file file     (("o" (ext "exampleext" "show-info"))))
             (file function (("o" (ext "exampleext" "show-info"))))))
   (options ((option "exampleext.greeting" "exampleext" text "hello" "greeting")
-            (option "exampleext.verbose"  "exampleext" bool "#f"    "verbose"))))
+            (option "exampleext.verbose"  "exampleext" bool #f     "verbose"))))

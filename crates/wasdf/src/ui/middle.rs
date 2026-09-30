@@ -11,19 +11,18 @@
 //! below them, so they use `inner_open_bottom` and set `open_bottom`.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
-use crate::core::{AppState, Mode, Role, SelectInput, SelectPhase, Theme, PANEL_FUNCTION};
+use crate::core::{AppState, Role, SelectPhase, Theme, PANEL_FUNCTION};
 use crate::extension::ExtensionRegistry;
-use crate::ui::chrome::{self, PanelFrame, ScrollInfo};
-use crate::ui::render::{ratio_left, split_h, split_v};
+use crate::ui::chrome::{PanelArea, PanelFrame, ScrollInfo};
 
 mod function;
 
-use function::{is_command_select, render_function};
+pub use function::render_function;
+use function::is_command_select;
 
 /// Persistent top-of-window scroll offsets for the cursor-driven lists (the file
 /// list and the select candidate list). Kept across frames so a list scrolls
@@ -48,6 +47,13 @@ pub struct ScrollMemory {
     /// the pure reducer can move the cursor in 2-D matching the screen.
     list_cols: usize,
     list_rows: usize,
+    /// The function panel's title as of the last render — whatever actually
+    /// owns the panel this frame (a preview's file name, a form extension's own
+    /// title). The top area draws this on the border it shares with the panel
+    /// (see `ui/top.rs`), and it has no other way to know what the panel became:
+    /// `AppState` records *who* owns the panel, never what they chose to call
+    /// it. `None` when nothing is drawing a titled function panel.
+    function_title: Option<String>,
 }
 
 impl Default for ScrollMemory {
@@ -59,6 +65,7 @@ impl Default for ScrollMemory {
             function_hmax: usize::MAX,
             list_cols: 1,
             list_rows: 0,
+            function_title: None,
         }
     }
 }
@@ -85,6 +92,18 @@ impl ScrollMemory {
     pub fn reset_function_bounds(&mut self) {
         self.function_max = usize::MAX;
         self.function_hmax = usize::MAX;
+        self.function_title = None;
+    }
+
+    /// Record the title the function panel is drawn with this frame. Every
+    /// producer of a function-panel `PanelFrame` calls this, so the border label
+    /// the top area draws cannot drift from the panel's own title.
+    pub fn set_function_title(&mut self, title: &str) {
+        self.function_title = Some(title.to_string());
+    }
+
+    pub fn function_title(&self) -> Option<&str> {
+        self.function_title.as_deref()
     }
 }
 
@@ -147,29 +166,6 @@ pub(super) fn focus(state: &AppState) -> Focus {
         Focus::Function
     } else {
         Focus::File
-    }
-}
-
-/// Render the file layout's main area: the file list, plus the function panel at
-/// ratio-right while it is visible.
-#[allow(clippy::too_many_arguments)]
-pub fn render_file_main(
-    frame: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    extensions: &ExtensionRegistry,
-    scroll: &mut ScrollMemory,
-    panels: &mut Vec<PanelFrame>,
-    theme: &Theme,
-    file_row_size_graph: bool,
-) {
-    if state.function.visible {
-        let (lw, rw) = state.function.ratio.weights();
-        let (file, func) = split_h(area, ratio_left(area.width, lw, rw));
-        render_file_list(frame, file, state, extensions, scroll, panels, theme, file_row_size_graph);
-        render_function(frame, func, state, extensions, None, scroll, panels, theme);
-    } else {
-        render_file_list(frame, area, state, extensions, scroll, panels, theme, file_row_size_graph);
     }
 }
 
@@ -596,9 +592,9 @@ fn build_rows_lines_with_props(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_file_list(
+pub fn render_file_list(
     frame: &mut Frame,
-    area: Rect,
+    area: PanelArea,
     state: &AppState,
     extensions: &ExtensionRegistry,
     scroll: &mut ScrollMemory,
@@ -644,7 +640,7 @@ fn render_file_list(
 #[allow(clippy::too_many_arguments)]
 fn render_entry_grid(
     frame: &mut Frame,
-    area: Rect,
+    area: PanelArea,
     entries: &[crate::core::Entry],
     cursor: usize,
     layout: crate::core::ListLayout,
@@ -658,7 +654,7 @@ fn render_entry_grid(
     theme: &Theme,
     file_row_size_graph: bool,
 ) {
-    let inner = chrome::inner_open_bottom(area);
+    let inner = area.inner();
     let n = entries.len();
     let h = inner.height as usize;
 
@@ -689,54 +685,19 @@ fn render_entry_grid(
 
     // Scrollbar reflects the visible window (offset), in visual-row units.
     panels.push(
-        PanelFrame::new(area)
+        area.frame()
             .title(title)
             .focused(focused)
-            .open_bottom(true)
-            .open_left(true)
             .scroll(ScrollInfo { total: rows, viewport: h, position }),
     );
 }
 
-/// Render the select layout's main area: the select input (collapsed when the
-/// spec has no input) above the candidate list, plus the function panel at
-/// ratio-right while the spec sets a function hint.
-pub fn render_select_main(
-    frame: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    extensions: &ExtensionRegistry,
-    scroll: &mut ScrollMemory,
-    panels: &mut Vec<PanelFrame>,
-    theme: &Theme,
-) {
-    let Mode::Select(spec) = state.mode() else { return };
-    let (left, right) = if spec.function_hint.is_some() {
-        let (lw, rw) = state.function.ratio.weights();
-        let (l, r) = split_h(area, ratio_left(area.width, lw, rw));
-        (l, Some(r))
-    } else {
-        (area, None)
-    };
-
-    if !matches!(spec.input, SelectInput::None) {
-        let (input, cands) = split_v(left, 3);
-        render_select_input(frame, input, state, panels, theme);
-        render_select_candidates(frame, cands, state, extensions, scroll, panels, theme);
-    } else {
-        render_select_candidates(frame, left, state, extensions, scroll, panels, theme);
-    }
-    if let Some(r) = right {
-        render_function(frame, r, state, extensions, spec.function_hint.clone(), scroll, panels, theme);
-    }
-}
-
-fn render_select_input(frame: &mut Frame, area: Rect, state: &AppState, panels: &mut Vec<PanelFrame>, theme: &Theme) {
+pub fn render_select_input(frame: &mut Frame, area: PanelArea, state: &AppState, panels: &mut Vec<PanelFrame>, theme: &Theme) {
     let (query, caret, phase) = match &state.select {
         Some(s) => (s.query.clone(), s.caret.min(s.query.len()), s.phase),
         None => return,
     };
-    let inner = chrome::inner(area);
+    let inner = area.inner();
     let marker = match phase {
         SelectPhase::Input => "› ",
         SelectPhase::Navigate => "  ",
@@ -765,13 +726,13 @@ fn render_select_input(frame: &mut Frame, area: Rect, state: &AppState, panels: 
     frame.render_widget(Paragraph::new(line), inner);
     let title = if is_command_select(state) { "Argument" } else { "Search" };
     panels.push(
-        PanelFrame::new(area).title(title).focused(phase == SelectPhase::Input).open_left(true),
+        area.frame().title(title).focused(phase == SelectPhase::Input),
     );
 }
 
-fn render_select_candidates(
+pub fn render_select_candidates(
     frame: &mut Frame,
-    area: Rect,
+    area: PanelArea,
     state: &AppState,
     extensions: &ExtensionRegistry,
     scroll: &mut ScrollMemory,
@@ -802,7 +763,7 @@ fn render_select_candidates(
         );
         return;
     }
-    let inner = chrome::inner_open_bottom(area);
+    let inner = area.inner();
     let items: Vec<ListItem> = sel
         .results
         .iter()
@@ -837,10 +798,8 @@ fn render_select_candidates(
     // as a plain list to browse (like the file panel itself), not a search
     // result count. The command Select keeps its distinct "Options (N)" title
     // (the option checkboxes, a genuinely separate concept from the results).
-    let mut pf = PanelFrame::new(area)
+    let mut pf = area.frame()
         .focused(navigate)
-        .open_bottom(true)
-        .open_left(true)
         .scroll(ScrollInfo {
             total,
             viewport: inner.height as usize,

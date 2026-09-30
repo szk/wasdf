@@ -17,7 +17,7 @@ use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use crate::core::{AppState, Block, ExtensionIntent, Intent, Mode, OptionStore, PanelView, ReadResult, SelectSource, SpanStyle, TextSpan, LINE_NUMBER_WIDTH};
+use crate::core::{AppState, Block, ExtensionIntent, Intent, Mode, OptionStore, PanelView, Content, SelectSource, SpanStyle, TextSpan, LINE_NUMBER_WIDTH};
 use crate::extension::{Extension, FunctionRenderCtx};
 use crate::script::condition::Conditions;
 
@@ -200,7 +200,7 @@ impl Extension for PreviewExtension {
     /// Decode a read chunk (core fetched the bytes/entries off-thread) and fold it
     /// into the stash. The first chunk (offset 0) fixes the content kind and
     /// resets the window; later chunks append. Runs on the main thread.
-    fn accept_content(&self, path: &Path, result: &ReadResult) {
+    fn accept_content(&self, path: &Path, result: &Content) {
         let tab_width = self
             .store
             .get()
@@ -208,14 +208,15 @@ impl Extension for PreviewExtension {
             .unwrap_or(4)
             .max(1);
         match result {
-            ReadResult::Dir { entries } => {
+            Content::Dir { entries } => {
                 *self.content.borrow_mut() = Some(Decoded::Dir { entries: entries.clone() });
                 *self.load.borrow_mut() =
                     Load { path: Some(path.to_path_buf()), eof: true, ..Default::default() };
             }
-            ReadResult::Bytes { offset, bytes, eof } => {
+            Content::Bytes { offset, bytes, eof } => {
                 self.accept_chunk(path, *offset, bytes, *eof, tab_width)
             }
+            Content::Value(_) => return, // never asked for one
         }
         *self.target.borrow_mut() = Some(path.to_path_buf());
     }
@@ -390,7 +391,7 @@ mod tests {
         let path = Path::new("/tmp/a.txt");
         ext.accept_content(
             path,
-            &ReadResult::Bytes { offset: 0, bytes: b"alpha\ncol a here\nbeta\n".to_vec(), eof: true },
+            &Content::Bytes { offset: 0, bytes: b"alpha\ncol a here\nbeta\n".to_vec(), eof: true },
         );
         let out = search(&ext, &state(), "col a");
         assert_eq!(matches(&out), vec![(1, 0, 5)]);
@@ -404,7 +405,7 @@ mod tests {
         // `**bold**` renders as `bold`: the asterisks are markup, not content.
         ext.accept_content(
             path,
-            &ReadResult::Bytes { offset: 0, bytes: b"intro\n\n**bold** tail\n".to_vec(), eof: true },
+            &Content::Bytes { offset: 0, bytes: b"intro\n\n**bold** tail\n".to_vec(), eof: true },
         );
         let state = state();
         assert!(matches(&search(&ext, &state, "**bold**")).is_empty());
@@ -424,7 +425,7 @@ mod tests {
         ext.viewport.set((80, 200));
         ext.accept_content(
             &dir.join("a.md"),
-            &ReadResult::Bytes {
+            &Content::Bytes {
                 offset: 0,
                 bytes: b"top\n\n![i](i.png)\n\nneedle\n".to_vec(),
                 eof: true,

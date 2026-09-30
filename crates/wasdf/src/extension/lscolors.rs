@@ -5,10 +5,8 @@
 mod extension;
 mod parse;
 mod registry;
-mod writer;
 
 pub use extension::LsColorsExtension;
-pub use registry::NamedPalette;
 
 /// The raw preset scheme source (include_str! at compile time).
 pub const PRESETS_SCHEME: &str = include_str!("lscolors/presets.scm");

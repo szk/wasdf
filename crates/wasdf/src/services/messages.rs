@@ -208,7 +208,7 @@ mod tests {
             key: "max-message-line".into(),
             category: "System".into(),
             kind: OptionKind::Int { min: 1, max: 100000 },
-            default: default.into(),
+            default: crate::core::OptionValue::Int(default.parse().unwrap()),
             label: "max-message-line".into(),
             owner: None,
         }]))

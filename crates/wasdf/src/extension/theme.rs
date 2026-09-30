@@ -1,14 +1,14 @@
 //! The `theme` bundled extension: registry, presets, selection, and authoring.
 
 pub mod registry;
-pub mod writer;
 
 pub use registry::{NamedTheme, RoleStyle, ThemeRegistry};
 
 use std::cell::RefCell;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -16,19 +16,68 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Bar, BarChart, BarGroup, Paragraph};
 use ratatui::Frame;
 
-use crate::core::{AppState, Entry, ExtensionIntent, ExtensionValue, InputFormSpec, Intent, Mode, Role, KEY_ITEM};
+use crate::core::{
+    AppState, ConfigWrite, Entry, ExtensionIntent, ExtensionValue, InputFormSpec, Intent, Mode, OptionStore,
+    OptionValue, Role, KEY_ITEM,
+};
 use crate::extension::settings::SettingsNode;
 use crate::extension::{Extension, FunctionRenderCtx};
 use crate::script::condition::Conditions;
 use crate::vfs::vfs_root;
 
-use writer::ThemeWriter;
-
 const ID: &str = "theme";
 const KEYMAP_SCHEME: &str = include_str!("theme/keymap.scm");
+const OPTIONS_SCHEME: &str = include_str!("theme/options.scm");
+const PRELUDE_SCHEME: &str = include_str!("theme/prelude.scm");
+
+/// The registry as a projection of the `theme.active` / `theme.custom`
+/// options: rebuilt whenever the OptionStore's generation moves, so every
+/// reader — the extension, its settings node on a worker thread, the frame's
+/// `resolve_active` — sees the store's state without being told.
+struct ThemeState {
+    registry: Arc<RwLock<ThemeRegistry>>,
+    options: OnceLock<Arc<OptionStore>>,
+    /// The options generation the registry was last built from, plus one
+    /// (0 = never built).
+    synced: AtomicU64,
+}
+
+impl ThemeState {
+    fn sync(&self) {
+        let Some(options) = self.options.get() else { return };
+        let generation = options.generation() + 1;
+        if self.synced.load(Ordering::Acquire) == generation {
+            return;
+        }
+        let customs = options.value("theme.custom").map(|v| registry::customs_from_value(&v)).unwrap_or_default();
+        let active = options.get_str("theme.active");
+        if let Ok(mut reg) = self.registry.write() {
+            reg.replace_customs(customs);
+            if !reg.set_active(&active) {
+                reg.set_active("default");
+            }
+        }
+        self.synced.store(generation, Ordering::Release);
+    }
+
+    fn read(&self) -> Option<RwLockReadGuard<'_, ThemeRegistry>> {
+        self.sync();
+        self.registry.read().ok()
+    }
+
+    /// The `Configure` that stores `themes` as the custom themes.
+    fn write_customs<'a>(themes: impl IntoIterator<Item = &'a NamedTheme>) -> Intent {
+        Intent::Configure(ConfigWrite::SetOption { key: "theme.custom".into(), value: registry::customs_to_value(themes) })
+    }
+
+    /// The `Configure` that makes `name` the active theme.
+    fn write_active(name: &str) -> Intent {
+        Intent::Configure(ConfigWrite::SetOption { key: "theme.active".into(), value: OptionValue::Text(name.into()) })
+    }
+}
 
 /// The live Color-in-panel editor (interior-mutable inside the extension,
-/// mirroring CmdOp's own form — see `extension/cmdop/extension.rs`). Hosted
+/// mirroring CmdOp's own form — see `app/cmdop/builder.rs`). Hosted
 /// in the function panel via `Intent::HostFunctionForm` (passive — the file
 /// panel keeps focus), not a `Mode::InputForm` popup: nothing here round-trips
 /// through `KEY_ITEM`, since the state is entirely local to this extension.
@@ -92,7 +141,7 @@ fn theme_role_from_path(path: Option<&Path>) -> Option<(String, String)> {
 
 /// Serves the `@/settings/Display/Themes` subtree via the `SettingsNode` graft.
 struct ThemeNode {
-    registry: Arc<RwLock<ThemeRegistry>>,
+    state: Arc<ThemeState>,
 }
 
 impl SettingsNode for ThemeNode {
@@ -101,9 +150,7 @@ impl SettingsNode for ThemeNode {
     }
 
     fn list(&self, path: &Path) -> io::Result<Vec<Entry>> {
-        let reg = self.registry.read().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("theme registry lock poisoned: {e}"))
-        })?;
+        let reg = self.state.read().ok_or_else(|| io::Error::other("theme registry lock poisoned"))?;
 
         let depth = path.components().count();
         // @/settings/Display/Themes → depth 4
@@ -226,75 +273,16 @@ impl SettingsNode for ThemeNode {
 // ── ThemeExtension ────────────────────────────────────────────────────────────
 
 pub struct ThemeExtension {
-    pub registry: Arc<RwLock<ThemeRegistry>>,
-    writer: Option<ThemeWriter>,
+    state: Arc<ThemeState>,
     color_edit: RefCell<Option<ColorEdit>>,
 }
 
 impl ThemeExtension {
-    pub fn new(registry: Arc<RwLock<ThemeRegistry>>, config_scm: Option<PathBuf>) -> Self {
-        if let Some(ref path) = config_scm {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                boot_load_config(&registry, &text);
-            }
-        }
-        let writer = config_scm.map(ThemeWriter::new);
-        ThemeExtension { registry, writer, color_edit: RefCell::new(None) }
-    }
-}
-
-/// Parse the managed block in `text` for `(define-theme …)` and `(set-theme …)` forms,
-/// loading customs first so a custom active name is recognized by `set_active`.
-fn boot_load_config(registry: &Arc<RwLock<ThemeRegistry>>, text: &str) {
-    let lines: Vec<&str> = text.lines().collect();
-    let begin = lines.iter().position(|l| l.trim() == writer::BLOCK_BEGIN);
-    let end = lines.iter().position(|l| l.trim() == writer::BLOCK_END);
-    let (Some(b), Some(e)) = (begin, end) else { return };
-    if b >= e { return; }
-    let block = &lines[b + 1..e];
-
-    let mut customs = Vec::new();
-    let mut active_name: Option<String> = None;
-    let mut i = 0;
-
-    while i < block.len() {
-        let t = block[i].trim();
-        if t.starts_with("(define-theme ") {
-            // Multi-line form: count parens to find the closing line.
-            let start = i;
-            let mut depth = 0i32;
-            let mut end_i = i;
-            for j in i..block.len() {
-                for ch in block[j].chars() {
-                    match ch { '(' => depth += 1, ')' => depth -= 1, _ => {} }
-                }
-                end_i = j;
-                if depth <= 0 { break; }
-            }
-            let form_str = block[start..=end_i].join("\n");
-            if let Ok(datum) = crate::script::sexpr::parse(&form_str) {
-                if let Some(nt) = crate::script::config::parse_define_theme(&datum) {
-                    customs.push(nt);
-                }
-            }
-            i = end_i + 1;
-        } else if t.starts_with("(set-theme ") {
-            if let Ok(datum) = crate::script::sexpr::parse(t) {
-                if let Some(name) = crate::script::config::parse_set_theme(&datum) {
-                    active_name = Some(name);
-                }
-            }
-            i += 1;
-        } else {
-            i += 1;
-        }
-    }
-
-    if !customs.is_empty() {
-        let _ = registry.write().map(|mut r| r.load_customs(customs));
-    }
-    if let Some(name) = active_name {
-        let _ = registry.write().map(|mut r| r.set_active(&name));
+    /// `registry` is shared with the frame, which resolves the active theme
+    /// from it; the extension keeps it following the theme options.
+    pub fn new(registry: Arc<RwLock<ThemeRegistry>>) -> Self {
+        let state = ThemeState { registry, options: OnceLock::new(), synced: AtomicU64::new(0) };
+        ThemeExtension { state: Arc::new(state), color_edit: RefCell::new(None) }
     }
 }
 
@@ -305,6 +293,25 @@ impl Extension for ThemeExtension {
 
     fn scheme_source(&self) -> Option<String> {
         Some(KEYMAP_SCHEME.to_string())
+    }
+
+    fn option_scheme(&self) -> Option<String> {
+        Some(OPTIONS_SCHEME.to_string())
+    }
+
+    fn prelude(&self) -> Option<String> {
+        Some(PRELUDE_SCHEME.to_string())
+    }
+
+    fn bind_store(&self, store: &Arc<OptionStore>) {
+        let _ = self.state.options.set(store.clone());
+        self.state.sync();
+    }
+
+    /// Follow the options before the next frame resolves the active theme.
+    fn on_tick(&self, _state: &AppState) -> Vec<Intent> {
+        self.state.sync();
+        Vec::new()
     }
 
     fn register_conditions(&self, c: &mut Conditions) {
@@ -318,7 +325,7 @@ impl Extension for ThemeExtension {
     }
 
     fn settings_nodes(&self) -> Vec<Arc<dyn SettingsNode>> {
-        vec![Arc::new(ThemeNode { registry: self.registry.clone() })]
+        vec![Arc::new(ThemeNode { state: self.state.clone() })]
     }
 
     /// Cursor-follow: the file cursor landing on a custom theme's role leaf
@@ -343,12 +350,9 @@ impl Extension for ThemeExtension {
             // ── Selection ──────────────────────────────────────────────────────
             "set-active" => {
                 let Some(name) = intent.data.as_str() else { return vec![] };
-                let changed = self.registry.write()
-                    .map(|mut r| r.set_active(name))
-                    .unwrap_or(false);
-                if !changed { return vec![]; }
-                if let Some(w) = &self.writer { let _ = w.set_active(name); }
-                vec![Intent::Refresh]
+                let known = self.state.read().is_some_and(|r| r.get(name).is_some());
+                if !known { return vec![]; }
+                vec![ThemeState::write_active(name)]
             }
 
             // ── New theme ──────────────────────────────────────────────────────
@@ -367,22 +371,13 @@ impl Extension for ThemeExtension {
                 };
                 let name = name_raw.trim().to_string();
                 if name.is_empty() { return vec![]; }
-                let new_theme = {
-                    let Ok(reg) = self.registry.read() else { return vec![]; };
-                    if reg.get(&name).is_some() { return vec![]; }
-                    let active = reg.active().to_string();
-                    NamedTheme::seeded(name.clone(), reg.get(&active))
-                };
-                {
-                    let Ok(mut reg) = self.registry.write() else { return vec![]; };
-                    reg.upsert_custom(new_theme.clone());
-                    reg.set_active(&name);
-                }
-                if let Some(w) = &self.writer {
-                    let _ = w.upsert_theme(&new_theme);
-                    let _ = w.set_active(&name);
-                }
-                vec![Intent::Refresh]
+                let Some(reg) = self.state.read() else { return vec![]; };
+                if reg.get(&name).is_some() { return vec![]; }
+                let new_theme = NamedTheme::seeded(name.clone(), reg.get(reg.active()));
+                vec![
+                    ThemeState::write_customs(reg.customs().chain(std::iter::once(&new_theme))),
+                    ThemeState::write_active(&name),
+                ]
             }
 
             // ── Duplicate ──────────────────────────────────────────────────────
@@ -412,21 +407,13 @@ impl Extension for ThemeExtension {
                 let source_name = source_name.to_string();
                 let new_name = new_name_raw.trim().to_string();
                 if new_name.is_empty() { return vec![]; }
-                let new_theme = {
-                    let Ok(reg) = self.registry.read() else { return vec![]; };
-                    if reg.get(&new_name).is_some() { return vec![]; }
-                    NamedTheme::seeded(new_name.clone(), reg.get(&source_name))
-                };
-                {
-                    let Ok(mut reg) = self.registry.write() else { return vec![]; };
-                    reg.upsert_custom(new_theme.clone());
-                    reg.set_active(&new_name);
-                }
-                if let Some(w) = &self.writer {
-                    let _ = w.upsert_theme(&new_theme);
-                    let _ = w.set_active(&new_name);
-                }
-                vec![Intent::Refresh]
+                let Some(reg) = self.state.read() else { return vec![]; };
+                if reg.get(&new_name).is_some() { return vec![]; }
+                let new_theme = NamedTheme::seeded(new_name.clone(), reg.get(&source_name));
+                vec![
+                    ThemeState::write_customs(reg.customs().chain(std::iter::once(&new_theme))),
+                    ThemeState::write_active(&new_name),
+                ]
             }
 
             // ── Rename ─────────────────────────────────────────────────────────
@@ -451,27 +438,17 @@ impl Extension for ThemeExtension {
                 let old_name = old_name.to_string();
                 let new_name = new_name_raw.trim().to_string();
                 if new_name.is_empty() { return vec![]; }
-                let (was_active, renamed) = {
-                    let Ok(reg) = self.registry.read() else { return vec![]; };
-                    if reg.get(&new_name).is_some() { return vec![]; }
-                    let Some(old_nt) = reg.get(&old_name) else { return vec![]; };
-                    if old_nt.preset { return vec![]; }
-                    let was_active = reg.active() == old_name;
-                    let renamed = NamedTheme::seeded(new_name.clone(), Some(old_nt));
-                    (was_active, renamed)
-                };
-                {
-                    let Ok(mut reg) = self.registry.write() else { return vec![]; };
-                    reg.remove_custom(&old_name);
-                    reg.upsert_custom(renamed.clone());
-                    if was_active { reg.set_active(&new_name); }
+                let Some(reg) = self.state.read() else { return vec![]; };
+                if reg.get(&new_name).is_some() { return vec![]; }
+                let Some(old_nt) = reg.get(&old_name) else { return vec![]; };
+                if old_nt.preset { return vec![]; }
+                let renamed = NamedTheme::seeded(new_name.clone(), Some(old_nt));
+                let customs = reg.customs().map(|t| if t.name == old_name { &renamed } else { t });
+                let mut out = vec![ThemeState::write_customs(customs)];
+                if reg.active() == old_name {
+                    out.push(ThemeState::write_active(&new_name));
                 }
-                if let Some(w) = &self.writer {
-                    let _ = w.remove_theme(&old_name);
-                    let _ = w.upsert_theme(&renamed);
-                    if was_active { let _ = w.set_active(&new_name); }
-                }
-                vec![Intent::Refresh]
+                out
             }
 
             // ── Edit role fg + bg + modifiers ─────────────────────────────────
@@ -518,7 +495,7 @@ impl Extension for ThemeExtension {
             // ── Delete ─────────────────────────────────────────────────────────
             "delete" => {
                 let Some(name) = intent.data.as_str() else { return vec![] };
-                let is_preset = self.registry.read().ok()
+                let is_preset = self.state.read()
                     .and_then(|r| r.get(name).map(|nt| nt.preset))
                     .unwrap_or(true);
                 if is_preset { return vec![]; }
@@ -531,18 +508,14 @@ impl Extension for ThemeExtension {
             }
             "delete-confirm" => {
                 let Some(name) = intent.data.as_str() else { return vec![] };
-                let was_active = self.registry.read().ok()
-                    .map(|r| r.active() == name)
-                    .unwrap_or(false);
-                let _ = self.registry.write().map(|mut r| r.remove_custom(name));
-                if let Some(w) = &self.writer { let _ = w.remove_theme(name); }
-                if was_active {
-                    let _ = self.registry.write().map(|mut r| r.set_active("default"));
-                    if let Some(w) = &self.writer { let _ = w.set_active("default"); }
+                let Some(reg) = self.state.read() else { return vec![]; };
+                let mut out = vec![ThemeState::write_customs(reg.customs().filter(|t| t.name != name))];
+                if reg.active() == name {
+                    out.push(ThemeState::write_active("default"));
                 }
                 // The deleted theme's directory is gone — return to the Themes root.
-                let themes_root = vfs_root().join("settings").join("Display").join("Themes");
-                vec![Intent::NavigateTo(themes_root)]
+                out.push(Intent::NavigateTo(vfs_root().join("settings").join("Display").join("Themes")));
+                out
             }
 
             _ => Vec::new(),
@@ -567,25 +540,20 @@ impl ThemeExtension {
         let new_style = RoleStyle { fg, bg, bold: mods[0], italic: mods[1], underline: mods[2] };
         let default = registry::default_style(role);
 
-        let updated = {
-            let Ok(reg) = self.registry.read() else { return vec![]; };
-            let Some(nt) = reg.get(theme_name) else { return vec![]; };
-            if nt.preset { return vec![]; }
+        let Some(reg) = self.state.read() else { return vec![]; };
+        let Some(nt) = reg.get(theme_name) else { return vec![]; };
+        if nt.preset { return vec![]; }
 
-            let mut new_overrides = nt.overrides.clone();
-            if new_style == default {
-                new_overrides.retain(|(r, _)| *r != role);
-            } else if let Some(pos) = new_overrides.iter().position(|(r, _)| *r == role) {
-                new_overrides[pos].1 = new_style;
-            } else {
-                new_overrides.push((role, new_style));
-            }
-
-            NamedTheme { name: nt.name.clone(), preset: false, overrides: new_overrides }
-        };
-        { let Ok(mut reg) = self.registry.write() else { return vec![]; }; reg.upsert_custom(updated.clone()); }
-        if let Some(w) = &self.writer { let _ = w.upsert_theme(&updated); }
-        vec![Intent::Refresh]
+        let mut new_overrides = nt.overrides.clone();
+        if new_style == default {
+            new_overrides.retain(|(r, _)| *r != role);
+        } else if let Some(pos) = new_overrides.iter().position(|(r, _)| *r == role) {
+            new_overrides[pos].1 = new_style;
+        } else {
+            new_overrides.push((role, new_style));
+        }
+        let updated = NamedTheme { name: nt.name.clone(), preset: false, overrides: new_overrides };
+        vec![ThemeState::write_customs(reg.customs().map(|t| if t.name == theme_name { &updated } else { t }))]
     }
 
     /// Seed (or refresh) the live `ColorEdit` from the named custom theme's
@@ -598,7 +566,7 @@ impl ThemeExtension {
     /// `edit-role` manual fallback).
     fn open_editor(&self, theme_name: &str, role_tok: &str) -> Option<Vec<Intent>> {
         let role = Role::from_token(role_tok)?;
-        let reg = self.registry.read().ok()?;
+        let reg = self.state.read()?;
         let nt = reg.get(theme_name)?;
         if nt.preset {
             return None;
@@ -828,9 +796,22 @@ mod tests {
     use super::*;
 
     fn parse_presets() -> Vec<NamedTheme> {
-        let datum = crate::script::sexpr::parse(PRESETS_SCHEME).expect("presets.scm parses");
-        let inner = datum.as_list().and_then(|l| l.get(1)).cloned().expect("(quote (...))");
-        crate::script::config::parse_theme_config(&inner)
+        registry::parse_presets(PRESETS_SCHEME)
+    }
+
+    fn theme_options() -> Arc<OptionStore> {
+        Arc::new(OptionStore::new(crate::app::defaults::extension_options(&ThemeExtension::new(Arc::new(RwLock::new(ThemeRegistry::bundled()))))))
+    }
+
+    /// What the kernel does with a returned `Configure`: the store accepts it
+    /// and the projection (the OptionStore) follows.
+    fn apply(ext: &ThemeExtension, intents: Vec<Intent>) {
+        let store = ext.state.options.get().unwrap();
+        for i in intents {
+            if let Intent::Configure(ConfigWrite::SetOption { key, value }) = i {
+                assert!(store.set(&key, value), "the theme options accept {key}");
+            }
+        }
     }
 
     #[test]
@@ -857,8 +838,8 @@ mod tests {
     }
 
     fn ext_with_custom(name: &str, source: &str) -> ThemeExtension {
-        let registry = Arc::new(RwLock::new(ThemeRegistry::with_presets(parse_presets())));
-        let ext = ThemeExtension::new(registry, None);
+        let ext = ThemeExtension::new(Arc::new(RwLock::new(ThemeRegistry::bundled())));
+        ext.bind_store(&theme_options());
         let intent = ExtensionIntent {
             extension: "theme".into(),
             intent: "duplicate-apply".into(),
@@ -867,7 +848,8 @@ mod tests {
                 .with(KEY_ITEM, ExtensionValue::String(name.into())),
         };
         let state = AppState::new(std::env::temp_dir());
-        ext.handle_intent(&intent, &state);
+        let out = ext.handle_intent(&intent, &state);
+        apply(&ext, out);
         ext
     }
 
@@ -914,10 +896,11 @@ mod tests {
         edit(&ext, "mycopy", "entry-symlink"); // starts with no modifiers set, no bg override
         let state = AppState::new(std::env::temp_dir());
         let go = |intent: &str| {
-            ext.handle_intent(
+            let out = ext.handle_intent(
                 &ExtensionIntent { extension: "theme".into(), intent: intent.into(), data: ExtensionValue::Nil },
                 &state,
             );
+            apply(&ext, out);
         };
         for _ in 0..MOD_CHANNEL_BASE {
             go("channel-next");
@@ -948,10 +931,11 @@ mod tests {
         edit(&ext, "mycopy", "entry-symlink");
         let state = AppState::new(std::env::temp_dir());
         let go = |intent: &str| {
-            ext.handle_intent(
+            let out = ext.handle_intent(
                 &ExtensionIntent { extension: "theme".into(), intent: intent.into(), data: ExtensionValue::Nil },
                 &state,
             );
+            apply(&ext, out);
         };
         assert!(!ext.color_edit.borrow().as_ref().unwrap().fg_nil, "entry-symlink starts with a real fg color");
         assert!(ext.color_edit.borrow().as_ref().unwrap().bg_nil, "entry-symlink carries no bg override in gruvbox, so bg starts nil");
@@ -975,10 +959,11 @@ mod tests {
         edit(&ext, "mycopy", "entry-symlink");
         let state = AppState::new(std::env::temp_dir());
         let go = |intent: &str| {
-            ext.handle_intent(
+            let out = ext.handle_intent(
                 &ExtensionIntent { extension: "theme".into(), intent: intent.into(), data: ExtensionValue::Nil },
                 &state,
             );
+            apply(&ext, out);
         };
         for _ in 0..MOD_CHANNEL_BASE {
             go("channel-next"); // -> Bold
@@ -989,7 +974,7 @@ mod tests {
         // stays open (cursor-follow, not a modal popup) so the user can keep
         // adjusting other channels for the same role.
         assert!(ext.color_edit.borrow().is_some(), "the editor stays open — there is nothing to close");
-        let reg = ext.registry.read().unwrap();
+        let reg = ext.state.read().unwrap();
         let resolved = reg.resolve("mycopy");
         assert!(resolved.bold(Role::EntrySymlink), "the Bold toggle must persist as soon as it's pressed");
         // The color itself (untouched here) survives the same write.
@@ -1002,10 +987,11 @@ mod tests {
         edit(&ext, "mycopy", "entry-symlink");
         let state = AppState::new(std::env::temp_dir());
         let go = |intent: &str| {
-            ext.handle_intent(
+            let out = ext.handle_intent(
                 &ExtensionIntent { extension: "theme".into(), intent: intent.into(), data: ExtensionValue::Nil },
                 &state,
             );
+            apply(&ext, out);
         };
         for _ in 0..(MOD_CHANNEL_BASE + 1) {
             go("channel-next"); // -> Italic
@@ -1014,7 +1000,7 @@ mod tests {
         go("channel-next"); // -> Underline
         go("color-dec"); // toggle Underline on
 
-        let reg = ext.registry.read().unwrap();
+        let reg = ext.state.read().unwrap();
         let resolved = reg.resolve("mycopy");
         assert!(resolved.italic(Role::EntrySymlink));
         assert!(resolved.underline(Role::EntrySymlink));
@@ -1031,11 +1017,11 @@ mod tests {
         // that widget, not what this test is about.
         let ext = ext_with_custom("mycopy", "gruvbox");
         let default = registry::default_style(Role::Title); // title has no override in gruvbox
-        ext.apply_role("mycopy", "title", default.fg, default.bg, [!default.bold, default.italic, default.underline]);
-        assert!(ext.registry.read().unwrap().get("mycopy").unwrap().overrides.iter().any(|(r, _)| *r == Role::Title));
-        ext.apply_role("mycopy", "title", default.fg, default.bg, [default.bold, default.italic, default.underline]);
+        apply(&ext, ext.apply_role("mycopy", "title", default.fg, default.bg, [!default.bold, default.italic, default.underline]));
+        assert!(ext.state.read().unwrap().get("mycopy").unwrap().overrides.iter().any(|(r, _)| *r == Role::Title));
+        apply(&ext, ext.apply_role("mycopy", "title", default.fg, default.bg, [default.bold, default.italic, default.underline]));
         assert!(
-            !ext.registry.read().unwrap().get("mycopy").unwrap().overrides.iter().any(|(r, _)| *r == Role::Title),
+            !ext.state.read().unwrap().get("mycopy").unwrap().overrides.iter().any(|(r, _)| *r == Role::Title),
             "an override identical to the default should be dropped, not stored"
         );
     }
@@ -1104,5 +1090,34 @@ mod tests {
         state.cursor = 0;
         assert_eq!(ext.on_cursor_changed(&state), Vec::<Intent>::new());
         assert!(ext.color_edit.borrow().is_none());
+    }
+
+    #[test]
+    fn the_prelude_defines_and_selects_themes_through_the_store() {
+        use crate::script::store::{Layer, Store, CORE_VOCABULARY};
+        let session = crate::script::SchemeSession::spawn();
+        assert!(session.wait_ready(std::time::Duration::from_secs(30)));
+        let store = Store::new(session);
+        let options = theme_options();
+        let defs: Vec<_> = options.keys().iter().filter_map(|k| options.def(k).cloned()).collect();
+        store.declare_options(&defs).unwrap();
+        let mut taken = CORE_VOCABULARY.iter().map(|s| s.to_string()).collect();
+        let problems = store.load_prelude(ID, PRELUDE_SCHEME, &mut taken);
+        assert!(problems.is_empty(), "{problems:?}");
+        // The old managed-block form is the new config.scm form: no quoting.
+        let (changes, errors) = store.eval_program(
+            Layer::Config,
+            "(define-theme \"x\" (title \"#112233\" nil #t #f #f))\n(set-theme \"x\")",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(crate::script::projection::apply_options(&changes, &options).is_empty());
+        assert_eq!(options.get_str("theme.active"), "x");
+        let customs = registry::customs_from_value(&options.value("theme.custom").unwrap());
+        assert_eq!(customs.len(), 1);
+        let (role, style) = customs[0].overrides[0];
+        assert_eq!(role, Role::Title);
+        assert_eq!(style.fg, Color::Rgb(0x11, 0x22, 0x33));
+        assert_eq!(style.bg, Color::Reset);
+        assert!(style.bold && !style.italic);
     }
 }

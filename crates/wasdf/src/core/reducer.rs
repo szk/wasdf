@@ -433,6 +433,7 @@ pub fn apply_intent(state: &mut AppState, intent: Intent, ctx: &dyn CommandLooku
         Intent::FunctionSearchStart => {
             let s = &mut state.function.search;
             s.input_active = true;
+            s.hint = "type pattern".into();
             s.query.clear();
             s.caret = 0;
             s.matches.clear();
@@ -538,7 +539,13 @@ pub fn apply_intent(state: &mut AppState, intent: Intent, ctx: &dyn CommandLooku
             Effects::none()
         }
         Intent::Noop => Effects::none(),
+        Intent::SetInputCapture(c) => {
+            state.input_capture = c.as_deref().cloned();
+            Effects::none()
+        }
         Intent::Notify(text) => Effects::notice(Notice::info(text.clone())),
+        Intent::Configure(write) => Effects::plan(Plan::EvalScheme { expr: write.to_scheme(), owner: None }),
+        Intent::Eval { owner, expr } => Effects::plan(Plan::EvalScheme { expr: expr.clone(), owner: Some(owner.clone()) }),
 
         // Confirm/Cancel: Policy is handled by dispatch; Select and InputForm
         // are handled here (phase switching / confirm-shape construction /
@@ -1702,24 +1709,11 @@ pub fn apply_result(state: &mut AppState, result: AsyncResult) -> Effects {
             state.function.sublayout = SubLayout::Exec;
             Effects::none()
         }
-        (Purpose::Scheme, Payload::Scheme(value)) => {
-            Effects::notice(Notice::info(format!("scheme: {}", render_value(&value))))
-        }
+        // The kernel has already applied the change set and routed the value to
+        // its owner; an unowned success (a Configure) needs nothing more, and a
+        // failure arrives as `Failed` above.
+        (Purpose::Scheme, Payload::Scheme { .. }) => Effects::none(),
         _ => Effects::none(),
-    }
-}
-
-/// Render a Scheme result value for a notice.
-fn render_value(v: &crate::core::ExtensionValue) -> String {
-    use crate::core::ExtensionValue::*;
-    match v {
-        Nil => "()".into(),
-        Bool(b) => if *b { "#t".into() } else { "#f".into() },
-        Int(i) => i.to_string(),
-        String(s) => s.clone(),
-        Path(p) => p.display().to_string(),
-        List(items) => format!("({} items)", items.len()),
-        Map(m) => format!("{{{} keys}}", m.len()),
     }
 }
 

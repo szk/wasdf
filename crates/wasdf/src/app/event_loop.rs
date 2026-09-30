@@ -65,11 +65,6 @@ pub fn run(cwd: PathBuf) -> io::Result<()> {
             let s = &app.store;
             crate::ui::top::TopOptions {
                 border_style: s.get_str("border-style"),
-                nav_weight: s.get_u32("top.nav-weight").max(1),
-                prop_visible: s.get_bool("top.prop-visible"),
-                prop_weight: s.get_u32("top.prop-weight").max(1),
-                monitor_visible: s.get_bool("top.monitor-visible"),
-                monitor_weight: s.get_u32("top.monitor-weight").max(1),
                 monitor: crate::ui::top::MonitorOptions::from_store(s),
                 scrollbar: crate::ui::chrome::ScrollbarChars {
                     thumb: s.get_str("scrollbar-thumb"),
@@ -80,7 +75,13 @@ pub fn run(cwd: PathBuf) -> io::Result<()> {
             }
         };
         let theme = app.theme_registry.read().unwrap().resolve_active();
-        if let Err(e) = term.draw(|f| app.ui.render(f, &app.state, &app.extensions, &app.vfs, &top_opts, &theme)) {
+        let view = crate::ui::render::View {
+            layouts: &app.layouts,
+            options: &app.store,
+            keymap: &app.keymap,
+            conds: &app.conditions,
+        };
+        if let Err(e) = term.draw(|f| app.ui.render(f, &app.state, &app.extensions, &app.vfs, &top_opts, &view, &theme)) {
             break Err(e);
         }
         // The reducer advances function scroll/hscroll blindly (it can't see the
@@ -101,6 +102,10 @@ pub fn run(cwd: PathBuf) -> io::Result<()> {
             Ok(AppEvent::Resize(_, _)) | Ok(AppEvent::Tick) => {}
             Err(_) => break Ok(()),
         }
+        // After the event, never before: an extension reacting to something
+        // that finished on its own (a PTY child exiting) must see the state
+        // this pass produced.
+        app.tick();
         if let Some(argv) = app.take_suspend() {
             let cwd = app.cwd();
             // Hand stdin to the editor: pause the input thread, run it, then drain

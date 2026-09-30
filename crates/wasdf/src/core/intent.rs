@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use crate::core::event::{PanelView, ResolverRequest};
 use crate::core::extension_value::ExtensionValue;
 use crate::core::mode::{Mode, SubLayout};
+use crate::core::state::InputCapture;
 
 /// A device-independent key, owned by core so the codec can map crossterm key
 /// events to and from string names without core depending on crossterm.
@@ -13,6 +14,7 @@ use crate::core::mode::{Mode, SubLayout};
 pub struct Key {
     pub code: KeyCode,
     pub mods: Mods,
+    pub kind: KeyKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -24,6 +26,7 @@ pub enum KeyCode {
     BackTab,
     Backspace,
     Delete,
+    Insert,
     Left,
     Right,
     Up,
@@ -32,6 +35,20 @@ pub enum KeyCode {
     End,
     PageUp,
     PageDown,
+    /// F1–F35. Not folded into `Char` because a function key has no character
+    /// and its escape encoding is entirely separate.
+    F(u8),
+}
+
+/// Press / repeat / release. Legacy terminals report presses only; the other
+/// two arrive under the Kitty keyboard protocol's `REPORT_EVENT_TYPES`, and a
+/// PTY child that asked for them expects to see them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyKind {
+    #[default]
+    Press,
+    Repeat,
+    Release,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -39,11 +56,23 @@ pub struct Mods {
     pub ctrl: bool,
     pub shift: bool,
     pub alt: bool,
+    /// Cmd on macOS, Win elsewhere. Reported only under the Kitty keyboard
+    /// protocol; always false on a legacy terminal.
+    pub sup: bool,
+    pub hyper: bool,
+    pub meta: bool,
 }
 
 impl Mods {
-    pub const NONE: Mods = Mods { ctrl: false, shift: false, alt: false };
-    pub const CTRL: Mods = Mods { ctrl: true, shift: false, alt: false };
+    pub const NONE: Mods = Mods {
+        ctrl: false,
+        shift: false,
+        alt: false,
+        sup: false,
+        hyper: false,
+        meta: false,
+    };
+    pub const CTRL: Mods = Mods { ctrl: true, ..Mods::NONE };
 
     pub fn is_none(self) -> bool {
         self == Mods::NONE
@@ -52,11 +81,11 @@ impl Mods {
 
 impl Key {
     pub fn new(code: KeyCode, mods: Mods) -> Self {
-        Key { code, mods }
+        Key { code, mods, kind: KeyKind::Press }
     }
 
     pub fn plain(code: KeyCode) -> Self {
-        Key { code, mods: Mods::NONE }
+        Key { code, mods: Mods::NONE, kind: KeyKind::Press }
     }
 
     /// A bare printable character with no modifiers (ignoring shift, which is
@@ -163,7 +192,7 @@ pub enum Intent {
     /// to `owner` — the extension-facing counterpart of the file panel's own
     /// `f` (see SEARCH_RENEW.md). The kernel issues an owner-addressed
     /// `Plan::Search`; the completion arrives as a generic content Read
-    /// (`ReadResult::Dir`) and is handed to `owner`'s `accept_content`, same
+    /// (`Content::Dir`) and is handed to `owner`'s `accept_content`, same
     /// as `LoadContent`. Not tied to any one extension.
     LoadSearch { owner: String, root: PathBuf, query: String },
     /// Set (or clear) the extension currently hosting an interactive form in the
@@ -250,6 +279,20 @@ pub enum Intent {
     /// extension (or core) emits a message string; the kernel displays it via the
     /// standard notice channel. Not tied to any one feature.
     Notify(String),
+    /// A structured write to the settings store's `custom` layer (the settings
+    /// UI, extension editors). Runs as a store call; the change set updates
+    /// the projections and the Persister writes custom.scm.
+    Configure(crate::core::ConfigWrite),
+    /// Evaluate `expr` in the resident Scheme session (the `session` layer) on
+    /// behalf of `owner`; the printed value or error comes back to `owner`'s
+    /// `accept_content` as `Content::Value`.
+    Eval { owner: String, expr: String },
+
+    /// Install or clear an extension's claim on the raw keyboard
+    /// ([`crate::core::state::InputCapture`]). Generic: any extension that has
+    /// to drive something keystroke-by-keystroke uses it, and core keeps the
+    /// escapes so the claim can always be broken.
+    SetInputCapture(Option<Box<InputCapture>>),
 
     // Extension
     Extension(ExtensionIntent),

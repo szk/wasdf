@@ -8,16 +8,17 @@ document covers the layouts and panels, the mode stack, and the keymap.
 
 ## Layouts
 
-Core built-in layouts are exactly two: file and select. Policy renders as an
-overlay on whatever layout is active. Extension custom modes may use a layout
-hint (Select, File, or TwoPanel) or define additional layouts of their own;
-those do not count as core built-ins.
+Core built-in layouts are exactly two: file and select. Both are declared in
+Scheme (`app/layout.scm`) and may be redefined by the user's configuration,
+per environment if desired ([SCHEME.md](SCHEME.md), Role 3); the tables below
+describe the embedded definitions. Policy and InputForm render as overlays on
+whatever layout is active; an extension mode renders over the file layout.
 
 ### The file layout
 
 | Row | Content |
 |-----|---------|
-| top | the top panel, holding nav and prop side by side; height per vertical size class below |
+| top | the top panel, holding nav, prop, and monitor side by side; height per vertical size class below |
 | main | the file panel; while the function panel is visible, file at ratio-left and function at ratio-right, otherwise file takes the full width |
 | bottom | help |
 
@@ -52,12 +53,11 @@ as the function-panel scroll clamp; see [ARCHITECTURE.md](ARCHITECTURE.md)).
 
 **Acting on the entry (`d` vs `Enter`).** `d` = *look*, `Enter` = *do*:
 
-- In **Rows**, `d` on a directory enters it; `d` on a file **cycles the content view**
-  — it makes the function panel visible in the Content sublayout and cycles its
-  width (`2:1 → 1:1 → 1:2 → 2:1`), never hiding, keeping the shared ratio on first
-  open, and leaving focus on the file panel. (This differs from `,`
-  CycleFunctionPanel, which hides and resets the ratio.) In Columns/Grid the right
-  wall just clamps; show its content there with `,`.
+- In **Rows**, `d` on a directory enters it; `d` on a file **shows its content**
+  — it makes the function panel visible in the Content sublayout at the current
+  ratio, leaving focus on the file panel. It never changes the ratio and never
+  hides the panel; a second `d` does nothing more. The ratio is cycled only by
+  `,`. In Columns/Grid the right wall just clamps; show content there with `,`.
 - `Enter` (Activate) acts on the entry from any cell/layout: enter the directory,
   or open the file via the resolver. It does not show content.
 
@@ -125,14 +125,14 @@ One layout serves every picker.
 
 | Row | Content |
 |-----|---------|
-| top | the top panel (nav and prop) |
+| top | the top panel (nav, prop, and monitor) |
 | main | a left column at ratio-left — the select input (collapsed when the instance has no input) above the candidate list — and the function panel at ratio-right while the spec sets a function hint |
 | bottom | help |
 
 ### Screen chrome (the connected frame)
 
 The screen is one connected frame: adjacent panels share the line between them.
-nav and prop share the top panel's frame; the file and function panels meet on a
+nav, prop, and monitor share the top panel's frame; the file and function panels meet on a
 single shared vertical line; cycling the ratio (the comma key) slides that line
 left or right. The three ratio variants:
 
@@ -146,14 +146,30 @@ left or right. The three ratio variants:
   📁 crates                            │  1 # wasdf                            │
   📁 doc                               │                                       │
   📄 Cargo.toml 449 B                  │                                       │
- j/↓  scroll down   k/↑  scroll up   ,  cycle ratio   Enter  open   Esc  back
+ wasd cursor  jk scroll  hl ◂▸  / search  n line#  gG top/bottom  Enter open  q hide
 ```
 
 The file panel's title shows the full current-directory path. The function
-panel's title shows the name of the file being shown. The shared vertical line's
+panel's title comes from whatever drew it (see Borders and Scrollbars). The shared vertical line's
 junction with the top frame slides as the ratio cycles (2:1 / 1:1 / 1:2); the
 bottom-left junction tucks under the file panel rather than drawing a separate
 box.
+
+Where each panel sits comes from the layout ([SCHEME.md](SCHEME.md), Role 3),
+so the frame follows these rules rather than fixed positions:
+
+- **Open edges.** A panel has no left border where it meets the frame's left
+  edge below the top row, and no bottom border where it rests on an unboxed
+  panel (`help`) or on the frame's bottom edge. Everything else is boxed.
+- **The path and the file name.** The path is written on the file panel's top
+  border — in the select layout, on the top border of the panel in its place
+  (`select-input`, else `select-candidates`). When the function panel's top
+  border continues the same line to its right, the two labels share that line
+  by the five cases below (the path may flow past the junction; the file
+  name, shown while the function panel previews a file, follows it). A
+  function panel anywhere else keeps its own title on its own border.
+- Border labels are drawn after every panel title, so on a shared line they
+  win over a title that bled onto it.
 
 ## Borders and Scrollbars
 
@@ -185,28 +201,27 @@ them looks unchanged.
 
 A panel's **bottom** border carries up to two labels, both on the top area's
 bottom border (shared with the main panels' top border): a left-aligned **path**
-(the current directory, belonging to the **file panel**) and, when the function
-panel is previewing file content, a right-aligned **filename** (the cursor entry,
-which *is* the function panel's title — the name of the file being shown). Both
-are themed focus-aware, each following **its own** panel's focus — the path the
-file panel's, the filename the function panel's — so exactly the focused side
-brightens (they never light up together). The filename is omitted for non-content
-frames (Command / Exec / Select, or an empty directory), where the function panel
-keeps its own mode title.
+(the current directory, belonging to the **file panel**) and, while the function
+panel is visible, a right-aligned **function title**. The function title has one
+source: whatever drew the function panel's frame this pass supplies it — the
+content provider (the name of the file being shown), a form (the title its
+`render_form` returned), the Exec frame, or the command summary. An empty
+directory supplies none. Both labels are themed focus-aware, each following
+**its own** panel's focus, so exactly the focused side brightens.
 
 The two labels lay out across the shared row by five cases, driven by whether the
 function panel is visible and how the path length compares to the junction column:
 
-1. **No func panel, path fits** — the path fills from the left; no filename.
+1. **No func panel, path fits** — the path fills from the left; no title.
 2. **Func visible, path shorter than the junction** — the `┬` junction is kept
-   and the filename starts just after it.
+   and the title starts just after it.
 3. **Func visible, path longer than the junction** — the path overwrites the `┬`
    and flows past it (the vertical divider still descends in the row below); the
-   filename follows after a one-cell rule separator.
-4. **As case 3, the filename no longer fits** — it is `…`-truncated in brackets.
-5. **The path alone overflows the width** — it is `…`-truncated; no filename.
+   title follows after a one-cell rule separator.
+4. **As case 3, the title no longer fits** — it is `…`-truncated in brackets.
+5. **The path alone overflows the width** — it is `…`-truncated; no title.
 
-A real label character always wins over the border line, so the path and filename
+A real label character always wins over the border line, so the path and title
 stay intact; the rule padding and separators between and after the labels restore
 the crossed junction glyphs and erase any function title bled onto this shared
 row.
@@ -218,34 +233,34 @@ the **function** rows (PANEL_FUNCTION) — is drawn with explicit theme
 colours that follow the panel's focus: `cursor-active-fg` / `cursor-active-bg`
 while that panel is focused, and the subdued `cursor-fg` / `cursor-bg` while it is
 not. The cursor is therefore always visible, brightening on focus rather than
-appearing/disappearing. (The Select candidate list and the input-form carets —
-the Select `search`/`Argument` field, the `/` content search — still use a
+appearing/disappearing. (The Select candidate list and the text-input carets —
+the Select `search`/`Argument` field, the `/` content search — use a
 reverse-video block at the real caret while focused.)
 
 ## Panels
 
-Panels nest: the **top** panel is a container whose children are **nav** and
-**prop**, side by side.
+Panels nest: the **top** panel is a container whose children are **nav**,
+**prop**, and **monitor**, side by side.
 
 | Panel | Description | Provider |
 |-------|-------------|----------|
-| top | Container for the top row; holds the nav and prop panels side by side | kernel UI |
-| nav | Child of top. A macOS Finder-style column (Miller) directory navigator: the path from root to the current directory runs along the panel's horizontal axis, each level's sibling directories stack vertically in its column (the path element centered, `─` linking adjacent levels), the current directory is highlighted, and columns are right-aligned on overflow so it stays visible. Its title is the app banner `/ wasdf vX /` (unbracketed); the full current-directory path is on the file panel's title | kernel UI |
-| prop | Child of top. The cursor entry's properties — PATH, SIZE (human + bytes), PERM (permissions, uid, gid), and the C/M/A times — each truncated to width. Its top border carries a live readout, right-aligned: the system load averages and the current local time | kernel UI |
+| top | Container for the top row; holds the nav, prop, and monitor panels side by side | kernel UI |
+| nav | Child of top. A Finder-style column (Miller) directory navigator: the path from root to the current directory runs along the panel's horizontal axis, each level's sibling directories stack vertically in its column (the path element centered, `─` linking adjacent levels), the current directory is highlighted, and columns are right-aligned on overflow so it stays visible. The columns are `AppState.trail`, computed by the ReadDir worker — the panel reads no directory itself. Its title is the app banner `/ wasdf vX /` (unbracketed) | kernel UI |
+| prop | Child of top. The cursor entry's properties — PATH, SIZE (human + bytes), PERM (permissions, owner, group — names resolved in the worker), and the C/M/A times — each truncated to width. Its top border carries a live readout, right-aligned: the load averages (from the Monitor snapshot) and the local time, refreshed every `prop.refresh-ms` (default 1000) | kernel UI |
+| monitor | Child of top. System metrics (cpu, mem, net, disk) as gauges with rolling sparklines, drawn from the Monitor service's latest snapshot; the sampler runs on its own thread at `monitor.*` cadence. Toggled by `top.monitor-visible` | kernel UI |
 | file | The file list. Its title shows the full current-directory path | kernel UI |
 | function | Renderer container (see the frame table below) | kernel UI + extensions |
-| help | Key hints, drawn in reverse video (negative) | kernel UI |
+| help | Key hints, drawn in reverse video (negative). **Generated from the labelled bindings actually in force** — every chip is a key that would really fire, resolved through the same walk `handle_key` uses, so the row cannot drift from the keymap ([HELP.md](HELP.md)). While an extension holds the raw keyboard the row shows the capture's release key instead, since nothing else is reachable | kernel UI |
 | select-input | Select-mode input field | kernel UI |
 | select-candidates | Select-mode candidate list | kernel UI |
 
-The Panel trait consists of an id, a visibility test against the current
-context, a render method, and a focusability flag. Panels have no event
-handling: every key decision goes through the KeymapRegistry (panel-scoped
-bindings plus RawKeyEvent). A panel that needs key behavior ships keymap
-definitions; there is no second input path.
+Panels have no event handling: every key decision goes through the
+KeymapRegistry (panel-scoped bindings plus RawKeyEvent). A panel that needs key
+behavior ships keymap definitions; there is no second input path.
 
-Panels and renderers are stateless. They read a context bundle containing the
-read-only AppState, the render caches, and the focused panel id.
+Panel renderers are functions of the read-only AppState, the render caches, and
+shared snapshots (theme, render options, monitor). They perform no I/O
+([ARCHITECTURE.md](ARCHITECTURE.md), Render Contract).
 
 ## The Function Panel
 
@@ -257,7 +272,7 @@ read-only AppState, the render caches, and the focused panel id.
 | Visibility in File | FunctionPanelState.visible |
 | Visibility in Select | whether the active SelectSpec sets a function hint. The File-side visible flag is never consulted in Select |
 | sublayout | The type of the display frame, not a renderer kind. Exactly two: Content (the viewing frame) and Exec |
-| Content frame | hosts the active content extension's content, the command summary, and the file-search directory listing |
+| Content frame | hosts the content owner's content, an extension's form, the command summary, and the file-search directory listing. While `form_owner` is set the form is drawn; otherwise the content owner's `view()` |
 | Exec frame | hosts only the streamed output of Execute (line-by-line) |
 
 In File mode, while the function panel is visible, the content frame shows the
@@ -265,8 +280,9 @@ content of the file under the cursor and follows the cursor automatically — no
 key press is required (the entry's metadata lives in the prop panel, not here).
 The kernel reads the cursor path (the Read plan) and hands the bytes/entries to
 the content provider's `accept_content`, which decodes them (MIME dispatch, off
-the kernel's hands); the provider's `view()` then returns a logical `PanelView`
-that core lays out. There is no Scheme round trip at render time. Loading a different file resets the scroll
+the kernel's hands); the provider's `view()` then returns a shared, logical
+`PanelView` that core lays out — once per content revision and width, drawing
+only the visible rows each frame. Loading a different file resets the scroll
 positions and any active search (`ResetContentView`, dispatched when new content
 arrives).
 
@@ -280,17 +296,15 @@ so toggling it back does not force a reload. The file panel itself simply shows
 no rows.
 
 A content read that was already **in flight** when the cursor left its target
-(e.g. it was loading the previous file when you stepped into the empty directory)
-is **dropped on arrival**: the kernel discards any content completion whose path
-is no longer under the cursor, so a late read cannot re-populate the preview the
-clear just emptied. This is the same stale-result discipline the async round-trip
-contract applies elsewhere (doc/ARCHITECTURE.md).
+is **dropped on arrival**: the kernel discards any cursor-follow completion whose
+path is no longer under the cursor, so a late read cannot re-populate the
+preview the clear just emptied ([ARCHITECTURE.md](ARCHITECTURE.md)).
 
 ### Renderers
 
-The content frame draws one of these. Extension content (whether a bundled
-extension's `view()` return or a dynamic extension's pushed `ShowFunctionContent`)
-is always a logical `PanelView` (a `Document` of blocks + role/color spans, or an
+The content frame draws one of these. Extension content — always the content
+owner's `view()`, for bundled and dynamic extensions alike — is a logical
+`PanelView` (a `Document` of blocks + role/color spans, or an
 `Image`), laid out by the kernel's layout engine (`ui/middle/function` +
 `ui/content`) with the shared label-alignment / wrap / scroll / search-highlight /
 line-number handling. The extension describes the content; core lays it out and
@@ -300,7 +314,9 @@ paints it. The division of labor (thin core, fat extension) is specified in
 | Renderer | Content | Provider | Frame |
 |----------|---------|----------|-------|
 | extension content | text (syntax-highlighted via syntect), hex, directory listing, or image (Chafa truecolor symbol cells) — produced by the active content extension and painted by `ui/content` | extension + kernel blitter | Content |
-| command summary | the resolver op, targets, chosen options, and destination, resolved synchronously at render time | kernel UI | Content |
+| command summary | the command Select's live command line: the resolver template with the targets, marked options, and destination spliced in (in-memory; no I/O at render) | kernel UI | Content |
+| form | an extension's interactive form (`render_form`) while `form_owner` names it; takes precedence over extension content | extension + kernel chrome | Content |
+| dir-listing | a path-valued Select's result (`function_hint: dir-listing`): the directory under the result cursor | kernel UI | Content |
 | exec | captured Execute output | kernel UI | Exec |
 
 When no content extension is registered, or the active one declines the
@@ -310,7 +326,8 @@ shows `N/A` (file metadata lives in the prop panel) — distinct from `(empty)`
 
 ## Vertical Responsiveness
 
-Two size classes; the class exposes its top-row and content-row counts.
+Two size classes. A layout's `(size N M)` gives the Large and Compact sizes; the
+embedded file layout uses these for the top row:
 
 | Class | Terminal height | Top area | Content rows |
 |-------|-----------------|----------|--------------|
@@ -319,11 +336,12 @@ Two size classes; the class exposes its top-row and content-row counts.
 
 ## UiManager
 
-Owns the layout engine, the panel registry, and the render-only caches (image
-protocol state, notifications, computed layout). Its surface is: render from
-the read-only AppState, recompute the layout on mode change, and register
-panels. No field of UiManager is ever read by the reducer or a handler to make
-a behavioral decision.
+Owns the render-only caches: the function-panel layout cache (lowered rows, the
+block → row map, and content width per content revision, width, line-number
+flag, and theme), image
+cells, the notice slot and its expiry deadline, and the measured geometry the
+kernel copies back into AppState after each draw. No field of UiManager is ever
+read by the reducer or a handler to make a behavioral decision.
 
 ---
 
@@ -337,14 +355,14 @@ Modes form a stack; push enters, pop returns.
 | Mode | Carried data | Description |
 |------|--------------|-------------|
 | File | — | File list. The function panel belongs to File mode as view state, not as a mode |
-| Select | SelectSpec | The one generic picker for every modal UI. Always pushed by a parent mode handler or extension |
+| Select | SelectSpec | The one generic picker for every modal UI. Pushed by a core intent or an extension |
 | Policy | pending intent | Confirmation dialog titled **Confirm**, its key hints (`y / Enter : confirm`, `n / Esc : cancel`) drawn inside the box. y or Enter allows and resumes the pending intent; n or Esc denies. No selection state |
-| InputForm | InputFormSpec | A small popup text-entry dialog, sharing its chrome with Policy's Confirm box. The unified replacement for asking an extension for one line of free text (a name, a hex color, an option value) |
+| InputForm | InputFormSpec | A small popup asking for one value (Text / Bool / Choice / Int / List), sharing its chrome with Policy's Confirm box |
 | Extension | extension id, mode id, state | Extension-defined UIs that are genuinely not pickers |
 
 Mode ids are colon-separated strings (file; select:file-search; policy;
-input-form; extension modes as extension-id:mode-id). Keymap scopes and
-handler registration match by longest id prefix on segment boundaries.
+input-form; extension modes as extension-id:mode-id). Keymap scopes match by
+longest id prefix on segment boundaries.
 
 ## File Mode and the Function Panel
 
@@ -356,12 +374,15 @@ FunctionPanelState lives in AppState and is reducer-managed:
 | sublayout | Content, Exec | The active display frame |
 | ratio | 2:1, 1:1, 1:2 | file : function split; always kept and shared across modes |
 | scroll, hscroll, show_line_numbers | — | Generic content view geometry (vertical scroll is shared with the Exec frame) |
-| content_owner | extension id | The extension that owns the current content; the kernel calls its render hook and routes its reads |
+| content_owner | extension id | The one extension whose `view()` the panel shows and to which content search is routed. Starts as the content provider; changes on `ShowFunctionContent{owner}` or another extension's cursor-follow `LoadContent`; returns to the provider when that extension's overlay pops or the panel is hidden ([EXTENSION.md](EXTENSION.md), The content owner) |
+| form_owner | extension id | The extension hosting an interactive form in the panel (SetFunctionForm / HostFunctionForm) |
+| input | FunctionInput | An open function-panel text input: text, caret, purpose, multiline |
 | ext_view | ExtensionValue | Opaque per-extension view state, written via UpdateFunctionView |
-| search | PanelSearch | The content-search input (query, caret, active) and the match list + current index |
+| search | PanelSearch | The content-search input (query, caret, active), its help-row hint, and the match list (sorted) + current index |
+| exec | ExecOutput | The Exec frame's streamed lines, finished flag, exit code |
 
-The decoded *content itself* is not in AppState — it lives inside the owning
-extension ([EXTENSION.md](EXTENSION.md)).
+A bundled extension's decoded content is not in AppState — it lives inside the
+owning extension ([EXTENSION.md](EXTENSION.md)).
 
 Function panel intents:
 
@@ -370,11 +391,11 @@ Function panel intents:
 | SetSubLayout | Show the panel with the given frame |
 | CycleFunctionPanel | hidden → 2:1 → 1:1 → 1:2 → hidden (File mode only) |
 | HideFunctionPanel | Hide and refocus the file panel |
-| ShowFunctionContent / UpdateFunctionView | Store an extension's pushed content / opaque view state (generic) |
+| ShowFunctionContent / UpdateFunctionView | Make an extension the content owner and show the panel / store its opaque view state (generic) |
 | FunctionSearch{Start,Submit,Next,Prev,Cancel}, SetSearchMatches, SetScroll, ResetContentView | Less-style content search + view reset (see [ARCHITECTURE.md](ARCHITECTURE.md) catalog) |
 
-In the Rows layout, `d` (CursorRight) on a file cycles the content view (shows the
-function panel in the Content frame and cycles its width; see "File-list layouts"); the
+In the Rows layout, `d` (CursorRight) on a file shows the content (the function
+panel in the Content frame at the current ratio; see "File-list layouts"); the
 kernel then loads the file's content. While the function panel is visible in File
 mode, the content follows the cursor automatically — no key press is required. The
 cursor entry's metadata (name, size, permissions, modified, created, accessed) is
@@ -394,25 +415,27 @@ knows what the selection is for.
 | id | Colon-separated instance id; the full mode id prefixes it with the select segment |
 | source | FileWalk (deep search — a recursive walk, ranked async), Entries (shallow filter — a fixed `Entry` pool ranked synchronously, no I/O; see "Deep search vs. shallow filter" below), Commands, or Static (caller-supplied items, carried inside the spec) |
 | input | Fuzzy, Path, or None |
-| on_confirm | Navigate, RunCommand, or Resolve. Resolve carries a `ResolverRequest` template + a `fill` (Dst / Path). One Select (Static option candidates + Path input) is the whole "command op": the input fills dst/name, the Space-marked candidates fill opts, then `RunResolver` runs it |
-| initial_query | Optional initial query text (Rename prefills the current file name) |
-| function_hint | Optional renderer for the function panel; absent hides the panel |
+| on_confirm | Commit, RunCommand, or Resolve. Resolve carries a `ResolverRequest` template + a `fill` (Dst / Path). One Select (Static option candidates + Path input) is the whole "command op": the input fills dst/name, the Space-marked candidates fill opts, then `RunResolver` runs it |
+| initial_query | Optional initial query text |
+| input_hint | Optional keyless help-row entry describing what the input is for ([HELP.md](HELP.md)) |
+| function_hint | Optional renderer for the function panel (`dir-listing`, `command:summary`); absent hides the panel |
+| command_line | For a Resolve Select: the resolver entry's argv template, from which the command summary splices the live command line |
 
 ### Built-in instances
 
 | Instance | source | input | on_confirm | function_hint | Entry |
 |----------|--------|-------|------------|---------------|-------|
-| file-search | FileWalk (deep) | Fuzzy | Navigate | dir-listing | f on a **real** cwd (unavailable once `filter-maxed` — see below). Hits are kept as an `EntryList` (not flattened to candidates) and rendered + navigated as the file panel's entry grid — same layouts, cursor, 2-D moves, `v`. Confirm does **not** navigate anywhere: it commits the matches directly into **File mode** (see "Filtering the file panel" below), never reaching a Navigate phase of its own |
-| filter-list | Entries (shallow) | Fuzzy | Navigate | dir-listing | f on a **virtual** cwd (`@/...` — nothing for a walk to read), or f again once already inside a file-search/filter-list result view (`select-has-view`, replacing the Select in place — see "Deep search vs. shallow filter"). Otherwise identical to file-search: same `EntryList` rendering, same commit path |
-| command-palette | Commands | Fuzzy | RunCommand | none | x |
-| command | Static (option checkboxes from the command's `--help`/`man`) | Path | Resolve (fill Dst / Path) | command:summary | c, m, R (R prefills initial_query); palette Mkdir/Touch. The **Argument** input is the destination/name (free text, never filters); the **Options** list is the command's options, toggled with Space; the function panel shows the live **Command** line — the **actual external command** resolved from the chain (e.g. `cp -R …`, `mv …`), not the op key, with the marked options and target spliced in |
+| file-search | FileWalk (deep) | Fuzzy | Commit | dir-listing | f on a **real** cwd (unavailable once `filter-maxed` — see below). Hits are kept as an `EntryList` (not flattened to candidates) and rendered + navigated as the file panel's entry grid — same layouts, cursor, 2-D moves, `v`. Confirm commits the matches directly into **File mode** (see "Filtering the file panel" below) |
+| filter-list | Entries (shallow) | Fuzzy | Commit | dir-listing | f on a **virtual** cwd (`@/...` — nothing for a walk to read), or f again once already inside a file-search/filter-list result view (`select-has-view`, replacing the Select in place — see "Deep search vs. shallow filter"). Otherwise identical to file-search: same `EntryList` rendering, same commit path |
+| command-palette | Commands | Fuzzy | RunCommand | none | z |
+| command | Static (option checkboxes from the command's `--help`/`man`) | Path | Resolve (fill Dst / Path) | command:summary | No core binding; pushed by an extension that wants this shape (initial_query prefills the input). The **Argument** input is the destination/name (free text, never filters); the **Options** list is the command's options, toggled with Space; the function panel shows the live **Command** line — the **actual external command** resolved from the chain (e.g. `cp -R …`, `mv …`), not the op key, with the marked options and target spliced in |
 
 ### Phases
 
 Select has two phases so that typing and list navigation never conflict:
 
 - Input phase (only when the instance has an input): printable keys edit the
-  query (readline editing, applied by the reducer); Up/Down and Ctrl-n/Ctrl-p
+  query (see Line editing); Up/Down and Ctrl-n/Ctrl-p
   move the selection; Enter switches to Navigate — uniformly, in every
   instance; Esc cancels the whole Select.
 - Navigate phase: w and s move the selection; Space toggles a mark (where
@@ -427,14 +450,11 @@ handler can branch on it.
 ### Structural rules
 
 - A push of Select while a Select instance is topmost replaces it. Select
-  never nests. The generic **command Select** (`SelectSpec::command`, still
-  core infrastructure) is one screen combining a destination/name input with
-  option checkboxes, driven by `OnConfirm::Resolve`; copy/move/rename/mkdir/
-  touch no longer route through it in practice (all five are now the cmdop
-  extension's own function-panel forms — see "CmdOp" below and
-  [EXTENSION.md](EXTENSION.md)'s Bundled Extensions section), but it remains
-  the mechanism a Path-input Select uses, available to any extension that
-  wants the same single-input-plus-checkboxes shape.
+  never nests. The generic **command Select** (`SelectSpec::command`) is one
+  screen combining a destination/name input with option checkboxes, driven by
+  `OnConfirm::Resolve` — available to any extension that wants that shape. The
+  built-in file operations use CmdOp's function-panel form instead
+  ([CMDOP.md](CMDOP.md)).
 - The core command flow uses `OnConfirm::Resolve` carrying a `ResolverRequest`
   template that the pickers fill (target + options + dst/path); there is no
   per-operation intent. Extensions that need one line of free text push
@@ -469,25 +489,23 @@ pressed:
 | File panel, real cwd | `f` | Deep: pushes `file-search` (`FileWalk` from `cwd`) |
 | File panel, virtual cwd (`@/...`) | `f` | Shallow: `Intent::FilterListing` pushes `filter-list` (`Entries`, snapshotting the panel's current `entries`) — nothing for a walk to read, so filtering the listing already on screen is what `f` means here |
 | Inside a Select with a non-empty result view (`select-has-view`) — deep file-search results, or an earlier filter/refine | `f` | Shallow refine: `Intent::SelectRefine` **replaces** the Select in place (`push_mode`'s existing same-mode-replaces rule) with a fresh `filter-list` over the frozen result set. No refine-undo — Esc cancels the whole Select, same as always |
-| CmdOp's destination browser (function panel) | `/` | Two-stage — see "CmdOp" below |
+| CmdOp's destination browser (function panel) | `/` | Two-stage, deep then shallow — [CMDOP.md](CMDOP.md) |
 
 `Intent::FilterListing`/`Intent::SelectRefine` carry no data of their own (the
 keymap codec builds intents statically, without state); the reducer takes the
-`entries`/view snapshot itself when handling them. Shallow ranking
-(`filter_entries`, scored the same subsequence way as the palette's
-`fuzzy_rank`, just against `Entry::name` instead of `Candidate::label`) is a
-plain synchronous function — no `Plan`, no async round trip, so it works
-identically while the file panel is showing `@/settings`, `@/messages`, or
-any other virtual listing.
+`entries`/view snapshot itself when handling them. Shallow ranking uses the one
+local ranker (`core::rank`, subsequence-scored — the same one the palette and
+Static pickers use, keyed on `Entry::name` here and `Candidate::label` there).
+It borrows the pool from the mode stack and keeps the ranked order, never
+copying the pool per keystroke. It is synchronous — no `Plan`, no async round
+trip — so it works identically on `@/settings`, `@/messages`, or any other
+virtual listing.
 
 ### Filtering the file panel (commit)
 
 Confirming a deep search (`FileWalk`) or a shallow filter/refine (`Entries`)
-— both `on_confirm: Navigate` — does not produce a `NavigateTo`. Instead the
-reducer's `select_confirm` special-cases `on_confirm: Navigate` before even
-reading the Select's phase (no other Select ever uses `Navigate`, so keying on
-it is equivalent to keying on the source) and hands off to
-`commit_file_search`: the Select pops, and its matched `EntryList` becomes the
+— both `on_confirm: Commit` — does not produce a `NavigateTo`: the Select
+pops, and its matched `EntryList` becomes the
 file panel's own `entries`/`cursor`, in plain **File mode**. The listing the
 panel showed a moment ago (real directory, an outer filter, or the pre-refine
 result view) is pushed onto `AppState.filter_stack`; `AppState.filter_query`
@@ -519,27 +537,33 @@ Unwinding:
   it beats the unconditioned Esc→ClearSelection binding by specificity):
   restores the popped frame's `entries`/`cursor`/`filter_query` verbatim. With
   no filter active, Esc falls through to its ordinary `ClearSelection` meaning.
-- **Any real directory (re)load clears the whole stack.** `load_entries` — the
-  single landing point for a fresh `cd`, a refresh, a bookmark jump, `@` — always
-  drops `filter_stack`/`filter_query`: the saved levels describe a listing that
-  read is about to replace anyway, so there is nothing to unwind back to.
+- **Navigating to a directory clears the whole stack** (a fresh `cd`, a
+  bookmark jump, `@`, `~`): the saved levels describe listings the user has
+  left.
+- **Refreshing keeps the stack.** A refresh while filtered — `r`, the dotfiles
+  toggle, or the automatic refresh after a completed file operation —
+  revalidates the view shown now: its entries are re-stat'ed by path, vanished
+  ones drop out, survivors get fresh metadata, and nothing new is added (a
+  filter's membership is decided when it is committed). The frames below keep
+  their snapshots and are revalidated the same way when Esc returns to them.
 - The file panel's title reflects the active query when filtered (e.g.
   `<cwd> — filter: alpha`, or `<cwd> — filtered` for an empty query), so Esc's
   meaning at any moment is visible, not just inferred from behavior.
 
 ## The Confirm Contract
 
-Confirm produces exactly one of two result shapes. Whether a value came from
+Confirm produces exactly one of three result shapes. Whether a value came from
 a candidate or from free input is never distinguished by type.
 
 | Shape | Produced when | Content |
 |-------|---------------|---------|
 | Single (item) | Enter (input Fuzzy or None) | the current candidate |
 | InputOnly (text) | any instance with Path input | the typed text, as-is |
+| View | Enter in a path-valued instance (file-search, filter-list) | the result `EntryList` |
 
 | on_confirm | Consumes | Action |
 |------------|----------|--------|
-| Navigate | Single | pop, then navigate to the item's path — **except** file-search, whose `FileWalk` source is special-cased ahead of this table entirely: it commits its matches into File mode rather than reaching a Single shape or a NavigateTo (see "Filtering the file panel" above) |
+| Commit | View | pop, then commit the view into File mode (see "Filtering the file panel" above) |
 | RunCommand | Single | pop, then re-inject the chosen command's registered intent |
 | Resolve | InputOnly (Dst/Path) | pop, fill dst/name from the typed input and `opts` from the marked option candidates, then run `RunResolver(template)` |
 
@@ -547,29 +571,26 @@ Rules:
 
 - Marks (Space, in Navigate phase) are read directly off `SelectState` at
   confirm time — only the command Select uses them, to fill `opts` from the
-  Static option checkboxes (even though its input is Path). Elsewhere Space
-  is inert; there is no marks-driven confirm shape.
+  Static option checkboxes (even though its input is Path). In a path-valued
+  Select, Space toggles the path in the file selection instead, which confirm
+  does not read. There is no marks-driven confirm shape.
 - Path-input instances always confirm as InputOnly. `command`
-  (`SelectSpec::command`) is the one Path-input instance the core mode system
-  defines; no bundled feature currently pushes it (copy/move/rename/mkdir/
-  touch all moved to cmdop's own function-panel forms — see "Structural
-  rules" above), but it remains available to any extension that wants its
-  shape. Extensions that just need a single line of free text use
-  `Mode::InputForm` instead (below), not Select.
+  (`SelectSpec::command`) is the one Path-input instance core defines.
+  Extensions that just need a single value use `Mode::InputForm` (below), not
+  Select.
 - Do not extend on_confirm; new confirm behavior is absorbed by the consumers
-  of the two shapes.
+  of the three shapes.
 
 ## Policy Mode
 
 The dialog renders the pending operation's summary as an overlay. y or Enter
 allows: the pending intent resumes past the confirmation gate. n or Esc
 denies and pops. The mode carries only the pending intent; there is no
-toggleable selection state. Policy is pushed whenever a `RunResolver` (or an
-extension resolver-key plan) targets an op whose entry is marked
-**destructive** (e.g. delete), or — for copy/move/rename specifically — would
-silently overwrite a path that already exists (the `cp`/`mv -i` condition,
-checked dynamically against the real filesystem, not a fixed per-op flag)
-([ARCHITECTURE.md](ARCHITECTURE.md)).
+toggleable selection state. Policy is pushed when a `RunResolver` (or an
+extension resolver-key plan) targets an entry whose confirm policy requires it:
+`always` (e.g. delete), or `overwrite` when the request would overwrite an
+existing path, checked against the real filesystem at dispatch time
+([ARCHITECTURE.md](ARCHITECTURE.md), Resolver Contract).
 
 ## Input Form Mode
 
@@ -584,47 +605,35 @@ to the extension before that, so Cancel never needs to roll anything back.
 
 | Field | Meaning |
 |-------|---------|
-| title | The popup's border title (may carry a value hint, e.g. `"coloring (none \| LS_COLORS \| Light \| Dark \| Custom)"`) |
+| title | The popup's border title (e.g. `"new theme name"`) |
+| input_hint | Optional keyless help-row entry describing what the value is for ([HELP.md](HELP.md)) |
 | initial | The prefilled value, encoded per `kind` (see the table below) |
 | kind | Which widget renders and how it edits (`InputKind`) |
 | template | The `ExtensionIntent` re-injected on confirm |
 
 | Kind | Widget | Edited with | Wire value under `KEY_ITEM` |
 |------|--------|-------------|------------------------------|
-| Text | caret over typed text (`tui-input`) | printable keys, Backspace/Delete/arrows/Home/End, Ctrl-a/e/k/u/w/b/f/h/d | the raw string |
+| Text | caret over typed text | Line editing (below) | the raw string |
 | Bool | a 2-row List, `On`/`Off` | wasd/arrows (any direction) or Space — flips | `"#t"` / `"#f"` |
 | Choice | a List, one row per option | w/s or Up/Down | the chosen option string |
 | Int | a Gauge over `min..max` | a/d or Left/Right ±1, w/s or Up/Down ±10, W/S or Home/End → min/max, or type digits directly | the decimal string |
 | List | a Table (items + "+ Add" + "✓ Confirm" rows) | w/s or Up/Down browse, `a` add, `d`/Delete/Backspace remove, Enter edits/adds/confirms depending on the row | comma-joined |
 
-`Text`'s runtime state lives in `AppState::input_form` as `InputFormState::Text { value, cursor }`,
-mirroring how `SelectState` sits beside `Select`; every other kind has its
-own variant (`Bool`, `Choice`, `Int`, `List`) holding just what that
-widget needs (see `core::state::InputFormState`). Typing (Text, and List's
-nested per-item edit) goes through the `tui-input` crate's backend-agnostic
-`Input::handle(InputRequest)`, translated from this codebase's own
-`Key`/`KeyCode`/`Mods` — keeping `core::reducer` free of any terminal-backend
-dependency.
+Runtime state lives in `AppState::input_form`, one `InputFormState` variant
+per kind holding just what that widget needs. Typing (Text, and List's nested
+per-item edit) goes through the same line editor as every other text input.
 
-A color is **not** an `InputKind` — theme's role editor hosts its own
-BarChart-and-swatch editor directly in the **function panel** instead of a
-popup, the same `render_form`/`form_owner` seam CmdOp's builder uses, but
-opened passively by cursor-follow rather than an explicit action — landing
-on a role auto-opens it, hjkl edits write straight through with no confirm
-step ([EXTENSION.md](EXTENSION.md)'s Bundled Extensions section); `InputForm`
-only covers Text/Bool/Choice/Int/List.
+A color is **not** an `InputKind` — theme's role editor is a function-panel
+form ([THEME.md](THEME.md)).
 
 The structured navigation above is **not** hardcoded in the reducer — it is
-the ordinary `Cursor{Up,Down,Left,Right,Top,Bottom}`/`ToggleSelect`/
-`PageUp`/`PageDown` intents (the same ones File mode and Select already use),
-reinterpreted per `InputFormState` variant, plus two new InputForm-only
-intents (`AddItem`/`RemoveItem`) for the `List` kind's row management.
-`keymap.scm`'s `input-form` scope binds wasd (+ arrows, matching the rest of
-the app's convention) to these, gated by a `"input-form-typing"` condition
-that's true for the `Text` kind and a `List` row's nested item edit — so
-those keys fall through as `RawKeyEvent` to `tui-input` instead of being
-intercepted as navigation, exactly like Select's own Input/Navigate phase
-gating already works for its wasd bindings. `a`/`d` additionally split on a
+the ordinary `Cursor{Up,Down,Left,Right,Top,Bottom}`/`ToggleSelect` intents,
+reinterpreted per `InputFormState` variant, plus
+the InputForm-only `AddItem`/`RemoveItem` for the `List` kind's rows.
+`keymap.scm`'s `input-form` scope binds wasd (+ arrows) to these, gated by the
+`input-form-typing` condition (true for `Text` and a `List` row's nested edit)
+so that while typing those keys fall through as `RawKeyEvent` — the same way
+Select's Input/Navigate phases gate its wasd bindings. `a`/`d` additionally split on a
 `"input-form-list-browsing"` condition: cursor-left/right everywhere else,
 add/remove-row for `List` while browsing (`List` has no left/right concept).
 Only `Int`'s digit-typing and the two typing paths above stay as raw,
@@ -632,9 +641,7 @@ un-enumerated keys — the same reason Select's own query input isn't
 keymap-declared either.
 
 Enter confirms: pop the mode, then re-inject `template` with the encoded
-value inserted under the reserved `KEY_ITEM` key — exactly the same contract
-`Select`'s old `OnConfirm::Emit` used, so every `*-apply` handler on the
-extension side needs no changes regardless of kind. (`List` is the one
+value inserted under the reserved `KEY_ITEM` key, regardless of kind. (`List` is the one
 exception: Enter is contextual on which row is selected — it edits/adds a
 row on every row except the trailing "✓ Confirm" one, since `keymap.scm`
 binds Enter to `Intent::Confirm` for every InputForm instance and there is
@@ -645,16 +652,15 @@ nested state: pop the mode and clear `input_form`, emitting nothing.
 ## Selection and Cursor Rules
 
 - The selection is a set of paths, never of indices.
-- After any reload (refresh, dotfiles toggle, post-operation reload), paths no
-  longer present in the listing are dropped from the selection.
+- A selected path is dropped from the selection only when it no longer exists
+  (reported by a Listing's `gone`) — never merely because it is not in the
+  listing on screen, so a selection made across directories or filters
+  survives refreshes and navigation.
 - If the cursor's entry disappears, move to the nearest surviving neighbor;
   if none, the first entry; if the listing is empty, no cursor.
-- ToggleSelect (Space) marks the item under the **active interaction target's**
-  cursor: normally the file-panel cursor entry, but while a CmdOp panel is open it
-  is that panel's unified cursor — an option checkbox, or a listing entry into the
-  same shared path selection — regardless of which panel holds keyboard focus
-  (the CmdOp cursor is also what wasd/hjkl drive). Path-valued Selects
-  (file-search) likewise mark into the shared file selection.
+- ToggleSelect (Space) marks the file-panel cursor entry. Path-valued Selects
+  (file-search) mark into the same path selection. A form extension binds Space
+  to its own action while active (CmdOp: [CMDOP.md](CMDOP.md)).
 - ToggleSelect does not advance the cursor. ClearSelection clears everything.
 - Copy, Move, and Delete completion issues a refresh and applies the cursor
   correction above.
@@ -671,8 +677,9 @@ expressed in two places:
   path in File; Confirm switches phase or confirms; initiators expand into
   follow-up intents). It is pure and returns Effects.
 - The **kernel** (`dispatch_intent`) applies the structural gates (Policy,
-  extension dispatch, the destructive→Policy confirmation) and broadcasts the
-  **cursor-changed event** — when the cursor target or panel visibility changes it
+  extension dispatch, the confirm-policy → Policy gate) and broadcasts the
+  **cursor-changed event** — when the cursor signature changes
+  (cursor path, panel visibility, function scroll offset, or mode id), it
   calls every extension's `on_cursor_changed` and re-dispatches the intents they
   return; the content provider returns `LoadContent` to follow the cursor
   ([ARCHITECTURE.md](ARCHITECTURE.md), [EXTENSION.md](EXTENSION.md)). Async
@@ -697,10 +704,9 @@ all live in the same layered registry, so layer priority and collision
 detection apply uniformly. Scope specificity (longest mode-id prefix, then
 panel scope) is applied before layer priority.
 
-Default bindings exist only as the embedded keymap source, loaded at startup
-into the Scheme session. It is also written out as the user's keybindings
-template with every line commented out, so the User layer contains only lines
-the user actively uncommented.
+Default bindings exist only as the embedded keymap source. The `config.scm`
+template lists every one of them as a commented-out `bind!`, so the User layer
+contains only what the user actively set ([SCHEME.md](SCHEME.md)).
 
 ## Focus Follows the Action
 
@@ -713,8 +719,14 @@ handled — not per-intent focus code:
 - **File panel** ← `Cursor{Up,Down,Left,Right,Top,Bottom}` (the `wasd` keys) and
   `Activate`.
 - **Function panel** ← `Func{Up,Down,Left,Right}` (the `hjkl` keys from the file
-  panel), `Scroll*` / `Page*`, `Open`, and CmdOp listing navigation
-  (`Cmd{CursorDown,CursorUp,Descend,Parent}`).
+  panel), `Scroll*` / `Page*`, and `Open`.
+- **Exception — an active form keeps focus.** While an extension holds the
+  function panel as an active form (`SetFunctionForm`) and the panel has focus,
+  keys bound to file-targeting intents (`wasd`, `W`/`S`, `Enter` → Activate) are
+  not resolved to those intents; they go to the form as raw keys
+  ([ARCHITECTURE.md](ARCHITECTURE.md), key routing). `Tab` (FocusNextPanel) is how
+  the user steps back to the file panel without closing the form. A passive
+  form (`HostFunctionForm`) keeps the ordinary rule.
 - Every other intent (mode stack, initiators that manage focus themselves —
   rename/edit, function search, the explicit `FocusPanel`/`FocusNext` ops, async
   results, quit) leaves focus unchanged.
@@ -722,7 +734,8 @@ handled — not per-intent focus code:
 So pressing `hjkl` from the file panel both operates the function panel **and**
 moves focus there; pressing `wasd` from the function panel both moves the file
 cursor **and** returns focus to the file panel. To make this reciprocal, the
-function panel also binds `wasd → Cursor*` (always) and `h`/`l → FuncLeft/Right`
+function panel also binds `wasd → Cursor*` (except under an active form, above)
+and `h`/`l → FuncLeft/Right`
 (content), so the same keys mean the same panel from either side. The panel ids
 are the shared `core::PANEL_FILE` / `PANEL_FUNCTION` constants — the single source
 of truth the reducer writes and the middle renderer recognizes.
@@ -746,61 +759,68 @@ file through the resolver (viewing content is `d` / `,`). It is never a *raw* Ex
 
 ## File Mode (file panel focused)
 
+Core layer (`app/keymap.scm`):
+
 | Key | Intent | Description |
 |-----|--------|-------------|
 | w | CursorUp | move the cursor up one cell (clamp at the column top) |
 | s | CursorDown | move the cursor down one cell (clamp at the column bottom) |
 | a | CursorLeft | move the cursor one column left; at the leftmost column, parent directory |
-| d | CursorRight | move the cursor one column right; at the **Rows** right wall, dir → enter, file → cycle the content view (Columns/Grid clamp) |
-| Enter | Activate | enter the directory, or open the file via the resolver (any cell, any layout) |
-| v | CycleListLayout | cycle the file-list layout: Rows → Columns → Grid → Rows |
-| k, Up | FuncUp | function cursor up (scroll the content up) |
-| j, Down | FuncDown | function cursor down (scroll the content down) |
-| h, Left | FuncLeft | scroll the content left |
-| l, Right | FuncRight | scroll the content right |
+| d | CursorRight | move the cursor one column right; at the **Rows** right wall, dir → enter, file → show its content (Columns/Grid clamp) |
+| Enter, e | Activate | enter the directory, or open the file via the resolver (any cell, any layout) |
+| W, S | CursorTop, CursorBottom | first / last entry |
+| v | CycleListLayout | Rows → Columns → Grid → Rows |
+| k, Up; j, Down | FuncUp, FuncDown | scroll the function panel |
+| h, Left; l, Right | FuncLeft, FuncRight | h-scroll the function panel |
 | Space | ToggleSelect | toggle selection; the cursor does not advance |
-| f | push Select file-search on a real cwd, or FilterListing (push Select filter-list) on a virtual cwd (`:when (not filter-maxed)` either way) | deep search on a real directory, shallow filter of the current listing on a virtual one (`@/...`); either way, confirm filters the file panel in place — see "Deep search vs. shallow filter" |
-| x | push Select command-palette | command palette |
-| W | CursorTop | first entry |
-| S | CursorBottom | last entry |
 | Ctrl-a | SelectAll | select all |
-| c | `(ext "cmdop" "start-copy")` | begin copy — the cmdop extension's function-panel builder (options + a browsable destination listing) |
-| m | `(ext "cmdop" "start-move")` | begin move — same builder as copy |
-| R | `(ext "cmdop" "start-rename")` | begin rename — a name prompt in the function panel, prefilled with the current name |
-| M | `(ext "cmdop" "start-create")` | begin mkdir/touch — a multi-line name buffer in the function panel; a trailing `/` makes a directory, otherwise a file, one per line — see "CmdOp" below |
-| e | StartEdit | edit in the user's editor (Suspended form) |
+| f | push `file-search` (`:when (and (not filter-maxed) (not cwd-virtual))`), or FilterListing (`:when (and (not filter-maxed) cwd-virtual)`) | deep search on a real directory, shallow filter on a virtual one — see "Deep search vs. shallow filter" |
+| z | push `command-palette` | command palette |
+| E | StartEdit | edit in the user's editor (Suspended form) |
+| Backspace, Delete | DeleteSelected | delete the targets with the resolver's `delete` entry (`rm`), Policy-confirmed |
+| c, m, R, M | start copy / move / rename / create | the built-in CmdOp builder ([CMDOP.md](CMDOP.md)) |
 | , | CycleFunctionPanel | hidden → 2:1 → 1:1 → 1:2 → hidden |
 | . | ToggleDotFiles | toggle hidden files |
-| @ | ToggleVfsRoot | jump to the VFS root (or back to the real filesystem) |
-| ~ | `(navigate-to "~")` | jump to the home directory (`$HOME`, falling back to `/`) |
-| Esc | ClearFilter (`:when has-filter`), else ClearSelection | pop one filter level while filtered — see "Filtering the file panel"; else clear selection |
+| @ | ToggleVfsRoot | jump to the VFS root, or back to the real filesystem |
+| ~ | `(navigate-to "~")` | the home directory (`env.home`, captured at boot) |
+| Esc | ClearFilter (`:when has-filter`), else ClearSelection | pop one filter level while filtered; else clear the selection |
 | r | Refresh | reload |
 | Tab, Shift-Tab | FocusNextPanel, FocusPrevPanel | panel focus |
 | q, Ctrl-c | Quit | quit |
 
-Extension entry keys merge into this table at the Extension layer and are
-user-overridable. Example: the archive extension binds p to start-pack when a
-selection exists, and P to start-unpack when the cursor entry is an archive;
-the bookmarks extension binds B to add the current path as a bookmark.
+Extension layer, bundled extensions (user-overridable):
+
+| Key | Binding | Extension |
+|-----|---------|-----------|
+| x, X | resume a shell / open a new one | pty ([PTY.md](PTY.md)) |
+| e | the editor in a PTY (`:when (option "pty.edit-host")`), overriding Activate | pty |
+| / ; n, p | start content search (`:when (and function-visible sublayout-content)`); next / previous match (`:when function-has-matches`) | preview |
+| B | bookmark the current path | bookmarks |
+| Backspace, Delete | remove the bookmark under the cursor (`:when bookmarks-cursor`) | bookmarks |
+| p, P | pack the selection (`:when has-selection`); unpack the cursor archive (`:when cursor-is-archive`) | archive |
+| j k h l (H L) | drive the role color editor (`:when theme-color-active`) | theme ([THEME.md](THEME.md)) |
 
 ## Function Panel (panel-scoped bindings, function panel focused)
 
 Core bindings (embedded defaults): vertical scroll, line numbers, open/back,
-kill, cycle, hide must work with zero extensions, so they live in core (vertical
-scroll is also used by the Exec frame).
+kill, cycle, hide must work with zero extensions, so they live in core. Scroll,
+jump, cycle, hide, and focus work in **both** frames (Content and Exec — the
+vertical scroll is shared); the rest are frame-specific.
 
-| Key | Intent | Condition | Description |
-|-----|--------|-----------|-------------|
-| w, a, s, d | CursorUp, CursorLeft, CursorDown, CursorRight | | move the **file** cursor; returns focus to the file panel (Focus Follows the Action) |
-| j, Down; k, Up | ScrollDown, ScrollUp | | vertical scroll |
+| Key | Intent | Frame | Description |
+|-----|--------|-------|-------------|
+| w, a, s, d | CursorUp, CursorLeft, CursorDown, CursorRight | both | move the **file** cursor; returns focus to the file panel (Focus Follows the Action) |
+| j, Down; k, Up | ScrollDown, ScrollUp | both | vertical scroll |
+| g, G | ScrollTop, ScrollBottom | both | jump to the top / bottom |
+| PageUp, PageDown | PageUp, PageDown | both | scroll by a page |
+| , | CycleFunctionPanel | both | cycle ratio, hide at the end |
+| Esc, q | HideFunctionPanel | both | hide and refocus the file panel |
+| Tab, Shift-Tab | FocusNextPanel, FocusPrevPanel | both | panel focus |
 | h, Left; l, Right | FuncLeft, FuncRight | content | horizontal scroll |
-| g, G | ScrollTop, ScrollBottom | | jump |
 | n | ToggleLineNumbers | content | toggle line numbers |
 | Enter | Open | content | open externally via the resolver |
-| Enter | SetSubLayout Content | exec | back to content / info |
+| Enter | SetSubLayout Content | exec | back to the content frame |
 | Ctrl-c | KillProcess | exec | kill the process; the panel stays visible |
-| , | CycleFunctionPanel | | cycle ratio, hide at the end |
-| Esc, q | HideFunctionPanel | | hide and refocus the file panel |
 
 The content extension contributes the text/hex interaction bindings at the
 **Extension layer**, declared in its `scheme_source` (the `:when` predicates
@@ -828,11 +848,13 @@ are kernel-owned (the panel is kernel UI); the extension owns the keys that emit
 them, the matching algorithm, and the rendering.
 
 While the search input is open, every key except Enter (submit) and Esc
-(cancel) is delivered to the query as a RawKeyEvent (same readline editing as
-Select inputs), so the other function-panel bindings do not fire during entry.
+(cancel) is delivered to the query as a RawKeyEvent (Line editing, below), so
+the other function-panel bindings do not fire during entry.
 Search is less-style: `/` opens the input, Enter runs it and jumps to the first
 match, and `n`/`p` step forward/back through matches (wrapping). Matching is
-ASCII case-insensitive.
+ASCII case-insensitive. The owner reports matches in logical coordinates
+(block, byte range); core maps them to panel rows, so a wrapped paragraph's
+match lands on the row it was wrapped onto.
 
 ## Select Mode (shared by every picker; instance scopes override by longest prefix)
 
@@ -852,15 +874,24 @@ Returning to the Input phase needs no binding: any unbound printable key in
 the Navigate phase is delivered as RawKeyEvent; the reducer switches back to
 Input and applies the character.
 
-Input fields use readline-style editing, applied by the reducer:
+## Line editing
+
+Every text input — the Select query, the function-panel search input, a
+function-panel form input (`BeginInput`), InputForm's `Text` kind and `List`
+item edit — is edited by the one line editor (`core::line_edit`), applied by
+the reducer to a (text, caret) pair on char boundaries:
 
 | Key | Action |
 |-----|--------|
-| Ctrl-a, Ctrl-e | beginning / end of line |
+| printable | insert at the caret |
+| Ctrl-a, Home; Ctrl-e, End | beginning / end of line |
 | Ctrl-k, Ctrl-u | kill to end / beginning of line |
-| Ctrl-w | delete word |
+| Ctrl-w | delete the word before the caret |
 | Ctrl-b, Left; Ctrl-f, Right | move one character |
 | Ctrl-h, Backspace; Ctrl-d, Delete | delete backward / forward |
+
+A multiline form input additionally inserts a newline on Enter unless the
+caret's line is empty, in which case Enter submits.
 
 ## Policy Mode
 
@@ -881,10 +912,9 @@ Input fields use readline-style editing, applied by the reducer:
 | d | CursorRight | not input-form-typing, not input-form-list-browsing |
 | W, Home; S, End | CursorTop, CursorBottom | not input-form-typing |
 | Space | ToggleSelect | not input-form-typing |
-| PageUp; PageDown | PageUp, PageDown | not input-form-typing |
 | a | AddItem | input-form-list-browsing |
 | d, Delete, Backspace | RemoveItem | input-form-list-browsing |
-| any other key | RawKeyEvent — `tui-input`'s `Input::handle` for `Text` (same Ctrl chords as Select's input fields, above), `List`'s nested item edit, and `Int`'s direct digit-typing | |
+| any other key | RawKeyEvent — Line editing for `Text` and `List`'s nested item edit; direct digit entry for `Int` | |
 
 `input-form-typing` is true for the `Text` kind and a `List` row's nested
 edit; `input-form-list-browsing` is true for the `List` kind while not
@@ -898,20 +928,61 @@ Select's own `select-phase-navigate`/`select-phase-input` already use.
 |-------|----------|--------|
 | Core | lowest | embedded defaults |
 | Extension | middle | bundled and dynamically loaded extensions (keymaps and entry bindings) |
-| User | highest | the user's own configuration files only |
+| User | highest | the settings store's bindings — its `config`, `custom`, and `session` layers ([SCHEME.md](SCHEME.md)) |
 
-Later layers win; within a layer, the last definition wins. Collisions are
-checked at startup across all layers and emit a warning naming both layers.
-A user can rebind or disable any extension-provided key. Deleting the user
-configuration reproduces exactly the embedded defaults.
+Later layers win. Within the Core layer the later definition wins (source
+order). Within the User layer the store's layering decides: `session` over
+`custom` over `config`, and an `unbind!` hides the bindings below it. Within the Extension layer,
+two extensions binding the same (scope, key) are decided by **extension
+priority**: the extension with the lower priority rank wins. A user rebind in
+the User layer overrides either. Settings edits to bindings apply immediately:
+the kernel rebuilds the User layer and re-runs collision detection.
 
-The Core layer is sourced from the embedded Scheme keymap, evaluated by the
-session and decoded by the codec; on any failure it falls back to the native
-default table. The User layer comes from `keybindings.scm`, one
-`(bind <mode> <panel|#f> "<key>" <intent> [<when>])` form per (uncommented)
-line — panel `#f` means any focused panel. Scope specificity still applies
-before layer priority, so a User binding overrides a Core one only when its
-panel scope is at least as specific.
+**Extension priority.** Every registered extension has a rank: its position in
+the store's `extensions` display order, starting at 1. The default order is
+registration order (bundled extensions in `bundled()` order, then optional
+extensions in manifest file-name order); `(order! 'extensions '(…))` — or the
+settings UI — reorders it, and extensions it does not list follow in
+registration order. A lower rank means
+higher priority, everywhere one extension must be chosen over another: a key
+collision within the Extension layer, the content provider (the lowest-ranked
+extension with `provides_function_content`), `entry_style` (the
+lowest-ranked extension returning `Some`), and the cursor-changed broadcast
+(extensions are called highest rank number first, so the intents of the
+highest-priority extension are dispatched last and prevail). The rank is shown as
+`@/settings/Extensions/<id>/Priority`, and editable there.
 
-Conditional bindings use `:when` clauses, evaluated in three classes without
-any Scheme session round trip on the input path — see [SCHEME.md](SCHEME.md).
+Collisions are checked at startup (and whenever the User layer is rebuilt)
+across all layers and emit a warning naming both layers. A user can rebind or
+disable (`unbind!`) any extension-provided key. Deleting the user
+configuration — `config.scm` and `custom.scm` — reproduces exactly the
+embedded defaults.
+
+The Core layer is the embedded Scheme keymap, read by the s-expression reader
+and decoded by the codec. The User layer is the projection of the store's
+bindings ([SCHEME.md](SCHEME.md)) — panel `#f` means any focused panel. Scope
+specificity still applies before layer priority, so a User binding overrides a
+Core one only when its panel scope is at least as specific.
+
+Conditional bindings use `:when` clauses — the closed predicate grammar,
+evaluated natively with no Scheme round trip on the input path
+([SCHEME.md](SCHEME.md)).
+
+## Key Model
+
+A `Key` is a code, modifiers, and an event kind:
+
+- **code** — a character, Enter, Esc, Tab, BackTab, Backspace, Delete, Insert,
+  the arrows, Home/End, PageUp/PageDown, or F1–F35. `Shift-Tab` and `BackTab`
+  are two spellings of the same key (the terminal reports Shift+Tab as
+  BackTab); both are accepted in key strings and resolve to one binding;
+- **mods** — ctrl, shift, alt, super, hyper, meta (the last three reported only
+  under the Kitty keyboard protocol). Shift is folded into a character and kept
+  only for non-character codes;
+- **kind** — Press, Repeat, Release.
+
+wasdf asks its own terminal for the Kitty keyboard protocol at startup
+(disambiguated escapes, event types, alternate keys, all keys as escapes) and
+pops it on exit and around a Suspended child; a terminal without support stays
+on legacy keys. Only Press events resolve through the keymap. An input capture
+receives every event, losslessly encoded ([EXTENSION.md](EXTENSION.md)).

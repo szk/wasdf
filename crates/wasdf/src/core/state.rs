@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::core::event::{ExecOutput, PanelView};
-use crate::core::intent::ExtensionIntent;
+use crate::core::intent::{ExtensionIntent, Intent, Key};
 use crate::core::mode::{Mode, SubLayout};
 use crate::core::scroll::Scroll;
 
@@ -208,6 +208,10 @@ pub struct PanelSearch {
     pub matches: Vec<(usize, usize, usize)>,
     /// Index into `matches` of the current match (the one `n`/`p` move from).
     pub current: usize,
+    /// What the open input is for, shown keyless at the head of the help row.
+    /// The same idea as `SelectSpec::input_hint`, but this input is a panel
+    /// state rather than a mode, so it carries its own (doc/HELP.md).
+    pub hint: String,
 }
 
 /// Function-panel view state. Reducer-managed, lives in AppState.
@@ -393,6 +397,33 @@ pub struct AppState {
     /// The query text that produced the currently shown listing, when
     /// filtered — `None` exactly when `filter_stack` is empty.
     pub filter_query: Option<String>,
+    /// An extension's claim on the raw keyboard, if any. See [`InputCapture`].
+    pub input_capture: Option<InputCapture>,
+}
+
+/// An extension's claim on the raw keyboard. While one is installed,
+/// `handle_key` hands keys to `owner` instead of acting on them — except for
+/// the two escapes below, which **core** honours on its own.
+///
+/// Both escapes are data core owns rather than a protocol the extension must
+/// implement, and that is the point: an extension that panics, deadlocks, or
+/// simply mishandles a key cannot leave the user with no way back. Nothing
+/// here is specific to any one extension.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputCapture {
+    /// The extension receiving captured keys, as `intent = "key"`.
+    pub owner: String,
+    /// The hard release key, checked before anything else. Core clears the
+    /// capture on it unconditionally, then delivers `intent = "prefix"` so a
+    /// healthy extension can react — but the release has already happened
+    /// whether or not it answers.
+    pub release: Key,
+    /// Intents that also end the capture. Core resolves each key through the
+    /// keymap as usual; a hit here clears the capture **and dispatches the
+    /// intent**, so the action the user pressed the key for still happens.
+    /// Declared as intents rather than keys so it follows the user's keymap.
+    /// Empty ⇒ only `release` escapes, and the keymap is never consulted.
+    pub escape: Vec<Intent>,
 }
 
 impl AppState {
@@ -416,6 +447,7 @@ impl AppState {
             root_return: None,
             filter_stack: Vec::new(),
             filter_query: None,
+            input_capture: None,
         }
     }
 

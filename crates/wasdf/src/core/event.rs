@@ -3,7 +3,6 @@
 
 use std::path::PathBuf;
 
-use crate::core::extension_value::ExtensionValue;
 use crate::core::intent::Key;
 use crate::core::state::Entry;
 
@@ -28,11 +27,13 @@ pub struct ResolverRequest {
 /// off-thread; the *extension* decodes them into its own content. Both arms are
 /// core types so the read stays content-agnostic.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ReadResult {
+pub enum Content {
     /// A byte chunk starting at `offset`; `eof` marks the last chunk (no bytes
     /// beyond it). The owning extension assembles consecutive chunks itself.
     Bytes { offset: u64, bytes: Vec<u8>, eof: bool },
     Dir { entries: Vec<Entry> },
+    /// A Scheme evaluation's printed value, or its error (`Intent::Eval`).
+    Value(Result<String, String>),
 }
 
 /// The closed set of plans — the only way side effects leave the pipeline.
@@ -46,7 +47,7 @@ pub enum Plan {
     /// SEARCH_RENEW.md). `owner: None` completes as `(Purpose::Search,
     /// Payload::Entries)`, driving a Select's own `view` (today's file-search).
     /// `owner: Some(id)` completes as a generic content Read instead
-    /// (`Purpose::Content`, `Payload::Read{owner, path: root, ReadResult::Dir}`)
+    /// (`Purpose::Content`, `Payload::Read{owner, path: root, Content::Dir}`)
     /// — the extension-facing counterpart, addressed like `Plan::Read`,
     /// routed to `id`'s `accept_content` with zero new kernel plumbing.
     Search {
@@ -73,8 +74,11 @@ pub enum Plan {
     Suspend {
         argv: Vec<String>,
     },
+    /// Evaluate in the settings store's session (`session` layer current). The
+    /// result goes to `owner` when there is one.
     EvalScheme {
         expr: String,
+        owner: Option<String>,
     },
 }
 
@@ -225,10 +229,13 @@ pub enum Payload {
     Entries { path: PathBuf, entries: Vec<Entry> },
     /// A content read completion: the owning extension and the path, plus the raw
     /// read result it should decode. The kernel routes this to the extension.
-    Read { owner: String, path: PathBuf, result: ReadResult },
+    Read { owner: String, path: PathBuf, result: Content },
     OpDone(OpDone),
     Exec(ExecOutput),
-    Scheme(ExtensionValue),
+    /// A settings-store evaluation: its printed value (or error) for `owner`,
+    /// and the change set in its printed form, which the kernel decodes and
+    /// applies to the projections (core treats it as opaque text).
+    Scheme { owner: Option<String>, value: Result<String, String>, changes: String },
     None,
 }
 

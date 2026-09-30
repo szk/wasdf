@@ -1,8 +1,10 @@
 //! A small s-expression reader. The Scheme session evaluates config forms and
 //! prints canonical data with `write`; this reader parses that output back into
 //! Rust. It belongs to the script layer's codec role (the single owner of the
-//! datum string form). It reads canonical `write` output only — no quoting,
-//! quasiquote, or dotted pairs are needed.
+//! datum string form). It reads data: lists, strings, integers, booleans,
+//! symbols, and the quote shorthand `'x` (read as `(quote x)`) — enough for
+//! canonical `write` output and for `custom.scm`'s literal store calls.
+//! Quasiquote and dotted pairs are not supported.
 
 /// A parsed datum.
 #[derive(Debug, Clone, PartialEq)]
@@ -65,10 +67,29 @@ pub fn render(d: &Datum) -> String {
 }
 
 /// Parse a single datum from the input.
+/// The datum inside a `(quote …)` source — the shape of every embedded
+/// declaration file.
+pub fn parse_quoted(input: &str) -> Result<Datum, String> {
+    match parse(input)? {
+        Datum::List(l) if l.len() == 2 && l[0].as_sym() == Some("quote") => Ok(l[1].clone()),
+        _ => Err("not a (quote …) form".into()),
+    }
+}
+
 pub fn parse(input: &str) -> Result<Datum, String> {
     let mut r = Reader { chars: input.chars().peekable() };
     let d = r.read_datum()?.ok_or("empty input")?;
     Ok(d)
+}
+
+/// Parse every top-level datum in the input, in order.
+pub fn parse_all(input: &str) -> Result<Vec<Datum>, String> {
+    let mut r = Reader { chars: input.chars().peekable() };
+    let mut out = Vec::new();
+    while let Some(d) = r.read_datum()? {
+        out.push(d);
+    }
+    Ok(out)
 }
 
 struct Reader<'a> {
@@ -100,6 +121,11 @@ impl Reader<'_> {
             Some('(') => self.read_list().map(Some),
             Some(')') => Err("unexpected )".into()),
             Some('"') => self.read_string().map(Some),
+            Some('\'') => {
+                self.chars.next();
+                let quoted = self.read_datum()?.ok_or("quote at end of input")?;
+                Ok(Some(Datum::List(vec![Datum::Sym("quote".into()), quoted])))
+            }
             Some(_) => self.read_atom().map(Some),
         }
     }
@@ -188,5 +214,13 @@ mod tests {
             d,
             Datum::List(vec![Datum::Sym("a".into()), Datum::Int(1), Datum::Bool(true)])
         );
+    }
+
+    #[test]
+    fn quote_shorthand_and_multiple_forms() {
+        let forms = parse_all("(opt-set! 'k '(\"a\" 1)) ; note\n'sym").unwrap();
+        assert_eq!(forms.len(), 2);
+        assert_eq!(render(&forms[0]), "(opt-set! (quote k) (quote (\"a\" 1)))");
+        assert_eq!(forms[1], Datum::List(vec![Datum::Sym("quote".into()), Datum::Sym("sym".into())]));
     }
 }

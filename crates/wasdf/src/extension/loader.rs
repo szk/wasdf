@@ -54,6 +54,8 @@ pub struct OptionalExtension {
     /// options. Lets a user extension declare configurable settings — appearing
     /// editable under `@/settings/Extensions/<id>` exactly like a bundled one.
     pub options: Option<String>,
+    /// The prelude's file name, relative to the manifest, from `(prelude …)`.
+    pub prelude: Option<String>,
 }
 
 type AbiVersionFn = unsafe extern "C" fn() -> u32;
@@ -72,6 +74,7 @@ struct DynamicExtension {
     resolvers: Vec<ResolverEntry>,
     keymaps: Vec<Binding>,
     options: Option<String>,
+    prelude: Option<String>,
     handle: Option<HandleFn>,
     cursor: Option<CursorFn>,
     /// Optional VFS-listing hook: when present, this extension owns the mount
@@ -174,6 +177,10 @@ impl Extension for DynamicExtension {
         self.options.clone()
     }
 
+    fn prelude(&self) -> Option<String> {
+        self.prelude.clone()
+    }
+
     fn bind_store(&self, store: &Arc<OptionStore>) {
         let _ = self.store.set(store.clone());
     }
@@ -230,6 +237,7 @@ pub fn parse_glue(glue: &str) -> Result<OptionalExtension, String> {
     let mut resolvers = Vec::new();
     let mut keymaps = Vec::new();
     let mut options = None;
+    let mut prelude = None;
     for section in &list[2..] {
         let s = section.as_list().ok_or("glue section is not a list")?;
         match s.first().and_then(|d| d.as_sym()) {
@@ -255,10 +263,13 @@ pub fn parse_glue(glue: &str) -> Result<OptionalExtension, String> {
                 config::parse_option_config(forms)?;
                 options = Some(format!("(quote {})", sexpr::render(forms)));
             }
+            Some("prelude") => {
+                prelude = Some(s.get(1).and_then(|d| d.as_str()).ok_or("prelude missing file name")?.to_string());
+            }
             other => return Err(format!("unknown glue section: {other:?}")),
         }
     }
-    Ok(OptionalExtension { id, lib, commands, resolvers, keymaps, options })
+    Ok(OptionalExtension { id, lib, commands, resolvers, keymaps, options, prelude })
 }
 
 /// The platform dynamic-library filename for a bare crate lib name, e.g.
@@ -320,6 +331,13 @@ pub fn load_optional(dir: &Path) -> Vec<Box<dyn Extension>> {
 fn load_one(manifest: &Path) -> Result<Box<dyn Extension>, String> {
     let glue = std::fs::read_to_string(manifest).map_err(|e| e.to_string())?;
     let parsed = parse_glue(&glue)?;
+    let dir = manifest.parent().unwrap_or_else(|| Path::new("."));
+    let prelude = match &parsed.prelude {
+        Some(file) => Some(
+            std::fs::read_to_string(dir.join(file)).map_err(|e| format!("prelude {file}: {e}"))?,
+        ),
+        None => None,
+    };
 
     // Purely declarative manifest: no native library, no handlers.
     let Some(lib_name) = parsed.lib.clone() else {
@@ -330,6 +348,7 @@ fn load_one(manifest: &Path) -> Result<Box<dyn Extension>, String> {
             resolvers: parsed.resolvers,
             keymaps: parsed.keymaps,
             options: parsed.options,
+            prelude,
             handle: None,
             cursor: None,
             list: None,
@@ -365,6 +384,7 @@ fn load_one(manifest: &Path) -> Result<Box<dyn Extension>, String> {
             resolvers: parsed.resolvers.clone(),
             keymaps: parsed.keymaps.clone(),
             options: parsed.options.clone(),
+            prelude: prelude.clone(),
             handle,
             cursor,
             list,

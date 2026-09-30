@@ -4,6 +4,7 @@
 pub mod command;
 pub mod matcher;
 pub mod messages;
+pub mod persister;
 pub mod resolver;
 
 pub use command::CommandRegistry;

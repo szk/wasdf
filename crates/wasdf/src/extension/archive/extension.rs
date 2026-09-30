@@ -5,7 +5,7 @@
 //! key and executes as a plan through the chain. No custom mode or panel.
 
 use crate::core::{
-    AppState, ExtensionIntent, ExtensionValue, InputFormSpec, Intent, Key, KeyCode, Mode, Mods,
+    AppState, ExtensionIntent, ExtensionValue, InputFormSpec, Intent, Key, KeyCode, Mode,
     KEY_ITEM, KEY_RESOLVER,
 };
 use crate::extension::Extension;
@@ -62,21 +62,23 @@ impl Extension for ArchiveExtension {
 
     fn keymaps(&self) -> Vec<Binding> {
         let bind = |key: Key, intent: Intent, when: Cond| Binding {
+            help: None,
             mode: "file".into(),
             panel: Some("file".into()),
             key,
             intent,
             when,
             layer: Layer::Extension,
+            owner: None,
         };
         vec![
             bind(
-                Key { code: KeyCode::Char('p'), mods: Mods::NONE },
+                Key::plain(KeyCode::Char('p')),
                 ext_intent("pack", ExtensionValue::Nil),
                 Cond::pred("has-selection"),
             ),
             bind(
-                Key { code: KeyCode::Char('P'), mods: Mods::NONE },
+                Key::plain(KeyCode::Char('P')),
                 ext_intent("unpack", ExtensionValue::Nil),
                 Cond::pred("cursor-is-archive"),
             ),

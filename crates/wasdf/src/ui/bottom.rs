@@ -1,21 +1,37 @@
-//! The bottom panel: the help row (see doc/UI.md), a single unboxed line of key
-//! hints for the current mode and focus. The bar spans edge to edge; each hint's
-//! trigger key is shown as a "negative" (inverted) chip, the rest of the label in
-//! the normal bar style. All colors are themeable (the `help-*` roles).
+//! The bottom panel: the help row (see doc/UI.md, doc/HELP.md), a single
+//! unboxed line of key hints for the current mode and focus. The bar spans edge
+//! to edge; each hint's trigger key is shown as a "negative" (inverted) chip,
+//! the rest of the label in the normal bar style. All colors are themeable (the
+//! `help-*` roles).
+//!
+//! The hints are **generated from the keymap actually in force** — every chip is
+//! a key that would really fire, resolved through the same walk `handle_key`
+//! uses. Nothing here holds a second copy of the bindings, so the row cannot
+//! drift from them.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::core::{AppState, Mode, Role, Theme};
+use crate::core::{AppState, Role, Theme};
+use crate::script::codec;
+use crate::script::condition::Conditions;
+use crate::script::keymap::KeymapRegistry;
 
 /// One hint: a trigger `key` (empty = plain instructional text) and its `label`.
-type Hint = (&'static str, &'static str);
+type Hint = (String, String);
 
 /// Render the help row.
-pub fn render_bottom(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let hints: Vec<Hint> = hints_for(state);
+pub fn render_bottom(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    keymap: &KeymapRegistry,
+    conds: &Conditions,
+    theme: &Theme,
+) {
+    let hints = hints_for(state, keymap, conds);
 
     let bar = theme.style(Role::HelpFg).bg(theme.role(Role::HelpBg));
     let key = theme.style(Role::HelpKeyFg).bg(theme.role(Role::HelpKeyBg));
@@ -28,16 +44,16 @@ pub fn render_bottom(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         }
         if k.is_empty() {
             // Instructional text with no trigger key.
-            spans.push(Span::styled(*label, bar));
+            spans.push(Span::styled(label.clone(), bar));
         } else if let Some((first, rest)) = first_letter_is_key(k, label) {
             // The key is the label's leading letter → highlight just that letter.
             spans.push(Span::styled(first, key));
             spans.push(Span::styled(rest, bar));
         } else {
             // Otherwise show the key chip, then the label.
-            spans.push(Span::styled(*k, key));
+            spans.push(Span::styled(k.clone(), key));
             spans.push(Span::styled(" ", bar));
-            spans.push(Span::styled(*label, bar));
+            spans.push(Span::styled(label.clone(), bar));
         }
     }
 
@@ -47,7 +63,7 @@ pub fn render_bottom(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
 
 /// If `key` is a single character equal (case-insensitively) to the first letter
 /// of `label`, split `label` into (first-letter, rest); otherwise `None`.
-fn first_letter_is_key(key: &'static str, label: &'static str) -> Option<(&'static str, &'static str)> {
+fn first_letter_is_key(key: &str, label: &str) -> Option<(String, String)> {
     let mut kc = key.chars();
     let (k, None) = (kc.next()?, kc.next()) else { return None };
     let first = label.chars().next()?;
@@ -55,47 +71,174 @@ fn first_letter_is_key(key: &'static str, label: &'static str) -> Option<(&'stat
         return None;
     }
     let split = label.char_indices().nth(1).map(|(i, _)| i).unwrap_or(label.len());
-    Some(label.split_at(split))
+    let (a, b) = label.split_at(split);
+    Some((a.to_string(), b.to_string()))
 }
 
-/// The hint list for the current mode and focus.
-fn hints_for(state: &AppState) -> Vec<Hint> {
-    match state.mode() {
-        Mode::File => {
-            if state.focused_panel == "function" {
-                if state.function.search.input_active {
-                    vec![("", "type pattern"), ("Enter", "search"), ("Esc", "cancel")]
-                } else if !state.function.search.matches.is_empty() {
-                    vec![
-                        ("j/k", "scroll"), ("h/l", "◂▸"), ("n/p", "match"),
-                        ("g/G", "top/bottom"), ("Enter", "open"), ("Esc", "hide"),
-                    ]
-                } else {
-                    vec![
-                        ("j/k", "scroll"), ("h/l", "◂▸"), ("/", "search"), ("n", "line#"),
-                        ("g/G", "top/bottom"), ("Enter", "open"), ("Esc", "hide"),
-                    ]
-                }
-            } else {
-                vec![
-                    ("wasd", "move"), ("Space", "select"), ("f", "find"), ("z", "palette"),
-                    ("c", "copy"), ("m", "move"), ("R", "rename"), ("E", "edit"),
-                    ("@", "vfs"), (",", "panel"), ("q", "quit"),
-                ]
+/// The hint list for the current state.
+fn hints_for(state: &AppState, keymap: &KeymapRegistry, conds: &Conditions) -> Vec<Hint> {
+    // A captured keyboard reaches no binding at all, so a keymap-derived row
+    // would be empty — worst in the one state where the user most needs to be
+    // told the way out. Render the capture itself instead; everything else is
+    // suppressed because nothing else is reachable.
+    if let Some(cap) = &state.input_capture {
+        return capture_hints(cap, state, keymap, conds);
+    }
+    let mut hints: Vec<Hint> = Vec::new();
+    if let Some(text) = input_hint(state) {
+        hints.push((String::new(), text));
+    }
+    hints.extend(keymap.help_hints(conds, state, &state.focused_panel));
+    hints
+}
+
+/// The row while an extension holds the raw keyboard: the release key, then
+/// whatever else core will honour. Both come from the capture and the keymap,
+/// so they follow a rebound prefix or a rebound cursor key without this knowing.
+fn capture_hints(
+    cap: &crate::core::InputCapture,
+    state: &AppState,
+    keymap: &KeymapRegistry,
+    conds: &Conditions,
+) -> Vec<Hint> {
+    let mut hints = vec![(codec::key_name(cap.release), "release".to_string())];
+    let mut keys: Vec<crate::core::Key> = Vec::new();
+    for intent in &cap.escape {
+        for k in keymap.keys_for_intent(conds, state, &state.focused_panel, intent) {
+            if !keys.contains(&k) {
+                keys.push(k);
             }
         }
-        // The command Select's input is the Argument (dest/name), not a filter,
-        // and its marks toggle the command's Options.
-        Mode::Select(spec) if spec.id == "command" => vec![
-            ("", "type argument"), ("w/s", "move"), ("Space", "toggle option"),
-            ("Enter", "run"), ("Esc", "cancel"),
-        ],
-        Mode::Select(_) => vec![
-            ("", "type to filter"), ("Enter", "confirm/next"), ("w/s", "move"),
-            ("Space", "mark"), ("Esc", "cancel"),
-        ],
-        Mode::Policy(_) => vec![("y/Enter", "confirm"), ("n/Esc", "cancel")],
-        Mode::InputForm(_) => vec![("", "type value"), ("Enter", "confirm"), ("Esc", "cancel")],
-        Mode::Extension { .. } => vec![("Esc", "back")],
+    }
+    if !keys.is_empty() {
+        let chip: Vec<String> = keys.iter().map(|k| codec::key_name(*k)).collect();
+        let joined = if chip.iter().all(|n| n.chars().count() == 1) {
+            chip.concat()
+        } else {
+            chip.join("/")
+        };
+        hints.push((joined, "file cursor".to_string()));
+    }
+    hints
+}
+
+/// The keyless "what this input is for" line, when one is open. It describes a
+/// *mode with an open input*, not a key, so it lives on the spec that opened it
+/// rather than in a table here (doc/HELP.md).
+fn input_hint(state: &AppState) -> Option<String> {
+    if state.function.search.input_active {
+        return Some(state.function.search.hint.clone());
+    }
+    match state.mode() {
+        crate::core::Mode::Select(spec) => spec.input_hint.clone(),
+        crate::core::Mode::InputForm(spec) => spec.input_hint.clone(),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{InputCapture, Intent, Key, KeyCode, Mods};
+    use crate::script::keymap::{Binding, Layer};
+    use crate::script::condition::Cond;
+
+    fn state() -> AppState {
+        AppState::new(std::path::PathBuf::from("/"))
+    }
+
+    fn bind(key: Key, intent: Intent, help: Option<&str>) -> Binding {
+        Binding {
+            mode: "file".into(),
+            panel: Some("file".into()),
+            key,
+            intent,
+            when: Cond::Always,
+            layer: Layer::Core,
+            help: help.map(str::to_string),
+            owner: None,
+        }
+    }
+
+    fn keymap() -> KeymapRegistry {
+        let mut km = KeymapRegistry::new();
+        for (c, i) in [
+            ('w', Intent::CursorUp),
+            ('a', Intent::CursorLeft),
+            ('s', Intent::CursorDown),
+            ('d', Intent::CursorRight),
+        ] {
+            km.add(bind(Key::plain(KeyCode::Char(c)), i, Some("cursor")));
+        }
+        km.add(bind(Key::plain(KeyCode::Char('q')), Intent::Quit, Some("quit")));
+        km
+    }
+
+    fn capture(escape: Vec<Intent>) -> InputCapture {
+        InputCapture {
+            owner: "someone".into(),
+            release: Key::new(KeyCode::Char('b'), Mods::CTRL),
+            escape,
+        }
+    }
+
+    #[test]
+    fn a_captured_keyboard_shows_the_release_key_and_nothing_else_of_the_keymap() {
+        // Under capture no binding is reachable, so advertising them would be a
+        // lie — and the one key that *is* reachable is the one to show.
+        let mut s = state();
+        s.input_capture = Some(capture(Vec::new()));
+        let hints = hints_for(&s, &keymap(), &Conditions::default());
+        assert_eq!(hints, vec![("Ctrl-b".to_string(), "release".to_string())]);
+    }
+
+    #[test]
+    fn the_release_chip_follows_a_rebound_prefix() {
+        let mut s = state();
+        let mut cap = capture(Vec::new());
+        cap.release = Key::new(KeyCode::Char('a'), Mods::CTRL);
+        s.input_capture = Some(cap);
+        let hints = hints_for(&s, &keymap(), &Conditions::default());
+        assert_eq!(hints[0].0, "Ctrl-a");
+    }
+
+    #[test]
+    fn escape_intents_are_shown_as_the_keys_that_currently_reach_them() {
+        let mut s = state();
+        s.input_capture = Some(capture(vec![
+            Intent::CursorUp,
+            Intent::CursorLeft,
+            Intent::CursorDown,
+            Intent::CursorRight,
+        ]));
+        let hints = hints_for(&s, &keymap(), &Conditions::default());
+        assert_eq!(
+            hints,
+            vec![
+                ("Ctrl-b".to_string(), "release".to_string()),
+                ("wasd".to_string(), "file cursor".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_open_input_states_what_it_is_for_before_any_key() {
+        let mut s = state();
+        s.function.search.input_active = true;
+        s.function.search.hint = "type pattern".into();
+        let hints = hints_for(&s, &keymap(), &Conditions::default());
+        assert_eq!(hints[0], (String::new(), "type pattern".to_string()));
+    }
+
+    #[test]
+    fn an_uncaptured_row_is_the_keymap_itself() {
+        let hints = hints_for(&state(), &keymap(), &Conditions::default());
+        assert_eq!(
+            hints,
+            vec![
+                ("wasd".to_string(), "cursor".to_string()),
+                ("q".to_string(), "quit".to_string()),
+            ]
+        );
     }
 }

@@ -89,8 +89,8 @@ fn is_bookmark_leaf(state: &AppState) -> bool {
 /// don't crash the boot).
 fn load_bookmarks(path: &Path) -> Vec<PathBuf> {
     let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
-    let Ok(datum) = crate::script::sexpr::parse(&text) else { return Vec::new() };
-    let Some(inner) = datum.as_list().and_then(|l| l.get(1)).and_then(|d| d.as_list()) else {
+    let Ok(datum) = crate::script::sexpr::parse_quoted(&text) else { return Vec::new() };
+    let Some(inner) = datum.as_list() else {
         return Vec::new();
     };
     inner.iter().filter_map(|d| d.as_str().map(PathBuf::from)).collect()

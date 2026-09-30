@@ -2,7 +2,7 @@
 //! types: resolver entries, palette commands, and keymap bindings. Shared by
 //! the embedded-default loader (kernel boot) and the optional-extension loader.
 
-use crate::core::{OptionDef, OptionKind};
+use crate::core::{OptionDef, OptionKind, OptionValue};
 use crate::script::codec;
 use crate::script::condition::Cond;
 use crate::script::keymap::{Binding, Layer};
@@ -115,8 +115,9 @@ pub fn parse_option_config(datum: &Datum) -> Result<Vec<OptionDef>, String> {
             .to_string();
         let kind_datum = parts.get(3).ok_or("option missing kind")?;
         let kind = parse_option_kind(kind_datum)?;
-        let default =
-            parts.get(4).and_then(|d| d.as_str()).ok_or("option missing default")?.to_string();
+        let default_datum = parts.get(4).ok_or("option missing default")?;
+        let default = option_value_from_datum(default_datum, &kind)
+            .ok_or_else(|| format!("option {key}: default does not fit its kind"))?;
         let label =
             parts.get(5).and_then(|d| d.as_str()).ok_or("option missing label")?.to_string();
         // Parsed defs are unowned; the kernel tags an extension's defs with its id.
@@ -125,12 +126,48 @@ pub fn parse_option_config(datum: &Datum) -> Result<Vec<OptionDef>, String> {
     Ok(out)
 }
 
+/// Read an option value literal of `kind`: `#t`, `42`, `"text"`, `("a" "b")`,
+/// a record `((field value) …)`, a map `(("key" value) …)`. For a scalar or
+/// list kind a string in the flat form (`"#t"`, `"4"`, `"a,b"`) is accepted
+/// too, so older manifests keep loading. `None` when it does not fit `kind`.
+pub fn option_value_from_datum(datum: &Datum, kind: &OptionKind) -> Option<OptionValue> {
+    let value = match (kind, datum) {
+        (OptionKind::Text | OptionKind::Choice(_), Datum::Str(s)) => OptionValue::Text(s.clone()),
+        (_, Datum::Str(s)) => return OptionValue::parse_flat(kind, s),
+        (OptionKind::Bool, Datum::Bool(b)) => OptionValue::Bool(*b),
+        (OptionKind::Int { .. }, Datum::Int(n)) => OptionValue::Int(*n),
+        (OptionKind::List(item), Datum::List(items)) => OptionValue::List(
+            items.iter().map(|d| option_value_from_datum(d, item)).collect::<Option<Vec<_>>>()?,
+        ),
+        (OptionKind::Record(fields), Datum::List(pairs)) => {
+            let mut m = std::collections::BTreeMap::new();
+            for pair in pairs {
+                let p = pair.as_list()?;
+                let name = p.first()?.text()?;
+                let (_, field_kind) = fields.iter().find(|(f, _)| f == name)?;
+                m.insert(name.to_string(), option_value_from_datum(p.get(1)?, field_kind)?);
+            }
+            OptionValue::Map(m)
+        }
+        (OptionKind::Map(item), Datum::List(pairs)) => {
+            let mut m = std::collections::BTreeMap::new();
+            for pair in pairs {
+                let p = pair.as_list()?;
+                m.insert(p.first()?.text()?.to_string(), option_value_from_datum(p.get(1)?, item)?);
+            }
+            OptionValue::Map(m)
+        }
+        _ => return None,
+    };
+    kind.accepts(&value).then_some(value)
+}
+
 fn parse_option_kind(datum: &Datum) -> Result<OptionKind, String> {
     match datum {
         Datum::Sym(s) => match s.as_str() {
             "bool" => Ok(OptionKind::Bool),
             "text" => Ok(OptionKind::Text),
-            "list" => Ok(OptionKind::List),
+            "list" => Ok(OptionKind::text_list()),
             other => Err(format!("unknown option kind symbol: {other}")),
         },
         Datum::List(items) => {
@@ -149,6 +186,27 @@ fn parse_option_kind(datum: &Datum) -> Result<OptionKind, String> {
                         _ => return Err("int kind missing or non-integer max".into()),
                     };
                     Ok(OptionKind::Int { min, max })
+                }
+                "list" => {
+                    let item = items.get(1).ok_or("list kind missing its item kind")?;
+                    Ok(OptionKind::List(Box::new(parse_option_kind(item)?)))
+                }
+                "map" => {
+                    let item = items.get(1).ok_or("map kind missing its value kind")?;
+                    Ok(OptionKind::Map(Box::new(parse_option_kind(item)?)))
+                }
+                "record" => {
+                    let mut fields = Vec::new();
+                    for f in &items[1..] {
+                        let f = f.as_list().ok_or("record field is not a list")?;
+                        let name = f.first().and_then(|d| d.text()).ok_or("record field missing name")?;
+                        let kind = parse_option_kind(f.get(1).ok_or("record field missing kind")?)?;
+                        fields.push((name.to_string(), kind));
+                    }
+                    if fields.is_empty() {
+                        return Err("record kind has no fields".into());
+                    }
+                    Ok(OptionKind::Record(fields))
                 }
                 "choice" => {
                     let choices: Vec<String> =
@@ -186,164 +244,31 @@ pub fn parse_keymap_config(datum: &Datum, layer: Layer) -> Result<Vec<Binding>, 
                 .get(1)
                 .and_then(codec::intent_from_datum)
                 .ok_or_else(|| format!("binding for '{key_name}' has an unknown intent"))?;
-            let when = match bp.get(2) {
-                Some(d) => codec::cond_from_datum(d),
-                None => Cond::Always,
-            };
-            out.push(Binding { mode: mode.clone(), panel: panel.clone(), key, intent, when, layer });
+            // Everything after the intent is `when` and/or the help label, in
+            // either order: a `when` is always a symbol or a list, a label is
+            // always a string, so they are told apart by type rather than by
+            // position. Every binding written before labels existed therefore
+            // still parses unchanged.
+            let rest = bp.get(2..).unwrap_or_default();
+            let help = rest.iter().find_map(|d| d.as_str()).map(str::to_string);
+            let when = rest
+                .iter()
+                .find(|d| d.as_str().is_none())
+                .map(codec::cond_from_datum)
+                .unwrap_or(Cond::Always);
+            out.push(Binding {
+                mode: mode.clone(),
+                panel: panel.clone(),
+                key,
+                intent,
+                when,
+                layer,
+                help,
+                owner: None,
+            });
         }
     }
     Ok(out)
-}
-
-// ── Theme config parsers ───────────────────────────────────────────────────────
-
-/// Parse a `(quote ((theme "name" (role fg bg bold italic underline) …) …))`
-/// datum (as produced by `theme_presets.scm`) into a list of `NamedTheme` presets.
-///
-/// Unknown role tokens and malformed role forms are silently skipped.
-pub fn parse_theme_config(datum: &Datum) -> Vec<crate::extension::theme::NamedTheme> {
-    let forms = match datum.as_list() {
-        Some(l) => l,
-        None => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    for form in forms {
-        let parts = match form.as_list() {
-            Some(p) => p,
-            None => continue,
-        };
-        let head = parts.first().and_then(|d| d.as_sym());
-        if head != Some("theme") {
-            continue;
-        }
-        let name = match parts.get(1).and_then(|d| d.as_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let overrides = parse_role_style_overrides(&parts[2..]);
-        out.push(crate::extension::theme::NamedTheme { name, preset: true, overrides });
-    }
-    out
-}
-
-/// Parse a single `(define-theme "name" (role fg bg bold italic underline) …)`
-/// datum into a custom `NamedTheme`. Returns `None` if the form is malformed.
-pub fn parse_define_theme(datum: &Datum) -> Option<crate::extension::theme::NamedTheme> {
-    let parts = datum.as_list()?;
-    let head = parts.first().and_then(|d| d.as_sym());
-    if head != Some("define-theme") {
-        return None;
-    }
-    let name = parts.get(1).and_then(|d| d.as_str())?.to_string();
-    let overrides = parse_role_style_overrides(&parts[2..]);
-    Some(crate::extension::theme::NamedTheme { name, preset: false, overrides })
-}
-
-/// Parse the active theme selection from a `(set-theme "name")` datum.
-/// Returns the name string if valid, else `None`.
-pub fn parse_set_theme(datum: &Datum) -> Option<String> {
-    let parts = datum.as_list()?;
-    if parts.first().and_then(|d| d.as_sym()) != Some("set-theme") {
-        return None;
-    }
-    parts.get(1).and_then(|d| d.as_str()).map(String::from)
-}
-
-/// A color slot in a role-style form: the bare symbol `nil` means "no color"
-/// (`Color::Reset`), anything else is read the same way any other themed
-/// color is (`#rrggbb`, an ANSI name, or `default`/`reset`).
-fn parse_theme_color(d: &Datum) -> Option<ratatui::style::Color> {
-    let text = d.text()?;
-    if text == "nil" { Some(ratatui::style::Color::Reset) } else { crate::core::parse_color(text) }
-}
-
-/// Parse each `(role fg bg bold italic underline)` form into a role's full
-/// `RoleStyle` — one override is the whole tuple, never a partial attribute,
-/// so there is exactly one shape to parse (no merged/standalone distinction
-/// like the old per-attribute override lists needed). A form that doesn't
-/// supply all six positions, or whose role/color/boolean fails to parse, is
-/// silently skipped: this runs after the TUI has taken the alternate screen,
-/// so an eprintln would corrupt the display. (disable, continue.)
-fn parse_role_style_overrides(pairs: &[Datum]) -> Vec<(crate::core::Role, crate::extension::theme::RoleStyle)> {
-    let mut out = Vec::new();
-    for pair in pairs {
-        let Some(pl) = pair.as_list() else { continue };
-        let Some(role) = pl.first().and_then(|d| d.as_sym()).and_then(crate::core::Role::from_token) else { continue };
-        let Some(fg) = pl.get(1).and_then(parse_theme_color) else { continue };
-        let Some(bg) = pl.get(2).and_then(parse_theme_color) else { continue };
-        let Some(bold) = pl.get(3).and_then(|d| d.as_bool()) else { continue };
-        let Some(italic) = pl.get(4).and_then(|d| d.as_bool()) else { continue };
-        let Some(underline) = pl.get(5).and_then(|d| d.as_bool()) else { continue };
-        out.push((role, crate::extension::theme::RoleStyle { fg, bg, bold, italic, underline }));
-    }
-    out
-}
-
-// ── LsColors palette config parsers ─────────────────────────────────────────────
-
-/// Parse a `(quote ((palette "name" (raw "...")) …))` datum (as produced by
-/// `lscolors/presets.scm`) into a list of `NamedPalette` presets.
-///
-/// Malformed forms and missing `raw` fields are silently skipped.
-pub fn parse_lscolors_presets_config(datum: &Datum) -> Vec<crate::extension::lscolors::NamedPalette> {
-    let forms = match datum.as_list() {
-        Some(l) => l,
-        None => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    for form in forms {
-        let parts = match form.as_list() {
-            Some(p) => p,
-            None => continue,
-        };
-        if parts.first().and_then(|d| d.as_sym()) != Some("palette") {
-            continue;
-        }
-        let name = match parts.get(1).and_then(|d| d.as_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let raw = match parse_raw_field(&parts[2..]) {
-            Some(s) => s,
-            None => continue,
-        };
-        out.push(crate::extension::lscolors::NamedPalette { name, preset: true, raw });
-    }
-    out
-}
-
-/// Parse a single `(define-lscolors-palette "name" (raw "..."))` datum into a
-/// custom `NamedPalette`. Returns `None` if the form is malformed.
-pub fn parse_define_lscolors_palette(datum: &Datum) -> Option<crate::extension::lscolors::NamedPalette> {
-    let parts = datum.as_list()?;
-    if parts.first().and_then(|d| d.as_sym()) != Some("define-lscolors-palette") {
-        return None;
-    }
-    let name = parts.get(1).and_then(|d| d.as_str())?.to_string();
-    let raw = parse_raw_field(&parts[2..])?;
-    Some(crate::extension::lscolors::NamedPalette { name, preset: false, raw })
-}
-
-/// Parse the active palette selection from a `(set-lscolors-palette "name")` datum.
-/// Returns the name string if valid, else `None`.
-pub fn parse_set_lscolors_palette(datum: &Datum) -> Option<String> {
-    let parts = datum.as_list()?;
-    if parts.first().and_then(|d| d.as_sym()) != Some("set-lscolors-palette") {
-        return None;
-    }
-    parts.get(1).and_then(|d| d.as_str()).map(String::from)
-}
-
-/// Find and read the `(raw "...")` field among a palette form's trailing parts.
-fn parse_raw_field(fields: &[Datum]) -> Option<String> {
-    for f in fields {
-        let Some(fl) = f.as_list() else { continue };
-        if fl.first().and_then(|d| d.as_sym()) == Some("raw") {
-            return fl.get(1).and_then(|d| d.as_str()).map(String::from);
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -367,7 +292,7 @@ mod tests {
         assert_eq!(defs[0].category, "Cat");
         assert_eq!(defs[0].label, "x-label");
         assert_eq!(defs[0].kind, OptionKind::Bool);
-        assert_eq!(defs[0].default, "#f");
+        assert_eq!(defs[0].default, OptionValue::Bool(false));
     }
 
     #[test]
@@ -375,7 +300,7 @@ mod tests {
         let d = eval_quote(r#"(quote ((option "n" "C" (int 1 99) "5" "n-label")))"#);
         let defs = parse_option_config(&d).unwrap();
         assert_eq!(defs[0].kind, OptionKind::Int { min: 1, max: 99 });
-        assert_eq!(defs[0].default, "5");
+        assert_eq!(defs[0].default, OptionValue::Int(5));
     }
 
     #[test]
@@ -398,8 +323,37 @@ mod tests {
               (option "t" "C" text "" "t-label")))"#,
         );
         let defs = parse_option_config(&d).unwrap();
-        assert_eq!(defs[0].kind, OptionKind::List);
+        assert_eq!(defs[0].kind, OptionKind::text_list());
         assert_eq!(defs[1].kind, OptionKind::Text);
+    }
+
+    #[test]
+    fn typed_defaults_and_structured_kinds_parse() {
+        let d = eval_quote(
+            r##"(quote (
+              (option "b" "C" bool #t "b")
+              (option "n" "C" (int 0 9) 3 "n")
+              (option "l" "C" list ("rs" "md") "l")
+              (option "s" "C" (record (fg text) (bold bool)) ((fg "#fff") (bold #f)) "s")
+              (option "m" "C" (map (list text)) (("dark" ("a")) ("light" ())) "m")))"##,
+        );
+        let defs = parse_option_config(&d).unwrap();
+        assert_eq!(defs[0].default, OptionValue::Bool(true));
+        assert_eq!(defs[1].default, OptionValue::Int(3));
+        assert_eq!(defs[2].default.flat(), "rs,md");
+        assert!(matches!(&defs[3].kind, OptionKind::Record(f) if f.len() == 2));
+        assert!(defs[3].kind.accepts(&defs[3].default));
+        assert!(matches!(&defs[4].default, OptionValue::Map(m) if m.len() == 2));
+    }
+
+    #[test]
+    fn legacy_string_defaults_still_load_and_bad_defaults_are_rejected() {
+        let d = eval_quote(r##"(quote ((option "b" "C" bool "#t" "b") (option "l" "C" list "a,b" "l")))"##);
+        let defs = parse_option_config(&d).unwrap();
+        assert_eq!(defs[0].default, OptionValue::Bool(true));
+        assert_eq!(defs[1].default.flat(), "a,b");
+        let bad = eval_quote(r#"(quote ((option "n" "C" (int 0 9) 42 "n")))"#);
+        assert!(parse_option_config(&bad).is_err(), "an out-of-range default is an error");
     }
 
     #[test]
@@ -433,115 +387,4 @@ mod tests {
         assert!(parse_option_config(&d).is_err());
     }
 
-    #[test]
-    fn parse_theme_config_reads_name_and_overrides() {
-        use crate::core::Role;
-        let d = eval_quote(r##"(quote ((theme "x" (border "#102030" nil #f #f #f))))"##);
-        let themes = parse_theme_config(&d);
-        assert_eq!(themes.len(), 1);
-        assert_eq!(themes[0].name, "x");
-        assert!(themes[0].preset);
-        assert_eq!(themes[0].overrides.len(), 1);
-        let (role, style) = themes[0].overrides[0];
-        assert_eq!(role, Role::Border);
-        assert_eq!(style.fg, ratatui::style::Color::Rgb(0x10, 0x20, 0x30));
-        assert_eq!(style.bg, ratatui::style::Color::Reset);
-        assert!(!style.bold && !style.italic && !style.underline);
-    }
-
-    #[test]
-    fn parse_define_theme_reads_a_custom() {
-        use crate::core::Role;
-        let d = crate::script::sexpr::parse(r#"(define-theme "y" (cursor-bg "blue" nil #f #f #f))"#)
-            .expect("parse failed");
-        let nt = parse_define_theme(&d).expect("should parse");
-        assert_eq!(nt.name, "y");
-        assert!(!nt.preset);
-        assert_eq!(nt.overrides[0].0, Role::CursorBg);
-        assert_eq!(nt.overrides[0].1.fg, ratatui::style::Color::Blue);
-    }
-
-    #[test]
-    fn parse_theme_skips_unknown_role() {
-        let d = eval_quote(
-            r##"(quote ((theme "t" (nonexistent-role "#ff0000" nil #f #f #f) (border "red" nil #f #f #f))))"##,
-        );
-        let themes = parse_theme_config(&d);
-        assert_eq!(themes[0].overrides.len(), 1, "unknown role is dropped, known one kept");
-        assert_eq!(themes[0].overrides[0].0, crate::core::Role::Border);
-    }
-
-    #[test]
-    fn parse_define_theme_reads_fg_bg_and_every_modifier() {
-        use crate::core::Role;
-        let d = crate::script::sexpr::parse(
-            r##"(define-theme "y" (entry-dir "#83a598" "#000000" #t #f #t))"##,
-        )
-        .expect("parse failed");
-        let nt = parse_define_theme(&d).expect("should parse");
-        let (role, style) = nt.overrides[0];
-        assert_eq!(role, Role::EntryDir);
-        assert_eq!(style.fg, ratatui::style::Color::Rgb(0x83, 0xa5, 0x98));
-        assert_eq!(style.bg, ratatui::style::Color::Rgb(0, 0, 0));
-        assert!(style.bold);
-        assert!(!style.italic);
-        assert!(style.underline);
-    }
-
-    #[test]
-    fn parse_define_theme_reads_nil_as_no_color_for_fg_or_bg() {
-        use crate::core::Role;
-        let d = crate::script::sexpr::parse(r#"(define-theme "y" (title nil nil #f #t #f))"#)
-            .expect("parse failed");
-        let nt = parse_define_theme(&d).expect("should parse");
-        let (role, style) = nt.overrides[0];
-        assert_eq!(role, Role::Title);
-        assert_eq!(style.fg, ratatui::style::Color::Reset);
-        assert_eq!(style.bg, ratatui::style::Color::Reset);
-        assert!(style.italic);
-    }
-
-    #[test]
-    fn parse_define_theme_skips_a_form_with_a_missing_position() {
-        // Every override is the full 6-token form; a role form that stops
-        // short (e.g. no underline) has nothing valid to fall back to.
-        let d = crate::script::sexpr::parse(r##"(define-theme "y" (border "#102030" nil #f #f))"##)
-            .expect("parse failed");
-        let nt = parse_define_theme(&d).expect("should parse");
-        assert!(nt.overrides.is_empty(), "an incomplete role form is dropped, not partially applied");
-    }
-
-    #[test]
-    fn parse_lscolors_presets_config_reads_name_and_raw() {
-        let d = eval_quote(r##"(quote ((palette "x" (raw "di=01;34"))))"##);
-        let palettes = parse_lscolors_presets_config(&d);
-        assert_eq!(palettes.len(), 1);
-        assert_eq!(palettes[0].name, "x");
-        assert!(palettes[0].preset);
-        assert_eq!(palettes[0].raw, "di=01;34");
-    }
-
-    #[test]
-    fn parse_lscolors_presets_config_skips_malformed_forms() {
-        let d = eval_quote(r##"(quote ((palette "no-raw") (palette "y" (raw "ln=01;36"))))"##);
-        let palettes = parse_lscolors_presets_config(&d);
-        assert_eq!(palettes.len(), 1, "the malformed 'no-raw' entry is dropped");
-        assert_eq!(palettes[0].name, "y");
-    }
-
-    #[test]
-    fn parse_define_lscolors_palette_reads_a_custom() {
-        let d = crate::script::sexpr::parse(r#"(define-lscolors-palette "z" (raw "ex=01;32"))"#)
-            .expect("parse failed");
-        let np = parse_define_lscolors_palette(&d).expect("should parse");
-        assert_eq!(np.name, "z");
-        assert!(!np.preset);
-        assert_eq!(np.raw, "ex=01;32");
-    }
-
-    #[test]
-    fn parse_set_lscolors_palette_reads_the_name() {
-        let d = crate::script::sexpr::parse(r#"(set-lscolors-palette "dark")"#).expect("parse failed");
-        assert_eq!(parse_set_lscolors_palette(&d), Some("dark".to_string()));
-    }
 }

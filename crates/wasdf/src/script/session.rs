@@ -13,9 +13,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use steel::steel_vm::engine::Engine;
+use steel::steel_vm::register_fn::RegisterFn;
 use steel::SteelVal;
 
-use crate::core::ExtensionValue;
 
 // Generous: covers Engine::new() stdlib load under heavy parallel load.
 // Steady-state evals return in microseconds.
@@ -65,16 +65,66 @@ impl SchemeSession {
             .unwrap_or_else(|_| Err("scheme: evaluation timed out".into()))
     }
 
-    /// Evaluate to a structural value for the SchemeValue payload.
-    pub fn eval_value(&self, expr: &str) -> Result<ExtensionValue, String> {
-        self.eval(expr).map(|s| parse_value(&s))
+}
+
+/// The Scheme side of the settings store (doc/SCHEME.md, The Settings Store).
+const STORE_SCHEME: &str = include_str!("store.scm");
+
+/// The environment procedures `config.scm` and the REPL may call. They read the
+/// real environment at call time.
+fn register_environment(engine: &mut Engine) {
+    engine.register_fn("os", || -> String { os_name().to_string() });
+    engine.register_fn("wsl?", is_wsl);
+    engine.register_fn("hostname", hostname);
+    engine.register_fn("getenv", |name: String| -> Option<String> { std::env::var(name).ok() });
+    engine.register_fn("executable?", |cmd: String| -> bool { crate::services::resolver::is_runnable(&cmd) });
+    // The store's check for `layout!` (store.scm): "" when valid.
+    engine.register_fn("layout-problem", |id: String, printed: String| -> String {
+        crate::script::layout::problem(&id, &printed)
+    });
+}
+
+fn os_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(windows) {
+        "windows"
+    } else {
+        "linux"
     }
+}
+
+/// Linux under WSL: the kernel release names Microsoft.
+fn is_wsl() -> bool {
+    cfg!(target_os = "linux")
+        && (std::env::var_os("WSL_DISTRO_NAME").is_some()
+            || std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .map(|r| r.to_lowercase().contains("microsoft"))
+                .unwrap_or(false))
+}
+
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer is valid for its length; gethostname NUL-terminates
+    // on success when the name fits.
+    let ok = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } == 0;
+    if !ok {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
 /// Engine thread. Owns the `Engine` (which is `!Send`) for its lifetime,
 /// signals readiness after stdlib load, then processes requests FIFO.
 fn engine_loop(req: Receiver<(String, Reply)>, ready: Arc<(Mutex<bool>, Condvar)>) {
     let mut engine = Engine::new();
+    register_environment(&mut engine);
+    // The settings store: loaded before readiness is signalled, so every
+    // evaluation — `config.scm`, `custom.scm`, the REPL — sees it.
+    if let Err(e) = engine.run(STORE_SCHEME) {
+        crate::services::messages::log(format!("scheme: the settings store failed to load: {e}"), true);
+    }
     {
         let (lock, cvar) = &*ready;
         *lock.lock().unwrap() = true;
@@ -146,44 +196,6 @@ fn steelval_to_write_string(val: &SteelVal) -> String {
     }
 }
 
-/// Parse a printed Scheme datum into an ExtensionValue (scalars; complex forms
-/// are kept as their string rendering).
-pub fn parse_value(s: &str) -> ExtensionValue {
-    let s = s.trim();
-    match s {
-        "" => ExtensionValue::Nil,
-        "#t" | "#true" => ExtensionValue::Bool(true),
-        "#f" | "#false" => ExtensionValue::Bool(false),
-        _ if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') => {
-            ExtensionValue::String(unescape(&s[1..s.len() - 1]))
-        }
-        _ => match s.parse::<i64>() {
-            Ok(i) => ExtensionValue::Int(i),
-            Err(_) => ExtensionValue::String(s.to_string()),
-        },
-    }
-}
-
-fn unescape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('\\') => out.push('\\'),
-                Some('"') => out.push('"'),
-                Some(other) => out.push(other),
-                None => {}
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,14 +224,6 @@ mod tests {
     }
 
     #[test]
-    fn eval_value_parses_scalars() {
-        let session = SchemeSession::spawn();
-        ready(&session);
-        assert_eq!(session.eval_value("(= 1 1)").unwrap(), ExtensionValue::Bool(true));
-        assert_eq!(session.eval_value("(+ 20 22)").unwrap(), ExtensionValue::Int(42));
-    }
-
-    #[test]
     fn quote_list_round_trips_through_sexpr() {
         let session = SchemeSession::spawn();
         ready(&session);
@@ -228,3 +232,4 @@ mod tests {
         assert_eq!(result, "(a \"b\" 1 #t (c))");
     }
 }
+

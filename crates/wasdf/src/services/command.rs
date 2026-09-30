@@ -62,22 +62,3 @@ impl crate::core::CommandLookup for CommandRegistry {
     }
 }
 
-/// The embedded default command set (the Scheme `defcommand` analogue).
-pub fn defaults() -> Vec<CommandDef> {
-    let cmd = |name: &str, desc: &str, intent: Intent| CommandDef {
-        name: name.into(),
-        description: desc.into(),
-        intent,
-    };
-    vec![
-        cmd("refresh", "reload the directory", Intent::Refresh),
-        cmd("toggle-dotfiles", "show/hide hidden files", Intent::ToggleDotFiles),
-        cmd("select-all", "select all entries", Intent::SelectAll),
-        cmd("clear-selection", "clear the selection", Intent::ClearSelection),
-        // copy / move / rename / mkdir / touch are contributed by the cmdop
-        // extension's commands() (mkdir/touch share its combined M builder).
-        cmd("delete", "delete selection/cursor", Intent::DeleteSelected),
-        cmd("edit", "edit in $EDITOR", Intent::StartEdit),
-        cmd("quit", "quit wasdf", Intent::Quit),
-    ]
-}

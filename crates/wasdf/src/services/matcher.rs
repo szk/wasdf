@@ -47,6 +47,24 @@ impl Default for MatcherConfig {
     }
 }
 
+impl MatcherConfig {
+    /// The weights and cap as the options currently hold them (`matcher.*`).
+    /// Built at each Search spawn, so a settings edit takes effect on the next
+    /// search with no projection of its own.
+    pub fn from_options(o: &crate::core::OptionStore) -> Self {
+        MatcherConfig {
+            tail_bonus: o.get_i64("matcher.tail-bonus"),
+            depth_penalty: o.get_i64("matcher.depth-penalty"),
+            length_penalty: o.get_i64("matcher.length-penalty"),
+            exec_bonus: o.get_i64("matcher.exec-bonus"),
+            preferred_ext: o.get_list("matcher.preferred-ext"),
+            noise_ext: o.get_list("matcher.noise-ext"),
+            noise_dirs: o.get_list("matcher.noise-dirs"),
+            max_results: o.get_u32("matcher.max-results") as usize,
+        }
+    }
+}
+
 /// Coarse file kind used by the affinity layer. Computed once from symlink
 /// metadata (no follow) so the caller avoids double-statting.
 #[derive(Clone, Copy, PartialEq, Debug)]

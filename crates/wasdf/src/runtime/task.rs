@@ -12,9 +12,10 @@ use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 
 use crate::core::{
-    AppEvent, AsyncResult, AsyncStatus, Entry, ExecOutput, Payload, Plan, Purpose, ReadResult,
+    AppEvent, AsyncResult, AsyncStatus, Entry, ExecOutput, Payload, Plan, Purpose, Content,
 };
-use crate::script::SchemeSession;
+use crate::core::OptionStore;
+use crate::script::store::{Layer, Store};
 use crate::services::{MatcherBackend, MatcherConfig, RankedEntry, ResolverChain, rank_paths};
 use crate::vfs::Vfs;
 
@@ -25,11 +26,11 @@ pub struct TaskManager {
     tx: Sender<AppEvent>,
     resolver: Arc<ResolverChain>,
     matcher: Arc<dyn MatcherBackend>,
-    scheme: Option<Arc<SchemeSession>>,
+    settings: Option<Arc<Store>>,
     vfs: Arc<Vfs>,
-    /// Shared with `Options.matcher` in the kernel; the settings extension
-    /// updates it via `Options::set`, and the Search worker snapshots it.
-    matcher_cfg: Arc<Mutex<MatcherConfig>>,
+    /// The options projection; a Search builds its `MatcherConfig` from it at
+    /// spawn, so the weights a search uses are the ones set when it started.
+    options: Arc<OptionStore>,
     next_id: AtomicU64,
     cancels: Mutex<HashMap<Purpose, Arc<AtomicBool>>>,
     /// Cancel flag of the most recent Execute, so KillProcess can stop it.
@@ -41,17 +42,17 @@ impl TaskManager {
         tx: Sender<AppEvent>,
         resolver: Arc<ResolverChain>,
         matcher: Arc<dyn MatcherBackend>,
-        scheme: Option<Arc<SchemeSession>>,
+        settings: Option<Arc<Store>>,
         vfs: Arc<Vfs>,
-        matcher_cfg: Arc<Mutex<MatcherConfig>>,
+        options: Arc<OptionStore>,
     ) -> Self {
         TaskManager {
             tx,
             resolver,
             matcher,
-            scheme,
+            settings,
             vfs,
-            matcher_cfg,
+            options,
             next_id: AtomicU64::new(1),
             cancels: Mutex::new(HashMap::new()),
             execute_cancel: Mutex::new(None),
@@ -81,12 +82,12 @@ impl TaskManager {
         let tx = self.tx.clone();
         let resolver = self.resolver.clone();
         let matcher = self.matcher.clone();
-        let scheme = self.scheme.clone();
+        let settings = self.settings.clone();
         let vfs = self.vfs.clone();
-        let matcher_cfg = self.matcher_cfg.clone();
+        let matcher_cfg = matches!(plan, Plan::Search { .. }).then(|| MatcherConfig::from_options(&self.options));
 
         std::thread::spawn(move || {
-            let (status, payload) = run_plan(&plan, &resolver, matcher.as_ref(), scheme.as_deref(), &vfs, &cwd, &matcher_cfg);
+            let (status, payload) = run_plan(&plan, &resolver, matcher.as_ref(), settings.as_deref(), &vfs, &cwd, matcher_cfg.as_ref());
             let status = if cancel.load(Ordering::Relaxed) {
                 AsyncStatus::Cancelled
             } else {
@@ -133,10 +134,10 @@ fn run_plan(
     plan: &Plan,
     resolver: &ResolverChain,
     matcher: &dyn MatcherBackend,
-    scheme: Option<&SchemeSession>,
+    settings: Option<&Store>,
     vfs: &Vfs,
     cwd: &std::path::Path,
-    matcher_cfg: &Arc<Mutex<MatcherConfig>>,
+    matcher_cfg: Option<&MatcherConfig>,
 ) -> (AsyncStatus, Payload) {
     match plan {
         Plan::ReadDir { path, show_hidden } => {
@@ -146,10 +147,10 @@ fn run_plan(
             }
         }
         Plan::Search { root, query, show_hidden, owner } => {
-            // Snapshot config before the walk so weight edits don't race mid-search.
-            let cfg = matcher_cfg.lock().unwrap().clone();
+            let default_cfg = MatcherConfig::default();
+            let cfg = matcher_cfg.unwrap_or(&default_cfg);
             let walked = crate::fs::walk(root, *show_hidden, cfg.max_results);
-            let ranked: Vec<RankedEntry> = rank_paths(matcher, root, walked, query, &cfg);
+            let ranked: Vec<RankedEntry> = rank_paths(matcher, root, walked, query, cfg);
             let entries: Vec<Entry> = ranked
                 .into_iter()
                 .map(|re| {
@@ -171,7 +172,7 @@ fn run_plan(
                 None => (AsyncStatus::Ok, Payload::Entries { path: root.clone(), entries }),
                 Some(owner) => (
                     AsyncStatus::Ok,
-                    Payload::Read { owner: owner.clone(), path: root.clone(), result: ReadResult::Dir { entries } },
+                    Payload::Read { owner: owner.clone(), path: root.clone(), result: Content::Dir { entries } },
                 ),
             }
         }
@@ -188,12 +189,20 @@ fn run_plan(
             (AsyncStatus::Ok, Payload::Exec(out))
         }
         Plan::Suspend { .. } => (AsyncStatus::Cancelled, Payload::None),
-        Plan::EvalScheme { expr } => match scheme {
-            Some(session) => match session.eval_value(expr) {
-                Ok(value) => (AsyncStatus::Ok, Payload::Scheme(value)),
-                Err(e) => (AsyncStatus::Failed(e), Payload::None),
-            },
-            None => (AsyncStatus::Ok, Payload::Scheme(crate::core::ExtensionValue::Nil)),
+        Plan::EvalScheme { expr, owner } => match settings {
+            Some(store) => {
+                let (value, changes) = store.eval_printed(Layer::Session, expr);
+                // A failed evaluation can still have changed entries before it
+                // failed; the kernel applies the change set either way. An
+                // owner's evaluation completed even when its value is an error:
+                // the owner shows it, so core does not notify it a second time.
+                let status = match &value {
+                    Err(e) if owner.is_none() => AsyncStatus::Failed(e.clone()),
+                    _ => AsyncStatus::Ok,
+                };
+                (status, Payload::Scheme { owner: owner.clone(), value, changes })
+            }
+            None => (AsyncStatus::Failed("the settings store is unavailable".into()), Payload::None),
         },
     }
 }
@@ -277,21 +286,21 @@ fn read_content(owner: &str, path: &std::path::Path, offset: u64, vfs: &Vfs) -> 
         if path.is_relative() && path.components().count() > 1 {
             // Virtual directory: list via VFS.
             match vfs.list(path, true) {
-                Ok(entries) => ReadResult::Dir { entries },
+                Ok(entries) => Content::Dir { entries },
                 Err(e) => return (AsyncStatus::Failed(format!("{e}")), Payload::None),
             }
         } else {
             // Virtual leaf: empty-EOF so preview is a no-op.
-            ReadResult::Bytes { offset, bytes: Vec::new(), eof: true }
+            Content::Bytes { offset, bytes: Vec::new(), eof: true }
         }
     } else if path.is_dir() {
         match crate::fs::read_directory(path, true) {
-            Ok(entries) => ReadResult::Dir { entries },
+            Ok(entries) => Content::Dir { entries },
             Err(e) => return (AsyncStatus::Failed(format!("{e}")), Payload::None),
         }
     } else {
         match wasdf_sdk::read_chunk_at(path, offset, READ_LIMIT) {
-            Ok((bytes, eof)) => ReadResult::Bytes { offset, bytes, eof },
+            Ok((bytes, eof)) => Content::Bytes { offset, bytes, eof },
             Err(e) => {
                 return (AsyncStatus::Failed(format!("read {}: {e}", path.display())), Payload::None)
             }
@@ -322,8 +331,7 @@ mod tests {
         let resolver = ResolverChain::new();
         let matcher = SkimMatcher::default();
         let vfs = Vfs::default();
-        let matcher_cfg = Arc::new(Mutex::new(cfg));
-        run_plan(plan, &resolver, &matcher, None, &vfs, cwd, &matcher_cfg)
+        run_plan(plan, &resolver, &matcher, None, &vfs, cwd, Some(&cfg))
     }
 
     #[test]
@@ -358,7 +366,7 @@ mod tests {
         let (status, payload) = run(&plan, &dir);
         assert_eq!(status, AsyncStatus::Ok);
         match payload {
-            Payload::Read { owner, path, result: ReadResult::Dir { entries } } => {
+            Payload::Read { owner, path, result: Content::Dir { entries } } => {
                 assert_eq!(owner, "cmdop");
                 assert_eq!(path, dir);
                 assert!(entries.iter().any(|e| e.name == "needle.txt"));

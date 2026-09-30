@@ -13,15 +13,28 @@ doc/SCHEME.md (the scm roles), and the Top-Level Invariants in CLAUDE.md.
 
 Prime directive — the Zero-Edit Principle
 -----------------------------------------
-Adding an extension edits nothing in core/, app/, script/, or exec/.
+Adding an extension edits nothing in core/, app/ (including its .scm
+sources), script/, services/, ui/, exec/, or vfs.rs.
 Acceptance test: grep the tree for your extension's id — outside your own
 directory it may appear ONLY in the bundled-extension list
-(`extension::bundled()` in crates/wasdf/src/extension.rs). If you find
-yourself editing app/kernel.rs, core/intent.rs, or the reducer to make your
-feature work, stop: you are on the wrong path. (Precedent: lscolors was once
-wired through kernel.rs and was refactored back out — only `theme` earns a
-kernel special case, because App itself must hold its registry Arc for the
-per-frame `resolve_active()` read.)
+(`extension::bundled()` in crates/wasdf/src/extension.rs), and in OTHER
+extensions' directories only as an option key `"<id>.…"` or an intent form
+`(ext "<id>" …)`. If you find
+yourself editing app/kernel.rs, core/intent.rs, script/, or the reducer to
+make your feature work, stop: you are on the wrong path. There are no
+exceptions — every bundled extension (theme and settings included) is built in
+`bundled()` and registered through the same path; anything it needs from the
+kernel arrives through `Extension::bind(&Host)`.
+
+Using another extension: only through (1) its option keys, read from the
+OptionStore, and (2) its intent names, emitted as `(ext "<id>" "<intent>")`.
+Never its Rust types, functions, VFS paths, or config forms. Check the option
+first and fall back when it is undeclared (the other extension is absent)
+(doc/EXTENSION.md, Coupling between extensions). To plug into a core
+feature, implement the contract core defines and let the user name you in
+the core option (pty implements CmdOp's runner contract; the user sets
+`cmdop.runner` to "pty"). Palette commands and keys
+for your feature live in YOUR commands()/keymap, never in app/*.scm.
 
 
 1. Two kinds, one trait
@@ -59,14 +72,18 @@ b) Extension intents are data. `(ext "<id>" "<intent>" [data])` in scm
    Map) consumed structurally — no downcasting. Two reserved data keys:
      "item"     — filled by Mode::InputForm's confirm with the typed text
      "resolver" — marks the intent as a plan; the kernel executes it through
-                  the resolver chain (with Policy confirmation when
-                  destructive); it is NOT dispatched to you.
+                  the resolver chain (with Policy confirmation when the
+                  entry's confirm policy requires it); it is NOT
+                  dispatched to you.
 
 c) Declarations, not registrations. You declare commands, keymaps (Extension
    layer), resolver entries, and options; the kernel collects them once at
    boot. Options use the shared form
-     (option "<id>.<key>" "<Category>" <kind> "<default>" "<label>")
-   with kind ∈ bool | text | list | (int MIN MAX) | (choice "a" "b" …), and
+     (option "<id>.<key>" "<Category>" <kind> <default> "<label>")
+   with kind ∈ bool | text | list | (int MIN MAX) | (choice "a" "b" …) |
+   (record (field kind) …) | (map kind). Options are your WHOLE configurable
+   state (structured kinds for anything richer than a scalar — theme's user
+   themes are a map of records). They live in the settings store, and
    automatically appear editable + persisted under
    @/settings/Extensions/<id>, next to an auto-generated About card
    (`Extension::about()`) and a Priority leaf.
@@ -96,17 +113,21 @@ f) VFS. An extension may contribute a mount, conventionally `@/<id>`,
 | Trait impl        | direct Rust `impl Extension`         | C ABI fns bridged by DynamicExtension   |
 | Glue delivery     | `include_str!` .scm, returned from   | init.scm manifest, discovered & parsed  |
 |                   | scheme_source()/option_scheme()      | as data by loader::parse_glue           |
-| Panel content     | PULL: `view(ctx) -> PanelView`, plus | PUSH: reply `(show-function-content     |
-|                   | `accept_content` for kernel-read     | "<id>" (document …))` from a handler;   |
-|                   | bytes (LoadContent -> Plan::Read)    | no accept_content (deferred)            |
+| Panel content     | `view(ctx) -> Arc<PanelView>`, plus  | reply `(show-function-content "<id>"    |
+|                   | `accept_content` for results sent    | (document …))`; the loader's wrapper    |
+|                   | to you (Read / Search / Eval)        | serves it as your view(); no            |
+|                   |                                      | accept_content                          |
 | Images            | yes (PanelView::Image, raw RGB)      | no (pixels don't cross the ABI)         |
 | Interactive form  | `render_form(&mut Frame, …)` +       | not available (a Frame can't cross      |
-|   in the panel    | SetFunctionForm(Some(id)) (CmdOp,    | the ABI)                                |
+|   in the panel    | SetFunctionForm(Some(id)) (pty,      | the ABI)                                |
 |                   | theme's color editor)                |                                          |
 | `:when` predicates| may register NATIVE predicates via   | limited to core predicates (cannot      |
-|                   | register_conditions (read &AppState) | register natives across the ABI)        |
-| Options readback  | shared `Arc<OptionStore>` stashed in | `wasdf_sdk::Settings::from_scheme_alist`|
-|                   | bind_store (OnceLock)                | snapshot handed as the intent payload   |
+|                   | register_conditions (read AppState + | register natives across the ABI);       |
+|                   | options)                             | `(option "<id>.key")` works             |
+| Options readback  | `Host.options` (Arc<OptionStore>),   | `wasdf_sdk::Settings::from_scheme_alist`|
+|                   | kept from `bind`                     | on the `options` argument (every call)  |
+| Kernel handles    | `bind(&Host)`: options, events,      | none                                    |
+|                   | resolver, theme, config, extensions  |                                          |
 | Settings subtree  | may graft a SettingsNode (rich       | not available                           |
 |                   | screens under @/settings/…, e.g.     |                                          |
 |                   | lscolors' Themes)                    |                                          |
@@ -114,22 +135,23 @@ f) VFS. An extension may contribute a mount, conventionally `@/<id>`,
 | Versioning        | compiled together                    | `wasdf_abi_version()` must equal        |
 |                   |                                      | wasdf_sdk::API_VERSION exactly, else    |
 |                   |                                      | skipped with a warning                  |
-| Faults            | ordinary Rust                        | catch_unwind around every ABI call; a   |
-|                   |                                      | panic disables the call, not the app    |
+| Faults            | ordinary Rust                        | export entry points through the SDK     |
+|                   |                                      | wrapper; a panic returns null, which is |
+|                   |                                      | a no-op logged to @/messages            |
 | Id collision      | you control the list                 | later manifest is disabled with warning |
 
 Everything in section 2 (intents-as-data, options form, keymap shape,
 resolver entries, failure policy, VFS, the PanelView vocabulary) is shared
-verbatim — a user extension's manifest sections are parsed by the SAME
-script::config parsers the bundled .scm sources go through.
+verbatim — a user extension's manifest sections are decoded by the SAME core
+config decoders the bundled .scm sources go through.
 
 
 4. The scm / Rust split (applies to both kinds)
 -----------------------------------------------
 Scheme is the WHAT and WHEN. Rust is the HOW. Concretely:
 
-  scm declares (data, evaluated/parsed once at boot, never on the input or
-  render path):
+  scm declares (data, read once at boot, never on the input or render
+  path):
     - keymaps: which key, in which mode/panel scope, fires which intent,
       gated by which `:when` condition
     - palette commands, resolver entries, options (kind/default/label)
@@ -143,15 +165,17 @@ Scheme is the WHAT and WHEN. Rust is the HOW. Concretely:
     - state (interior mutability: RefCell/OnceLock — `handle_intent` takes
       &self), decode, matching, view construction, persistence
     - native `:when` predicates (bundled only), VfsProvider impls,
-      SettingsNode impls, parsing of your own preset scm via
-      script::config (add a parser there if you introduce a new form —
-      script/ is generic infrastructure, not core)
+      SettingsNode impls, and the decoder for your own forms (presets,
+      persisted state): read the text with script::sexpr, then interpret
+      the Datum in YOUR directory. script/ holds no extension-specific
+      decoder.
 
   The runtime relationship:
-    - Bundled: kernel evaluates your `scheme_source()` in the resident
-      steel session at registration; the resulting datum is decoded by
-      script::codec/config into NATIVE tables (bindings, commands,
-      OptionDefs). After boot, scm is out of the loop — a keypress hits
+    - Bundled: kernel reads your `scheme_source()` / `option_scheme()` with
+      the s-expression reader at registration (they are data; the steel
+      session is only for the user's config.scm and the REPL); the datum is
+      decoded by script::codec/config into NATIVE tables (bindings,
+      commands, OptionDefs). After boot, scm is out of the loop — a keypress hits
       compiled tables and dispatches straight to your Rust.
     - User: init.scm is never evaluated at all — it is READ AS DATA by the
       s-expression reader. The link from a declared `(ext id intent)` to
@@ -176,18 +200,28 @@ Scheme is the WHAT and WHEN. Rust is the HOW. Concretely:
      crates/wasdf/src/extension/<id>/options.scm   # if you have options
      …plus whatever else the feature needs (parse.rs, registry.rs, writer.rs)
 2. In extension.rs: `struct <Id>Extension { … }` with interior-mutable
-   state; `impl Extension` overriding only what you provide. Take
-   `config_dir: Option<PathBuf>` in `new()` if you persist anything
-   (convention: bookmarks, lscolors) — the file name inside it is yours.
+   state; `impl Extension` overriding only what you provide. Keep what you
+   need from the `Host` handed to `bind` (options, events, resolver, theme,
+   files). Take `config_dir: Option<PathBuf>` in `new()` only if you keep a
+   file of your own (bookmarks does) — the file name inside it is yours; write
+   it through `Host.files`, never directly from a hook.
 3. Embed scm with `include_str!("<id>/keymap.scm")` etc.; return from
    `scheme_source()` / `option_scheme()`.
 4. Register: add ONE line to `extension::bundled()` in
    crates/wasdf/src/extension.rs. This is the only edit outside your dir.
-   Do NOT touch app/kernel.rs unless App itself must own a shared handle
-   (the theme registry is the only current legitimate case).
-5. Persist user edits (if any) into the managed block of config.scm using
-   your own writer (copy the theme/writer.rs pattern: BLOCK_BEGIN/END,
-   atomic tmp+rename); reload them in `new()` by scanning the same block.
+   If you need something from the kernel that `Host` does not carry, the
+   answer is a generic Host field, never a special case for your id.
+5. Persisted state = options. Declare them (structured kinds if needed);
+   read them from `Host.options` (watch its generation); change them by
+   returning a `Configure` intent — the store validates, persists to
+   custom.scm, and updates every projection. Users set the same options
+   from config.scm (a program, possibly per environment) or the REPL. Never
+   write config.scm or custom.scm yourself (doc/SCHEME.md).
+5b. Optional prelude: Scheme code (`prelude()`; a manifest's
+   `(prelude "file.scm")`) loaded into the session to give users convenience
+   procedures built on the store procedures — theme's `(set-theme "x")` is
+   `(opt-set! 'theme.active "x")`. It only defines procedures; names must not
+   clash with core or other preludes (doc/SCHEME.md, Preludes).
 6. Rich settings screen (if flat option leaves aren't enough): implement
    `SettingsNode` and return it from `settings_nodes()`; anchor to a core
    category `("Display", "Name")` or to your own screen `("<id>", "Name")`
@@ -210,16 +244,16 @@ Scheme is the WHAT and WHEN. Rust is the HOW. Concretely:
 2. If behavior is needed, write a `cdylib` crate depending on `wasdf-sdk`
    (model: crates/wasdf-example-ext). Export:
      wasdf_abi_version() -> u32                        // = API_VERSION, required
-     wasdf_handle_intent(intent, data) -> *c_char      // optional
+     wasdf_handle_intent(intent, data, options) -> *c_char  // optional
      wasdf_on_cursor_changed(path) -> *c_char          // optional
      wasdf_vfs_list(path) -> *c_char                   // optional, mounts @/<id>
    All replies are Scheme-datum strings: a list of follow-up intents, e.g.
      ((notify "hi") (push-overlay "<id>" "info")
       (show-function-content "<id>" (document (field "Name" ((span "x"))))))
    Keep the reply CString alive until the next call (thread_local slot).
-3. Read your options from the `data` payload:
-   `wasdf_sdk::Settings::from_scheme_alist(data)` — the kernel passes your
-   live option snapshot whenever the intent form carried no data of its own.
+3. Read your options from the `options` argument:
+   `wasdf_sdk::Settings::from_scheme_alist(options)` — the kernel passes your
+   live option snapshot on every call; `data` is the intent's own payload.
 4. Deploy: `~/.config/wasdf/extensions/<id>/init.scm` + `lib<id>.{so,dylib}`
    (the loader adds the platform affixes to the bare (lib …) name).
    Your options + About appear under @/settings/Extensions/<id> like a
@@ -230,16 +264,28 @@ Scheme is the WHAT and WHEN. Rust is the HOW. Concretely:
 - The reducer cannot call extensions. Anything the reducer must apply goes
   through generic setter intents you return (SetSearchMatches, SetScroll,
   SetFunctionForm, Refresh, NavigateTo, …).
-- `:when` predicates read ONLY &AppState and must be cheap. State that
-  gates a key must therefore live in AppState, even when the algorithm that
-  computes it is yours (preview's search matches are the precedent).
+- `:when` predicates read ONLY &AppState and the OptionStore, and must be
+  cheap. State that gates a key must therefore live in AppState or be an
+  option, even when the algorithm that computes it is yours (preview's search
+  matches are the precedent). Gating on a bool option needs no predicate of
+  your own: `(option "<id>.<key>")`.
 - Don't grow the core Intent enum, don't branch per-intent in the event
   loop, don't handle completions per-intent — (purpose, payload) only.
 - Prefer removing a branch over adding an abstraction; MVP short and
   correct beats extensible (CLAUDE.md).
-- presets/config scm files are `(quote (…))` data literals — parse them via
-  script::sexpr + a script::config parser; never hand-roll a parser and
-  never build scm source at compile time in Rust.
+- presets and other shipped scm files are `(quote (…))` data literals (only
+  the user's config.scm is a program) — read them via
+  script::sexpr and decode the Datum in your own directory; never hand-roll
+  a reader and never build scm source at compile time in Rust.
+- Hooks never block and never do I/O (doc/ARCHITECTURE.md, Purity and Render
+  Contracts): I/O is an intent that becomes a plan; a setting changes via a
+  `Configure` intent; a file you own goes to `Host.files`. The pty
+  extension's spawn / resize / write are the only sanctioned exceptions. `view()` returns the SAME
+  Arc<PanelView> until the content changes (core caches layout on it), and
+  never depends on the viewport: emit `Para` for text core should wrap, and
+  report search matches as (block, byte range) — core maps them to rows;
+  `entry_style` runs per visible entry per frame, so resolve its tables when
+  inputs change, not per call.
 - If your feature is "a picker" or "one line of input", you do not need a
   mode: Select / Mode::InputForm already exist and round-trip through the
   reserved "item" key.

@@ -4,6 +4,20 @@
 use crate::core::{AppState, Entry, ExtensionIntent, Intent};
 use crate::extension::Extension;
 
+/// Extension priority, highest first: the registered ids the store's
+/// `extensions` order lists, in its order, then every other registered id in
+/// registration order. Ids it lists that are not registered are ignored.
+pub fn rank(registered: &[String], order: &[String]) -> Vec<String> {
+    let listed = order.iter().filter(|id| registered.contains(id));
+    let mut out: Vec<String> = Vec::new();
+    for id in listed.chain(registered) {
+        if !out.contains(id) {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
 #[derive(Default)]
 pub struct ExtensionRegistry {
     extensions: Vec<Box<dyn Extension>>,
@@ -50,11 +64,31 @@ impl ExtensionRegistry {
         self.iter().find_map(|e| e.entry_style(entry))
     }
 
+    /// Reorder by priority (`ranked`, highest first); an id it does not name
+    /// (the built-in CmdOp) goes last. Every "first extension that…" choice —
+    /// the content provider, `entry_style` — then follows the rank.
+    pub fn set_order(&mut self, ranked: &[String]) {
+        self.extensions.sort_by_key(|e| ranked.iter().position(|r| r == e.id()).unwrap_or(ranked.len()));
+    }
+
     /// Route an extension intent to its owning extension.
     pub fn dispatch(&self, intent: &ExtensionIntent, state: &AppState) -> Vec<Intent> {
         match self.extensions.iter().find(|e| e.id() == intent.extension) {
             Some(e) => e.handle_intent(intent, state),
             None => Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listed_ids_lead_unknown_ones_are_ignored_and_the_rest_keep_registration_order() {
+        let registered: Vec<String> = ["preview", "pty", "repl"].map(String::from).to_vec();
+        let order: Vec<String> = ["repl", "gone", "repl"].map(String::from).to_vec();
+        assert_eq!(rank(&registered, &order), ["repl", "preview", "pty"]);
+        assert_eq!(rank(&registered, &[]), registered);
     }
 }

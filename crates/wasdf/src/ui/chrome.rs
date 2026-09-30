@@ -62,22 +62,6 @@ pub struct PanelFrame {
     /// wrapped as `[ title ]`.
     pub bracket: bool,
     pub info: Option<String>,
-    /// Left-aligned text embedded in the bottom border (path, possibly up to ╦).
-    /// Ignored when `open_bottom` is true (no bottom border).
-    pub bottom_info: Option<String>,
-    /// Right-segment text starting at an explicit X column (filename after ╦).
-    /// Only rendered when `open_bottom` is false.
-    pub bottom_right: Option<(u16, String)>,
-    /// Whether the panel that *owns* the left bottom-border label (`bottom_info`)
-    /// is focused. The label (e.g. the file panel's path) is themed focus-aware
-    /// off this flag, independent of this carrier panel's own `focused` (the path
-    /// lives on the nav panel's bottom border but reflects the file panel's focus).
-    pub bottom_focused: bool,
-    /// Whether the panel that *owns* the right bottom-border label (`bottom_right`)
-    /// is focused. Tracked separately from `bottom_focused` because the two labels
-    /// belong to different panels — the path to the file panel, the filename to the
-    /// function panel — so they must show focus independently.
-    pub bottom_right_focused: bool,
     pub focused: bool,
     pub scroll: Option<ScrollInfo>,
     /// When true, the panel has no bottom border: the side borders run down
@@ -99,10 +83,6 @@ impl PanelFrame {
             title: None,
             bracket: true,
             info: None,
-            bottom_info: None,
-            bottom_right: None,
-            bottom_focused: false,
-            bottom_right_focused: false,
             focused: false,
             scroll: None,
             open_bottom: false,
@@ -123,24 +103,6 @@ impl PanelFrame {
         self.info = Some(t.into());
         self
     }
-    /// Left-aligned text in the bottom border (path up to ╦, or full path+name).
-    pub fn bottom_info(mut self, t: impl Into<String>) -> Self {
-        self.bottom_info = Some(t.into());
-        self
-    }
-    /// Right-segment text starting at absolute column `x` (filename after ╦), with
-    /// the focus of its owning panel (the function panel) for focus-aware theming.
-    pub fn bottom_right(mut self, x: u16, t: impl Into<String>, focused: bool) -> Self {
-        self.bottom_right = Some((x, t.into()));
-        self.bottom_right_focused = focused;
-        self
-    }
-    /// Whether the owner of the left bottom-border label is focused (themes the
-    /// label focus-aware, e.g. the path reflecting the file panel's focus).
-    pub fn bottom_focused(mut self, f: bool) -> Self {
-        self.bottom_focused = f;
-        self
-    }
     pub fn focused(mut self, f: bool) -> Self {
         self.focused = f;
         self
@@ -156,6 +118,43 @@ impl PanelFrame {
     pub fn open_left(mut self, v: bool) -> Self {
         self.open_left = v;
         self
+    }
+}
+
+/// Text laid on a border line that belongs to a panel other than the one whose
+/// frame drew the line: the file panel's path and the function panel's file
+/// name on the file panel's top border (doc/UI.md). Painted after every title,
+/// from column `x`, never past column `right`; themed with its owner's focus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BorderLabel {
+    pub x: u16,
+    pub y: u16,
+    pub right: u16,
+    pub text: String,
+    pub focused: bool,
+}
+
+/// Where a panel sits in the solved layout: its rect and which of its edges
+/// are left open (doc/UI.md, Screen chrome). A panel draws its frame and finds
+/// its content rect through this, never by assuming its position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanelArea {
+    pub rect: Rect,
+    pub open_left: bool,
+    pub open_bottom: bool,
+}
+
+impl PanelArea {
+    pub fn closed(rect: Rect) -> Self {
+        PanelArea { rect, open_left: false, open_bottom: false }
+    }
+
+    pub fn inner(&self) -> Rect {
+        if self.open_bottom { inner_open_bottom(self.rect) } else { inner(self.rect) }
+    }
+
+    pub fn frame(&self) -> PanelFrame {
+        PanelFrame::new(self.rect).open_left(self.open_left).open_bottom(self.open_bottom)
     }
 }
 
@@ -226,6 +225,7 @@ fn glyph(mask: u8, style: &str) -> char {
 pub fn render(
     frame: &mut Frame,
     panels: &[PanelFrame],
+    labels: &[BorderLabel],
     border_style: &str,
     scrollbar: &ScrollbarChars,
     theme: &Theme,
@@ -400,10 +400,11 @@ pub fn render(
             }
         }
 
-        // Bottom-border left-aligned text (path, or path+filename combined).
+        // Border labels (the path, and the file name after it).
         //
-        // This row is the top area's bottom border *and* the main panels' shared
-        // top border, so a function-panel title may already have been painted here.
+        // The line a label sits on is usually shared — the top panel's bottom
+        // border is the main panels' top border — so a function-panel title may
+        // already have been painted here.
         // Three outcomes per cell, in priority order:
         //
         //   1. A real label character (anything but a horizontal rule — brackets
@@ -417,11 +418,8 @@ pub fn render(
         //      it repaints the connected junction glyph (`┴`/`╦`), which also
         //      erases any function title that bled onto this shared row.
         //
-        // The text belongs to the whole connected bottom line, so it is clamped to
-        // the frame's right edge (the closing corner), not the carrier panel's own
-        // width — a path may flow rightward across neighbouring panel sections.
-        let frame_right = area.x + area.width - 1;
-        let paint_bottom = |buf: &mut ratatui::buffer::Buffer, mut x: u16, y: u16, text: &str, focused: bool| {
+        // A label is clamped to its own right edge (the end of the line it sits on).
+        let paint_bottom = |buf: &mut ratatui::buffer::Buffer, mut x: u16, y: u16, frame_right: u16, text: &str, focused: bool| {
             // The bracketed path/name labels are themed like panel titles: the
             // `[`/`]` brackets take the title-bracket role, the inner text the
             // title role, and the rule/padding the border color. They follow the
@@ -467,24 +465,8 @@ pub fn render(
                 x += 1;
             }
         };
-        for p in panels {
-            let Some(bottom_text) = &p.bottom_info else { continue };
-            if p.open_bottom || p.rect.height < 2 || p.rect.width < 4 {
-                continue;
-            }
-            let y = p.rect.y + p.rect.height - 1;
-            paint_bottom(buf, p.rect.x + 2, y, bottom_text, p.bottom_focused);
-        }
-
-        // Bottom-border right-segment text: filename after the ╦ junction. Starts
-        // at the explicit column stored in bottom_right (func_x + 1); same rule.
-        for p in panels {
-            let Some((start_x, right_text)) = &p.bottom_right else { continue };
-            if p.open_bottom || p.rect.height < 2 {
-                continue;
-            }
-            let y = p.rect.y + p.rect.height - 1;
-            paint_bottom(buf, *start_x, y, right_text, p.bottom_right_focused);
+        for l in labels {
+            paint_bottom(buf, l.x, l.y, l.right, &l.text, l.focused);
         }
     }
 

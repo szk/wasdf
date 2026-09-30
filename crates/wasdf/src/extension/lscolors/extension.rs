@@ -13,24 +13,71 @@
 
 use std::cell::RefCell;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard};
 
 use ratatui::style::Style;
 
 use crate::core::{
-    AppState, Entry, ExtensionIntent, ExtensionValue, InputFormSpec, Intent, Mode, OptionStore, KEY_ITEM,
+    AppState, ConfigWrite, Entry, ExtensionIntent, ExtensionValue, InputFormSpec, Intent, Mode, OptionStore,
+    OptionValue, KEY_ITEM,
 };
 use crate::extension::settings::SettingsNode;
 use crate::extension::{About, Extension};
 use crate::vfs::vfs_root;
 
 use super::parse::{self, LsColorsTable};
-use super::registry::{NamedPalette, PaletteRegistry};
-use super::writer::LsColorsWriter;
+use super::registry::{self, NamedPalette, PaletteRegistry};
 
 const ID: &str = "lscolors";
 const OPTIONS_SCHEME: &str = include_str!("options.scm");
+const PRELUDE_SCHEME: &str = include_str!("prelude.scm");
+
+/// The registry as a projection of the `lscolors.palette` / `lscolors.custom`
+/// options, rebuilt whenever the OptionStore's generation moves (the same
+/// shape as the theme extension's state).
+struct PaletteState {
+    registry: RwLock<PaletteRegistry>,
+    options: OnceLock<Arc<OptionStore>>,
+    /// The options generation the registry was last built from, plus one
+    /// (0 = never built).
+    synced: AtomicU64,
+}
+
+impl PaletteState {
+    fn sync(&self) {
+        let Some(options) = self.options.get() else { return };
+        let generation = options.generation() + 1;
+        if self.synced.load(Ordering::Acquire) == generation {
+            return;
+        }
+        let customs = options.value("lscolors.custom").map(|v| registry::customs_from_value(&v)).unwrap_or_default();
+        let active = options.get_str("lscolors.palette");
+        if let Ok(mut reg) = self.registry.write() {
+            reg.replace_customs(customs);
+            if !reg.set_active(&active)
+                && let Some(first) = reg.names().first().cloned()
+            {
+                reg.set_active(&first);
+            }
+        }
+        self.synced.store(generation, Ordering::Release);
+    }
+
+    fn read(&self) -> Option<RwLockReadGuard<'_, PaletteRegistry>> {
+        self.sync();
+        self.registry.read().ok()
+    }
+
+    fn write_customs<'a>(palettes: impl IntoIterator<Item = &'a NamedPalette>) -> Intent {
+        Intent::Configure(ConfigWrite::SetOption { key: "lscolors.custom".into(), value: registry::customs_to_value(palettes) })
+    }
+
+    fn write_active(name: &str) -> Intent {
+        Intent::Configure(ConfigWrite::SetOption { key: "lscolors.palette".into(), value: OptionValue::Text(name.into()) })
+    }
+}
 
 // ── LsColorsNode ──────────────────────────────────────────────────────────────
 
@@ -40,7 +87,7 @@ const OPTIONS_SCHEME: &str = include_str!("options.scm");
 /// field instead of per-key color pickers (the table has no fixed role set to
 /// draw individual pickers for — just fixed slots plus an open `*.ext` map).
 struct LsColorsNode {
-    registry: Arc<RwLock<PaletteRegistry>>,
+    state: Arc<PaletteState>,
 }
 
 impl SettingsNode for LsColorsNode {
@@ -49,9 +96,7 @@ impl SettingsNode for LsColorsNode {
     }
 
     fn list(&self, path: &Path) -> io::Result<Vec<Entry>> {
-        let reg = self.registry.read().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("lscolors registry lock poisoned: {e}"))
-        })?;
+        let reg = self.state.read().ok_or_else(|| io::Error::other("lscolors registry lock poisoned"))?;
 
         let depth = path.components().count();
         // @/settings/Extensions/lscolors/Themes → depth 5
@@ -156,112 +201,28 @@ impl SettingsNode for LsColorsNode {
 pub struct LsColorsExtension {
     /// Parsed once at boot: the shell's `LS_COLORS` (empty table if unset).
     env_table: LsColorsTable,
-    pub registry: Arc<RwLock<PaletteRegistry>>,
-    writer: Option<LsColorsWriter>,
-    /// Memo of the active palette's parsed table, keyed by its name — refreshed
-    /// only when the active name changes, since `entry_style` is called once
-    /// per visible entry (reparsing the raw string on every call would be
-    /// quadratic in listing size).
-    active_cache: RefCell<Option<(String, LsColorsTable)>>,
-    /// Set once from boot via `bind_store`; read in `entry_style` for the
-    /// `lscolors.coloring` option value.
-    store: OnceLock<Arc<OptionStore>>,
+    state: Arc<PaletteState>,
+    /// Memo of the active palette's parsed table, keyed by the options
+    /// generation it was built at — `entry_style` runs once per visible entry,
+    /// so the raw string is parsed again only when the options changed.
+    active_cache: RefCell<Option<(u64, LsColorsTable)>>,
 }
 
 impl LsColorsExtension {
-    /// `config_dir` is the bare app config directory (e.g. `~/.config/wasdf`),
-    /// matching the convention other bundled extensions take (see
-    /// `bookmarks::BookmarksExtension::new`) — this extension owns both its
-    /// file name inside it (`config.scm`) and its own preset registry, so
-    /// nothing about it needs to live in the kernel.
-    pub fn new(config_dir: Option<PathBuf>) -> Self {
-        let presets = parse_presets();
-        let registry = Arc::new(RwLock::new(PaletteRegistry::with_presets(presets)));
-
-        let config_scm = config_dir.map(|d| d.join("config.scm"));
-        if let Some(ref path) = config_scm {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                boot_load_config(&registry, &text);
-            }
-        }
-        let env_table = std::env::var("LS_COLORS")
-            .map(|raw| parse::parse_ls_colors(&raw))
-            .unwrap_or_default();
-        let writer = config_scm.map(LsColorsWriter::new);
-        LsColorsExtension {
-            env_table,
-            registry,
-            writer,
-            active_cache: RefCell::new(None),
-            store: OnceLock::new(),
-        }
+    pub fn new() -> Self {
+        let env_table = std::env::var("LS_COLORS").map(|raw| parse::parse_ls_colors(&raw)).unwrap_or_default();
+        let state = PaletteState {
+            registry: RwLock::new(PaletteRegistry::bundled()),
+            options: OnceLock::new(),
+            synced: AtomicU64::new(0),
+        };
+        LsColorsExtension { env_table, state: Arc::new(state), active_cache: RefCell::new(None) }
     }
 }
 
-/// Parse the bundled `presets.scm` into `NamedPalette` presets.
-fn parse_presets() -> Vec<NamedPalette> {
-    let datum = crate::script::sexpr::parse(super::PRESETS_SCHEME)
-        .unwrap_or(crate::script::sexpr::Datum::List(vec![]));
-    let inner = datum.as_list()
-        .and_then(|l| l.get(1))
-        .cloned()
-        .unwrap_or(crate::script::sexpr::Datum::List(vec![]));
-    crate::script::config::parse_lscolors_presets_config(&inner)
-}
-
-/// Parse the managed block in `text` for `(define-lscolors-palette …)` and
-/// `(set-lscolors-palette …)` forms, loading customs first so a custom active
-/// name is recognized by `set_active`.
-fn boot_load_config(registry: &Arc<RwLock<PaletteRegistry>>, text: &str) {
-    let lines: Vec<&str> = text.lines().collect();
-    let begin = lines.iter().position(|l| l.trim() == super::writer::BLOCK_BEGIN);
-    let end = lines.iter().position(|l| l.trim() == super::writer::BLOCK_END);
-    let (Some(b), Some(e)) = (begin, end) else { return };
-    if b >= e { return; }
-    let block = &lines[b + 1..e];
-
-    let mut customs = Vec::new();
-    let mut active_name: Option<String> = None;
-    let mut i = 0;
-
-    while i < block.len() {
-        let t = block[i].trim();
-        if t.starts_with("(define-lscolors-palette ") {
-            // Single- or multi-line form: count parens to find the closing line.
-            let start = i;
-            let mut depth = 0i32;
-            let mut end_i = i;
-            for j in i..block.len() {
-                for ch in block[j].chars() {
-                    match ch { '(' => depth += 1, ')' => depth -= 1, _ => {} }
-                }
-                end_i = j;
-                if depth <= 0 { break; }
-            }
-            let form_str = block[start..=end_i].join("\n");
-            if let Ok(datum) = crate::script::sexpr::parse(&form_str) {
-                if let Some(np) = crate::script::config::parse_define_lscolors_palette(&datum) {
-                    customs.push(np);
-                }
-            }
-            i = end_i + 1;
-        } else if t.starts_with("(set-lscolors-palette ") {
-            if let Ok(datum) = crate::script::sexpr::parse(t) {
-                if let Some(name) = crate::script::config::parse_set_lscolors_palette(&datum) {
-                    active_name = Some(name);
-                }
-            }
-            i += 1;
-        } else {
-            i += 1;
-        }
-    }
-
-    if !customs.is_empty() {
-        let _ = registry.write().map(|mut r| r.load_customs(customs));
-    }
-    if let Some(name) = active_name {
-        let _ = registry.write().map(|mut r| r.set_active(&name));
+impl Default for LsColorsExtension {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -281,24 +242,29 @@ impl Extension for LsColorsExtension {
         Some(OPTIONS_SCHEME.to_string())
     }
 
+    fn prelude(&self) -> Option<String> {
+        Some(PRELUDE_SCHEME.to_string())
+    }
+
     fn bind_store(&self, store: &Arc<OptionStore>) {
-        let _ = self.store.set(store.clone());
+        let _ = self.state.options.set(store.clone());
+        self.state.sync();
     }
 
     fn settings_nodes(&self) -> Vec<Arc<dyn SettingsNode>> {
-        vec![Arc::new(LsColorsNode { registry: self.registry.clone() })]
+        vec![Arc::new(LsColorsNode { state: self.state.clone() })]
     }
 
     fn entry_style(&self, entry: &Entry) -> Option<Style> {
-        let store = self.store.get()?;
+        let store = self.state.options.get()?;
         match store.get_str("lscolors.coloring").as_str() {
             "LS_COLORS" => parse::style_for(&self.env_table, entry),
             "Palette" => {
-                let active = self.registry.read().ok()?.active().to_string();
-                let stale = self.active_cache.borrow().as_ref().map(|(n, _)| *n != active).unwrap_or(true);
+                let generation = store.generation();
+                let stale = self.active_cache.borrow().as_ref().map(|(g, _)| *g != generation).unwrap_or(true);
                 if stale {
-                    let table = self.registry.read().ok()?.resolve(&active);
-                    *self.active_cache.borrow_mut() = Some((active, table));
+                    let table = self.state.read()?.resolve_active();
+                    *self.active_cache.borrow_mut() = Some((generation, table));
                 }
                 let cache = self.active_cache.borrow();
                 parse::style_for(&cache.as_ref()?.1, entry)
@@ -313,12 +279,9 @@ impl Extension for LsColorsExtension {
             // ── Selection ──────────────────────────────────────────────────────
             "set-active" => {
                 let Some(name) = intent.data.as_str() else { return vec![] };
-                let changed = self.registry.write()
-                    .map(|mut r| r.set_active(name))
-                    .unwrap_or(false);
-                if !changed { return vec![]; }
-                if let Some(w) = &self.writer { let _ = w.set_active(name); }
-                vec![Intent::Refresh]
+                let known = self.state.read().is_some_and(|r| r.get(name).is_some());
+                if !known { return vec![]; }
+                vec![PaletteState::write_active(name)]
             }
 
             // ── New palette ────────────────────────────────────────────────────
@@ -337,23 +300,14 @@ impl Extension for LsColorsExtension {
                 };
                 let name = name_raw.trim().to_string();
                 if name.is_empty() { return vec![]; }
-                let new_palette = {
-                    let Ok(reg) = self.registry.read() else { return vec![]; };
-                    if reg.get(&name).is_some() { return vec![]; }
-                    let active = reg.active().to_string();
-                    let seed_raw = reg.get(&active).map(|p| p.raw.clone()).unwrap_or_default();
-                    NamedPalette { name: name.clone(), preset: false, raw: seed_raw }
-                };
-                {
-                    let Ok(mut reg) = self.registry.write() else { return vec![]; };
-                    reg.upsert_custom(new_palette.clone());
-                    reg.set_active(&name);
-                }
-                if let Some(w) = &self.writer {
-                    let _ = w.upsert_palette(&new_palette);
-                    let _ = w.set_active(&name);
-                }
-                vec![Intent::Refresh]
+                let Some(reg) = self.state.read() else { return vec![]; };
+                if reg.get(&name).is_some() { return vec![]; }
+                let raw = reg.get(reg.active()).map(|p| p.raw.clone()).unwrap_or_default();
+                let new_palette = NamedPalette { name: name.clone(), preset: false, raw };
+                vec![
+                    PaletteState::write_customs(reg.customs().chain(std::iter::once(&new_palette))),
+                    PaletteState::write_active(&name),
+                ]
             }
 
             // ── Duplicate ──────────────────────────────────────────────────────
@@ -378,22 +332,14 @@ impl Extension for LsColorsExtension {
                 let source_name = source_name.to_string();
                 let new_name = new_name_raw.trim().to_string();
                 if new_name.is_empty() { return vec![]; }
-                let new_palette = {
-                    let Ok(reg) = self.registry.read() else { return vec![]; };
-                    if reg.get(&new_name).is_some() { return vec![]; }
-                    let raw = reg.get(&source_name).map(|p| p.raw.clone()).unwrap_or_default();
-                    NamedPalette { name: new_name.clone(), preset: false, raw }
-                };
-                {
-                    let Ok(mut reg) = self.registry.write() else { return vec![]; };
-                    reg.upsert_custom(new_palette.clone());
-                    reg.set_active(&new_name);
-                }
-                if let Some(w) = &self.writer {
-                    let _ = w.upsert_palette(&new_palette);
-                    let _ = w.set_active(&new_name);
-                }
-                vec![Intent::Refresh]
+                let Some(reg) = self.state.read() else { return vec![]; };
+                if reg.get(&new_name).is_some() { return vec![]; }
+                let raw = reg.get(&source_name).map(|p| p.raw.clone()).unwrap_or_default();
+                let new_palette = NamedPalette { name: new_name.clone(), preset: false, raw };
+                vec![
+                    PaletteState::write_customs(reg.customs().chain(std::iter::once(&new_palette))),
+                    PaletteState::write_active(&new_name),
+                ]
             }
 
             // ── Rename ─────────────────────────────────────────────────────────
@@ -418,37 +364,23 @@ impl Extension for LsColorsExtension {
                 let old_name = old_name.to_string();
                 let new_name = new_name_raw.trim().to_string();
                 if new_name.is_empty() { return vec![]; }
-                let (was_active, renamed) = {
-                    let Ok(reg) = self.registry.read() else { return vec![]; };
-                    if reg.get(&new_name).is_some() { return vec![]; }
-                    let Some(old_np) = reg.get(&old_name) else { return vec![]; };
-                    if old_np.preset { return vec![]; }
-                    let was_active = reg.active() == old_name;
-                    let renamed = NamedPalette {
-                        name: new_name.clone(),
-                        preset: false,
-                        raw: old_np.raw.clone(),
-                    };
-                    (was_active, renamed)
-                };
-                {
-                    let Ok(mut reg) = self.registry.write() else { return vec![]; };
-                    reg.remove_custom(&old_name);
-                    reg.upsert_custom(renamed.clone());
-                    if was_active { reg.set_active(&new_name); }
+                let Some(reg) = self.state.read() else { return vec![]; };
+                if reg.get(&new_name).is_some() { return vec![]; }
+                let Some(old_np) = reg.get(&old_name) else { return vec![]; };
+                if old_np.preset { return vec![]; }
+                let renamed = NamedPalette { name: new_name.clone(), preset: false, raw: old_np.raw.clone() };
+                let customs = reg.customs().map(|p| if p.name == old_name { &renamed } else { p });
+                let mut out = vec![PaletteState::write_customs(customs)];
+                if reg.active() == old_name {
+                    out.push(PaletteState::write_active(&new_name));
                 }
-                if let Some(w) = &self.writer {
-                    let _ = w.remove_palette(&old_name);
-                    let _ = w.upsert_palette(&renamed);
-                    if was_active { let _ = w.set_active(&new_name); }
-                }
-                vec![Intent::Refresh]
+                out
             }
 
             // ── Edit raw string ────────────────────────────────────────────────
             "edit-raw" => {
                 let Some(name) = intent.data.as_str() else { return vec![] };
-                let Ok(reg) = self.registry.read() else { return vec![] };
+                let Some(reg) = self.state.read() else { return vec![] };
                 let Some(np) = reg.get(name) else { return vec![] };
                 if np.preset { return vec![]; }
                 let template = ExtensionIntent {
@@ -472,21 +404,17 @@ impl Extension for LsColorsExtension {
                 };
                 let name = name.to_string();
                 let raw = raw.to_string();
-                let updated = {
-                    let Ok(reg) = self.registry.read() else { return vec![]; };
-                    let Some(np) = reg.get(&name) else { return vec![]; };
-                    if np.preset { return vec![]; }
-                    NamedPalette { name: np.name.clone(), preset: false, raw }
-                };
-                { let Ok(mut reg) = self.registry.write() else { return vec![]; }; reg.upsert_custom(updated.clone()); }
-                if let Some(w) = &self.writer { let _ = w.upsert_palette(&updated); }
-                vec![Intent::Refresh]
+                let Some(reg) = self.state.read() else { return vec![]; };
+                let Some(np) = reg.get(&name) else { return vec![]; };
+                if np.preset { return vec![]; }
+                let updated = NamedPalette { name: np.name.clone(), preset: false, raw };
+                vec![PaletteState::write_customs(reg.customs().map(|p| if p.name == name { &updated } else { p }))]
             }
 
             // ── Delete ─────────────────────────────────────────────────────────
             "delete" => {
                 let Some(name) = intent.data.as_str() else { return vec![] };
-                let is_preset = self.registry.read().ok()
+                let is_preset = self.state.read()
                     .and_then(|r| r.get(name).map(|p| p.preset))
                     .unwrap_or(true);
                 if is_preset { return vec![]; }
@@ -499,21 +427,16 @@ impl Extension for LsColorsExtension {
             }
             "delete-confirm" => {
                 let Some(name) = intent.data.as_str() else { return vec![] };
-                let was_active = self.registry.read().ok()
-                    .map(|r| r.active() == name)
-                    .unwrap_or(false);
-                let _ = self.registry.write().map(|mut r| r.remove_custom(name));
-                if let Some(w) = &self.writer { let _ = w.remove_palette(name); }
-                if was_active {
-                    let fallback = self.registry.read().ok().and_then(|r| r.names().first().cloned());
-                    if let Some(fallback) = fallback {
-                        let _ = self.registry.write().map(|mut r| r.set_active(&fallback));
-                        if let Some(w) = &self.writer { let _ = w.set_active(&fallback); }
-                    }
+                let Some(reg) = self.state.read() else { return vec![]; };
+                let mut out = vec![PaletteState::write_customs(reg.customs().filter(|p| p.name != name))];
+                if reg.active() == name
+                    && let Some(first) = reg.names().first()
+                {
+                    out.push(PaletteState::write_active(first));
                 }
                 // The deleted palette's directory is gone — return to the Themes root.
-                let themes_root = vfs_root().join("settings").join("Extensions").join(ID).join("Themes");
-                vec![Intent::NavigateTo(themes_root)]
+                out.push(Intent::NavigateTo(vfs_root().join("settings").join("Extensions").join(ID).join("Themes")));
+                out
             }
 
             _ => Vec::new(),
@@ -545,12 +468,37 @@ mod tests {
     }
 
     fn ext() -> LsColorsExtension {
-        LsColorsExtension::new(None)
+        LsColorsExtension::new()
+    }
+
+    fn bound_ext() -> LsColorsExtension {
+        let e = ext();
+        let store = Arc::new(OptionStore::new(crate::app::defaults::extension_options(&e)));
+        e.bind_store(&store);
+        e
+    }
+
+    /// What the kernel does with a returned `Configure`.
+    fn apply(e: &LsColorsExtension, intents: Vec<Intent>) {
+        let store = e.state.options.get().unwrap();
+        for i in intents {
+            if let Intent::Configure(ConfigWrite::SetOption { key, value }) = i {
+                assert!(store.set(&key, value), "the lscolors options accept {key}");
+            }
+        }
+    }
+
+    fn run(e: &LsColorsExtension, intent: &str, data: ExtensionValue) {
+        let out = e.handle_intent(
+            &ExtensionIntent { extension: ID.into(), intent: intent.into(), data },
+            &AppState::new(std::env::temp_dir()),
+        );
+        apply(e, out);
     }
 
     #[test]
     fn builtin_dark_and_light_presets_parse_and_color_dirs_and_rs_files() {
-        let reg = PaletteRegistry::with_presets(parse_presets());
+        let reg = PaletteRegistry::bundled();
         let dark = reg.resolve("dark");
         let light = reg.resolve("light");
         assert!(parse::style_for(&dark, &entry("x", true)).is_some(), "dark: dir has a color");
@@ -566,20 +514,33 @@ mod tests {
     }
 
     #[test]
-    fn set_active_switches_the_resolved_table() {
-        let e = ext();
-        let store = Arc::new(OptionStore::new(vec![crate::core::OptionDef {
-            key: "lscolors.coloring".into(),
-            category: "LsColors".into(),
-            label: "coloring".into(),
-            kind: crate::core::OptionKind::Choice(vec!["none".into(), "LS_COLORS".into(), "Palette".into()]),
-            default: "Palette".into(),
-            owner: Some(ID.into()),
-        }]));
-        e.bind_store(&store);
-        assert_eq!(e.registry.read().unwrap().active(), "dark");
-        assert!(e.registry.write().unwrap().set_active("light"));
-        assert_eq!(e.registry.read().unwrap().active(), "light");
+    fn set_active_writes_the_option_and_the_registry_follows() {
+        let e = bound_ext();
+        assert_eq!(e.state.read().unwrap().active(), "dark");
+        run(&e, "set-active", ExtensionValue::String("light".into()));
+        assert_eq!(e.state.read().unwrap().active(), "light");
         assert!(e.entry_style(&entry("x", true)).is_some());
+    }
+
+    #[test]
+    fn editing_the_active_palette_recolors_without_a_rename() {
+        let e = bound_ext();
+        run(
+            &e,
+            "duplicate-apply",
+            ExtensionValue::Nil
+                .with("source", ExtensionValue::String("dark".into()))
+                .with(KEY_ITEM, ExtensionValue::String("mine".into())),
+        );
+        assert_eq!(e.state.read().unwrap().active(), "mine");
+        assert!(e.entry_style(&entry("main.rs", false)).is_some(), "the copy colors .rs like dark");
+        run(
+            &e,
+            "edit-raw-apply",
+            ExtensionValue::Nil
+                .with("palette", ExtensionValue::String("mine".into()))
+                .with(KEY_ITEM, ExtensionValue::String("di=01;34".into())),
+        );
+        assert!(e.entry_style(&entry("main.rs", false)).is_none(), "the cached table was rebuilt");
     }
 }

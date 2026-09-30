@@ -1,506 +1,351 @@
 # Extensions
 
 Features beyond the minimal filer are implemented as extensions. The kernel
-boots with zero extensions registered: browsing, selection, file operations,
-search, the palette, and the confirmation dialog all work; the cursor entry's
-metadata is always shown in the prop panel ([UI.md](UI.md)), so with no content
-extension the function panel simply shows a placeholder; extension entry keys
-and commands do not exist.
+boots with zero extensions registered: browsing, selection, file operations
+(the built-in CmdOp builder for copy / move / rename / create, and delete via
+the resolver), search, the palette, and the confirmation dialog all work; the prop panel shows
+the cursor entry's metadata ([UI.md](UI.md)), and the function panel shows a
+placeholder.
 
 ## Guiding Goal — thin core, fat extension
 
 > Minimize core's responsibility and size; give extensions the *large*
-> responsibility. The more a swapped/replaced extension changes, the better.
-> Core is a thin host; the extension is where behavior lives. Anything that
-> *can* live in the extension *should*.
+> responsibility. Core is a thin host; the extension is where behavior lives.
+> Anything that *can* live in the extension *should*.
 
-The target capability: a feature added as an extension — written against
-`wasdf-sdk`, built as a dynamic library and dropped into the extensions directory
-alongside its `.scm` manifest — that, with **zero further edits to
-`crates/wasdf/src/`**:
+A feature added as an extension — written against `wasdf-sdk`, built as a
+dynamic library and dropped into the extensions directory alongside its `.scm`
+manifest — with **zero edits to `crates/wasdf/src/`**:
 
-1. **joins the processing pipeline** (emits/handles intents, can load content),
+1. **joins the processing pipeline** (emits / handles intents, loads content),
 2. **receives key input** (binds keys that route to it), and
 3. **renders inside the function panel** (and only there).
 
-Bundled extensions use the **same** mechanism; `PreviewExtension` is the
-reference client that proves the design (dogfooding).
+Bundled extensions use the same mechanism; `PreviewExtension` is the reference
+client.
 
 The function panel **chrome** (border, title placement, the panel rect, the
 Exec frame) is the kernel's. The panel **content** — what is drawn, its
-appearance, syntax color, search, scroll/h-scroll, line numbers — is the
-**owning extension's**. Core hosts, blits, routes keys, reads bytes off-thread,
-and stores the gated match list; the extension renders and interacts.
+appearance, search, paging — is the owning extension's. Core hosts, lays out,
+routes keys, reads bytes off-thread, and stores the gated match list.
+
+## Zero-Edit Principle
+
+Adding an extension edits nothing in core, app, script, services, ui, exec, or
+vfs — including the embedded `.scm` sources under `app/`. No core module names
+an extension's id, one of its intents or options, or a path under its mount.
+This applies to every bundled extension without exception: none is
+constructed, registered, or parsed for by the kernel, and core palette
+commands and bindings reach only core intents.
+
+### Coupling between extensions
+
+An extension may use another extension through exactly two channels, and
+nothing else — no Rust type, function, VFS path, or form of the other
+extension:
+
+| Channel | Form | When the other extension is absent |
+|---------|------|------------------------------------|
+| Option key | read `<id>.<key>` from the OptionStore | the key is undeclared and reads as its type's empty value (`false`, `""`, `0`); the reader treats that as "not available" |
+| Intent name | emit `(ext "<id>" "<intent>" [data])` | an intent addressed to an unregistered owner is dropped (debug log only) |
+
+The consumer checks the option before emitting the intent, so it never relies
+on the drop, and it falls back to its own behavior when the other extension is
+absent. The data carried by such an intent is part of the receiving
+extension's documented contract.
+
+Core may reach an extension the same way only through **user data**: a core
+option whose value is an extension id (e.g. `cmdop.runner` — [CMDOP.md](CMDOP.md))
+makes core emit `(ext "<id>" …)` against a contract core defines. The id is
+never written in core's sources or defaults.
+
+Shared seams that are not another extension's code — the Extension trait,
+`Host`, `SettingsNode`, core intents — are core surface, not coupling. A
+settings node never hardcodes where it is mounted: the host of the settings
+tree hands each node its base path.
+
+**Acceptance test.** Searching the tree for an extension's id outside its own
+directory matches only (a) the bundled-extension list and (b) option keys
+`"<id>.…"` and `(ext "<id>" …)` intent forms inside other extensions'
+directories.
 
 ## Kinds
 
 | Kind | Loading | Examples |
 |------|---------|----------|
-| Bundled | Statically linked; named only in the bundled-extension list inside the extension facade | PreviewExtension, ArchiveExtension, CmdOpExtension, ThemeExtension |
-| Optional | A `.scm` **manifest** (the glue declarations) in the user's extensions directory — its own folder `<id>/init.scm` (or a flat `<id>.scm`) — optionally naming a native library via `(lib …)`; the kernel reads the manifest as data and loads the named `.so`/`.dylib` (libloading) for the handlers. A manifest with no `(lib …)` is purely declarative (glue-only). ABI-stable types come from the wasdf-sdk crate | third-party extensions; `exampleext` (manifest + minimal `cdylib`) |
+| Bundled | Statically linked; named only in `extension::bundled()` | preview, archive, pty, bookmarks, lscolors, theme, settings, repl |
+| Optional | A `.scm` manifest in the user's extensions directory — `<id>/init.scm` (or a flat `<id>.scm`) — optionally naming a native library via `(lib …)`. ABI-stable types come from `wasdf-sdk` | third-party extensions; `exampleext` (`crates/wasdf-example-ext`) |
 
-Both kinds implement the same Extension trait.
+Both kinds implement the same Extension trait (a dynamic library is wrapped in
+`loader::DynamicExtension`).
 
-### Optional extension: the `.scm` manifest + native library
-
-An optional extension is **two paired artifacts** in the extensions directory: a
-`.scm` manifest (the *what/when* — declarations, read as data) and the native
-library it names (the *how* — handlers). The manifest is the entry point; the
-kernel discovers manifests, reads the declarations, and loads the `(lib …)`
-library for the handlers.
-
-Each extension gets its **own folder** — `<extensions>/<id>/init.scm` (plus its
-library and any assets) — mirroring the bundled `<name>/` layout. A flat
-`<extensions>/<id>.scm` is also accepted for a single-file extension.
+### Optional extension: manifest + native library
 
 ```scheme
 (extension "id"
-  (lib "crate_lib_name")            ; bare lib name; loader adds lib…/.so/.dylib
-  (commands (…)) (resolvers (…)) (keymaps (…)) (options (…)))  ; all sections optional
+  (lib "crate_lib_name")            ; bare lib name; the loader adds lib…/.so/.dylib
+  (commands (…)) (resolvers (…)) (keymaps (…)) (options (…))   ; all sections optional
+  (prelude "prelude.scm"))          ; optional Scheme code for the session
 ```
 
-The `(options …)` section declares configurable settings as
-`(option key category kind default label)` forms — the same shape a bundled
-extension's `option_scheme` uses. The loader tags them with the extension id, so
-they appear **editable + persisted** under `@/settings/Extensions/<id>`, and the
-extension reads them back through the shared value snapshot (a
-`wasdf_sdk::Settings`) — full settings parity with a bundled extension. Every
-registered extension (bundled or optional) also shows an **About** card there
-(name / version / description from `Extension::about()`), so a user extension
-appears in `@/settings/Extensions` exactly like a bundled one.
+The manifest is **data, not code**: it is read by the s-expression reader, never
+evaluated, and decoded by the same core config decoders the embedded sources use
+into palette commands, resolver entries, Extension-layer key bindings, and
+option declarations. `(options …)` uses the shared
+`(option key category kind default label)` form; the options appear editable and
+persisted under `@/settings/Extensions/<id>` next to the extension's About card.
+A binding's `(ext "id" "intent")` form is linked to the library at dispatch
+time, by id. A manifest with no `(lib …)` is purely declarative: it wires
+existing core intents only. Its `:when` clauses are limited to core predicates
+(including `(option "key")`, which covers its own options).
 
-The manifest is **data, not code**: it never runs. It is read by the codec's
-s-expression reader into palette commands, resolver entries, and Extension-layer
-key bindings. A binding's `(ext "id" "intent")` form is linked to Rust at **intent
-dispatch over the C ABI** (by id), not by the manifest. A manifest with **no**
-`(lib …)` is a purely declarative extension — it wires existing core intents with
-no Rust at all.
-
-The reference **`exampleext`** (source: `crates/wasdf-example-ext`) **toggles** a
-cursor-info feature with `o`: the first press turns it ON — it pushes an **overlay
-mode** (so `wasd` still navigates the file list underneath) and shows the cursor
-entry's info as a logical document that *follows the cursor* — and the next press
-turns it OFF by popping that mode, so the previewer reclaims the panel (the state
-before ON). Every toggle notifies the configured greeting with a `: ON` / `: OFF`
-suffix the extension appends from its own state. It owns all of this **entirely in
-its own minimal library**, with *no* feature-specific edits to core / the codec /
-the keymap. A purely-declarative (scm-only) version is not possible here: glue is
-data and cannot *compute* — reading the cursor path, `stat`-ing it, describing the
-metadata, and keeping the toggle state is code. So `exampleext` is a small
-`cdylib`:
-
-```scheme
-(extension "exampleext"
-  (lib "exampleext")
-  (keymaps ((file file     (("o" (ext "exampleext" "show-info"))))
-            (file function (("o" (ext "exampleext" "show-info"))))))
-  (options ((option "exampleext.greeting" "exampleext" text "hello" "greeting")
-            (option "exampleext.verbose"  "exampleext" bool "#f"    "verbose"))))
-```
-
-It rides only **generic ABI seams** — no feature-specific kernel surface. Its
-`wasdf_on_cursor_changed` records the path now under the cursor and, *while the
-feature is ON*, returns a `show-function-content` reply so the panel follows the
-cursor (while OFF it returns nothing). Pressing `o` dispatches
-`(ext "exampleext" "show-info")` to its `wasdf_handle_intent`, which flips an
-internal ON/OFF flag and returns a `(notify "<greeting>: ON|OFF")` plus, on ON, a
-`(push-overlay "exampleext" "info")` and a `show-function-content` reply — a
-logical `(document (field …) …)` core lays out (it `stat`s the cursor path and
-describes the metadata with `wasdf_sdk::format_size` / `format_permissions`); on
-OFF, `pop-mode` (core clears the overlay's content and the previewer reclaims the
-panel on the mode-change broadcast). Because ON focuses the function panel, `o` is
-bound on both panels so the next `o` resolves regardless of focus (the overlay
-falls through to the file bindings). The greeting reaches the library because the
-kernel hands every `handle_intent` the extension's own live option values as its
-data payload — the `wasdf_sdk::Settings` snapshot (`Settings::from_scheme_alist`)
-— so editing `greeting` under settings changes the notice with no rebuild. Deploy
-`init.scm` + `libexampleext.{so,dylib}` into `~/.config/wasdf/extensions/exampleext/`;
-its options + About appear under `@/settings/Extensions/exampleext`.
-
-> `(notify "text")`, `(push-overlay "ext" "mode")`, and `pop-mode` are generic
-> kernel intents (like `show-function-content` / `hide-function-panel`): any
-> extension can emit them; they are not tied to `exampleext`. An **overlay** mode
-> sits on the mode stack and lets unbound keys fall through to the mode beneath,
-> so the file list keeps responding while the overlay owns the panel.
-
-The named library exports these C entry points (string-based bridge — Scheme
-datums, no Rust types cross the boundary):
+The library exports these C entry points (string-based: Scheme datums cross the
+boundary, never Rust types):
 
 | Symbol | Signature | Role |
 |--------|-----------|------|
 | `wasdf_abi_version` | `() -> u32` | Must equal `wasdf_sdk::API_VERSION` exactly, else the library is skipped |
-| `wasdf_handle_intent` | `(intent, data) -> *const c_char` | Optional. Receives the intent id and a Scheme-datum payload — the intent form's own ExtensionValue when it carried one, otherwise the extension's live option snapshot as a `(("key" "value") …)` alist (read via `wasdf_sdk::Settings::from_scheme_alist`) — and returns follow-up intents as a Scheme list, decoded back into core intents |
-| `wasdf_on_cursor_changed` | `(path) -> *const c_char` | Optional. Subscribes to the cursor-changed event: receives the cursor path and returns follow-up intents (same datum form as `wasdf_handle_intent`, e.g. `show-function-content`) — reacts to cursor movement with no kernel edits |
-| `wasdf_vfs_list` | `(path) -> *const c_char` | Optional. Gives this extension its own VFS mount at `@/<id>` (no manifest field — the mount name is always the extension's id): receives the virtual path being listed and returns a Scheme list of `(dir "name" "path-segment")` / `(leaf "name" "path-segment" (ext "id" "intent" [data]))` entries |
+| `wasdf_handle_intent` | `(intent, data, options) -> *const c_char` | Optional. `data` is the intent's own ExtensionValue (`()` when it carried none); `options` is always the extension's live option snapshot as an alist (`wasdf_sdk::Settings::from_scheme_alist`). Returns follow-up intents as a Scheme list |
+| `wasdf_on_cursor_changed` | `(path) -> *const c_char` | Optional. The cursor-changed broadcast; returns follow-up intents |
+| `wasdf_vfs_list` | `(path) -> *const c_char` | Optional. The extension's own mount at `@/<id>`; returns `(dir "name" "segment")` / `(leaf "name" "segment" (ext "id" "intent" [data]))` entries |
 
-The bridge carries commands, resolver entries, **keymaps** (entry bindings into
-core modes, whose intents are typically `(ext …)` forms; `:when` is limited to
-core predicates since a dynamic extension cannot register native predicates),
-intent handling, **the cursor-changed event** (`wasdf_on_cursor_changed`),
-**overlay modes** (`(push-overlay "ext" "mode")` / `pop-mode` — an overlay sits on
-the mode stack and lets unbound keys fall through to the mode beneath), and
-**function-panel content**: a `handle_intent` (or `on_cursor_changed`) reply may
-include `(show-function-content "owner" (document BLOCK…))` — a **logical**,
-layout-free view. Each BLOCK is `(field "label" (SPAN…))`, `(line (SPAN…))`,
-`(heading (SPAN…))`, or `(rule)`, and each SPAN is `(span "text")`,
-`(span "text" (role "name"))` (themed), or `(span "text" (rgb R G B))` /
-`(rgb R G B BR BG BB)` (literal). **Core owns all layout** — label alignment, line
-wrapping / h-scroll, vertical scroll, line numbers, theming, and search highlight;
-the extension never assembles styled lines. `(update-function-view VALUE)` stores
-opaque per-extension view state (a dynamic extension can *write* it but does not
-yet *receive* it). Custom panels are not carried across the ABI. `API_VERSION` is
-0 (the initial prototype ABI): the glue lives in the `.scm` manifest, and the
-library exports only `wasdf_abi_version` plus the optional `wasdf_handle_intent` /
-`wasdf_on_cursor_changed` / `wasdf_vfs_list` handlers the manifest's intents
-route to.
+Entry points are defined through the SDK's export wrapper, which catches a
+panic inside the library and returns a null pointer. A reply of `()` and a
+null reply both mean "nothing"; a null reply is additionally recorded in
+`@/messages` (naming the extension and the entry point), so a panicking library
+is visible without being treated differently. The reply string stays valid
+until the next call into the library.
 
-Dynamic content reaches the panel via this **push** path (`show-function-content`
-from `handle_intent` or `on_cursor_changed`). Bundled extensions instead implement
-the **pull** hook `view(ctx) -> PanelView` (below); both produce the same logical
-`PanelView`, so they share one core layout path — the extension describes *what*,
-core renders. Images (`PanelView::Image`, raw RGB) stay a bundled capability since
-raw pixels do not cross the ABI; dynamic content is documents of styled spans. A
-dynamic `accept_content` (off-thread byte read for a dynamic extension) is
-deferred until a dynamic extension reads files.
+Replies may contain any core intent in datum form plus the generic ones below;
+none is specific to an extension:
 
-## Zero-Edit Principle
+| Datum | Meaning |
+|-------|---------|
+| `(show-function-content "owner" (document BLOCK…))` | set the extension's content: the loader keeps the document inside the extension's wrapper (its `view()`) and emits `ShowFunctionContent{owner}`. `owner` must be the replying extension's own id; any other is ignored with an `@/messages` line |
+| `(push-overlay "ext" "mode")` / `pop-mode` | an overlay mode lets unbound keys fall through to the mode beneath |
+| `(notify "text")` | log a line to `@/messages` |
 
-Adding *another* extension edits nothing in core, app, script, or exec.
-It does **not** forbid building the one-time generic framework that hosts
-extensions. Acceptance test: searching the tree for an extension's id outside
-its own directory matches only the bundled-extension list, and nothing else.
+Each BLOCK is `(field "label" (SPAN…))`, `(line (SPAN…))`, `(para (SPAN…))`,
+`(heading (SPAN…))`, or `(rule)`; each SPAN is `(span "text")`, `(span "text" (role "name"))`, or
+`(span "text" (rgb R G B))` / `(rgb R G B BR BG BB)`.
+
+There is one content path for every extension: core **pulls** `view()`. A
+dynamic extension sends its content in a reply; the loader's wrapper stores it
+and serves it as that extension's `view()`, so core never holds content.
+Images, interactive forms, the `Host`, native predicates, `accept_content`,
+`ext_view`, and settings nodes do not cross the ABI.
+
+`API_VERSION` is 1.
+
+`exampleext` is the reference optional extension: `o` toggles a cursor-info
+overlay (`push-overlay` + `show-function-content` that follows the cursor via
+`wasdf_on_cursor_changed`), notifying its configurable greeting on each toggle.
 
 ## Loading Rules (optional extensions)
 
 | Rule | Content |
 |------|---------|
-| Discovery | the kernel scans the extensions directory for manifests — a folder `<id>/init.scm` (its own directory, holding its library + assets) or a flat `<id>.scm`; each may name a library via `(lib …)` |
-| ABI | when a manifest names a library, it is loaded only when its API version exactly matches the kernel's; a mismatch is skipped with a warning. A manifest with no `(lib …)` loads no library (purely declarative) |
+| Discovery | the extensions directory (`$WASDF_EXTENSIONS_DIR`, else `<config>/extensions`): folders `<id>/init.scm`, or flat `<id>.scm` |
+| ABI | a named library loads only when its API version matches exactly; otherwise the extension is skipped with a warning |
 | Extension id | unique; on collision the later one is disabled with a warning |
 | Order | bundled first, then optional in manifest file-name order |
-| Reload | unsupported in the MVP |
-| Faults | initialization failure or a panic disables the extension and the application continues; out-of-process faults such as a segfault are not survivable |
-| Disable | a user option keyed by the extension id prevents loading |
+| Reload | unsupported |
+| Faults | a null reply is a no-op recorded in `@/messages`; the extension stays registered and the application continues. Load failures (missing library, ABI mismatch, malformed manifest) skip the extension with a warning. Out-of-process faults (a segfault) are not survivable |
+| Disable | the core option `extensions.disabled` (a list of ids), set by the enable toggle under `@/settings/Extensions/<id>` and persisted in `custom.scm`; it takes effect at the next start. It is read from `custom.scm` before any extension is constructed, so only the `custom` layer counts — a `config.scm` or REPL write to it is reported and has no effect on loading |
 
 ## The Extension Trait
 
-One interface (`extension::Extension`), collected once at registration. Every
-method defaults to empty/none, so an extension declares only what it provides.
+One interface, collected once at registration. Every method defaults to
+empty / none, so an extension declares only what it provides.
 
 | Group | Methods | Role |
 |-------|---------|------|
-| Declarations | id, about, commands, keymaps, scheme_source, resolver_entries, register_conditions | `about` → the name / version / description card shown under `@/settings/Extensions/<id>` (defaults to the id + app version); palette commands; native-built keymaps and entry bindings into core modes (Extension layer); a declarative Scheme source evaluated at registration (its keymap groups merge into the Extension layer — see [SCHEME.md](SCHEME.md)); resolver entries; `:when` predicates |
-| Settings | option_scheme | Declares configurable options (`(option …)` forms), tagged with the extension id → editable + persisted under `@/settings/Extensions/<id>`; read back via the shared `OptionStore` (bundled) or a `wasdf_sdk::Settings` snapshot (dynamic) |
-| Function-panel content | provides_function_content, accept_content, view | The extension is the active content provider; the kernel reads a path (Read plan) and hands the bytes/entries to `accept_content`, which decodes + stashes them inside the extension; `view(ctx) -> PanelView` returns the stash as a **logical** view (blocks + spans) that **core lays out** — the extension no longer assembles lines |
-| Intent handling | handle_intent, on_cursor_changed | `handle_intent` handles an extension intent addressed to this extension; `on_cursor_changed(&AppState)` reacts to the kernel's generic cursor-changed broadcast (every extension is called when the cursor target / panel visibility / **mode** changes). Both return the standard list of follow-up intents — the content provider returns `LoadContent` to follow the cursor; `LoadSearch{owner, root, query}` is `LoadContent`'s deep-search sibling, an owner-addressed `Plan::Search` that completes through the same `accept_content` path (CmdOp's browse-directory search — see below) |
-| VFS | vfs_providers | Contributes a `VfsProvider` for this extension's own mount — conventionally named after `id()` — added to the router after the embedded filesystem default. Bundled extensions implement `VfsProvider::list` directly in Rust (e.g. the bookmarks extension listing its saved paths); a dynamic extension gets the same capability for free by exporting `wasdf_vfs_list` (below) — no separate registration path, no core awareness of any specific extension |
+| Identity | id, about | `about` is the name / version / description card under `@/settings/Extensions/<id>` |
+| Declarations | commands, keymaps, scheme_source, option_scheme, prelude, resolver_entries, vfs_providers, register_conditions, settings_nodes | Collected once at registration. `scheme_source` is a quoted keymap-group form merged into the Extension layer; `option_scheme` declares options (including structured `record` / `map` kinds — the extension's whole configurable state); `prelude` is Scheme code loaded into the session to give users convenience procedures ([SCHEME.md](SCHEME.md), Preludes); `vfs_providers` contributes the extension's own mount (named after its id); `register_conditions` adds native `:when` predicates (they read `AppState` and the OptionStore — [SCHEME.md](SCHEME.md)); `settings_nodes` contributes `SettingsNode`s — rich subtrees anchored to a settings category or to the extension's own settings screen |
+| Host | bind | Called once after every extension is registered, with the `Host` (below) |
+| Function-panel content | provides_function_content, accept_content, view | The content provider (the lowest-priority-rank extension with `provides_function_content` — [UI.md](UI.md), Extension priority) is the initial content owner. `accept_content(source, &Content)` receives every result addressed to the extension — `Bytes` / `Dir` from a Read or an owner-addressed Search, `Value` from an Eval (`source` is the path, the search root, or empty for an evaluation). `view(ctx) -> Option<Arc<PanelView>>` is asked of the content owner only |
+| Function-panel form | render_form, form_scroll | While `form_owner` names the extension it draws directly into the panel's inner rect (a real `&mut Frame`) and returns the title — a form takes precedence over the content owner's view; `form_scroll` reports `(total rows, position)` so the form gets the ordinary scrollbar and clamp |
+| Behavior | handle_intent, on_cursor_changed, on_tick | `handle_intent` receives intents addressed to this extension; `on_cursor_changed` the generic broadcast; `on_tick` runs after every event, for out-of-band state. All return follow-up intents |
+| File list | entry_style | Per-entry style override; the lowest-priority-rank `Some` wins. Called per visible entry per frame — must be O(1) (see [ARCHITECTURE.md](ARCHITECTURE.md), Render Contract) |
 
-`FunctionRenderCtx` carries the viewport size, focus, and the function-panel view
-state (scroll, search, line numbers, `ext_view`). An extension returns a logical
-`PanelView`; core lays it out into styled lines (label alignment, h-scroll, line
-numbers, theming, search highlight) and adds the title + scroll chrome.
+Hook rules:
 
-Condition predicates are name-plus-native-function pairs registered into the
-condition evaluator; they run on the input path and must be cheap. Core
-predicates are pre-registered by the kernel; extensions add their own (for
-example, the archive extension's archive test, or preview's
-`function-searching` / `function-has-matches`) without touching core.
+- Hooks are synchronous and never block. Work that needs I/O is expressed as
+  intents that become plans (LoadContent, LoadSearch, RunResolver, …). To
+  change a configurable value — its own options included — an extension
+  returns a `Configure` intent; the store validates, persists, and updates
+  the projections. A file the extension owns goes to `Host.files`. The only exceptions are the pty extension's, listed in
+  [ARCHITECTURE.md](ARCHITECTURE.md) (Purity Contract).
+- `view()` returns the **same** `Arc` until the content changes; the Arc's
+  identity is the revision core caches layout against. Build a new Arc in
+  `accept_content` (or wherever the content changes), not in `view()`. The
+  view never depends on the viewport: wrapping, alignment, and match → row
+  mapping are core's.
+- `on_cursor_changed` fires only when the cursor signature changes;
+  `on_tick` fires on every pass and must return nothing when there is nothing
+  to say.
 
-> Future trait surface — custom panels and per-panel renderers — is not
-> implemented; today an extension renders into the **function panel** only, via
-> `view() -> PanelView` (bundled) or a pushed `PanelView` (dynamic,
-> `show-function-content`). Both are the same logical model, laid out by core.
+### Host
+
+`Host` is the kernel's handle given to bundled extensions in `bind`:
+
+| Field | Use |
+|-------|-----|
+| options | `Arc<OptionStore>` — the projection of the settings store: read options (own or, per the coupling rule, another's); observe the generation. Read-only: writes are `Configure` intents |
+| events | `Sender<AppEvent>` — wake the loop with `AppEvent::Tick` when out-of-band state changes (a reader thread) |
+| resolver | `Arc<ResolverChain>` — resolve command templates and options for a command builder |
+| theme | ThemeCell — publish the active `Theme` |
+| files | FileWriter — write-behind for a file the extension owns under the config directory |
+| extensions | the registered extensions' ids and About cards |
+| settings_nodes | the settings nodes every extension contributed |
+
+A dynamic extension has no Host; it receives its option snapshot as the
+`options` argument of every `wasdf_handle_intent` call.
+
+### Input capture
+
+An extension that needs every key (a terminal) installs an `InputCapture` via
+`SetInputCapture`:
+
+| Field | Meaning |
+|-------|---------|
+| owner | the extension receiving captured keys as `"key"` intents (data: the lossless key encoding `codec::encode_key`) |
+| release | the hard release key. Core clears the capture on it unconditionally, then sends `"prefix"` to the owner |
+| escape | intents that also end the capture: a key the keymap resolves to one of them clears the capture and the intent is dispatched normally |
+
+The escapes are data held by core, not a protocol the extension implements, so
+they work even when the extension is wedged; declaring them as intents means
+they follow the user's keymap. The `input-captured` predicate lets keymaps gate
+on a capture, and the help row renders the capture's own keys ([HELP.md](HELP.md)).
 
 ## Extension Intents and ExtensionValue
 
-Extension intents travel as data — the core Intent enum never grows. An
-extension intent carries the extension id, an intent id, and a structured
-ExtensionValue payload (Nil, Bool, Int, String, Path, List, or string-keyed
-Map, with structural accessors; no downcasting). Values are generated directly
-from Scheme expressions and consumed structurally.
+Extension intents travel as data: the extension id, an intent id, and a
+structured ExtensionValue payload (Nil, Bool, Int, String, Path, List, or
+string-keyed Map, with structural accessors; no downcasting).
 
-Two data keys are reserved and have pipeline-level meaning:
+Two data keys are reserved:
 
 | Key | Meaning |
 |-----|---------|
-| item | Filled by `Mode::InputForm`'s confirm action with the typed text ([UI.md](UI.md)) |
-| resolver (with args) | Marks the intent as a plan. It is not dispatched to the extension; the kernel executes it through the resolver chain, with Policy confirmation when the entry is destructive ([ARCHITECTURE.md](ARCHITECTURE.md)) |
+| item | Filled by `Mode::InputForm`'s confirm with the entered value ([UI.md](UI.md)) |
+| resolver | Marks the intent as a plan. It is not dispatched to the extension; the kernel executes it through the resolver chain, with Policy confirmation when required ([ARCHITECTURE.md](ARCHITECTURE.md)) |
 
-An intent without the resolver key is only dispatched to its owning extension
-and can merely return more intents; dispatch therefore terminates
-structurally, with a re-dispatch depth cap as a backstop.
+An intent without the resolver key is dispatched to its owner and can only
+return more intents; dispatch terminates structurally, with a depth cap as a
+backstop.
 
 ## Prefer Select or Input Form over Custom Modes
 
-Most extension UIs are pickers or one-line prompts. Neither needs a custom
-mode: push Select with a Static source and an on_confirm the reducer already
-knows, or — for a single line of free text (a name, a color, an option value)
-— push `Mode::InputForm`, whose confirm substitutes the typed text under the
-item key. Between the two, extensions never need PendingOp variants. Register
-a full custom mode only for UIs that are genuinely not pickers or prompts,
-such as a multi-panel dashboard.
+Most extension UIs are pickers or one-value prompts. Push Select with a Static
+source, or `Mode::InputForm` for a single value (Text / Bool / Choice / Int /
+List), whose confirm re-injects the next intent with the value under `item`.
+Register a custom mode only for UIs that are genuinely neither. A UI that must
+stay live beside the file list is a function-panel form (`SetFunctionForm` /
+`HostFunctionForm` + `render_form`).
 
 ## Rust / Scheme Split
 
-Rust is the how: trait implementation, content decode, intent handling, plan
+Rust is the how: trait implementation, decode, intent handling, plan
 construction, producing a `PanelView`. Scheme is the what and when: keymaps,
-conditions, command bindings — declared in the extension's Scheme source and
-evaluated at registration (compiled to native tables; never on the input or
-render path).
+conditions, commands, options, presets — declared as data and decoded at
+registration into native tables, never consulted on the input or render path.
+
+- Strings are read into `Datum`s only by `script::sexpr`, and intents / keys /
+  modes are encoded and decoded only by `script::codec`.
+- An extension's **own** data (presets) is interpreted from `Datum` by the
+  extension itself, inside its directory. `script` holds no
+  extension-specific decoder.
+- An extension's configurable state is its options, held in the settings
+  store like every other setting. Users change them in `config.scm` (possibly
+  per environment), at the REPL, or through the UI; the extension changes them
+  with `Configure`. Nothing but the Persister writes `custom.scm`, and
+  nothing in wasdf writes `config.scm` after the template.
+- A prelude may wrap the store procedures in friendlier ones for users
+  (theme's `define-theme` / `set-theme`); it is sugar over options, never a
+  separate configuration form.
 
 ## Function-Panel Content Model
 
-The content frame is the one place an extension renders. The flow:
-
 ```
 key ──(Extension-layer binding)──▶ Intent::Extension{owner, intent, data}
-   ▼ kernel dispatch ──▶ owner.handle_intent(...)            (sync, in extension)
-        returns: ShowFunctionContent{owner, view} | UpdateFunctionView(value)
-                 | push-overlay / pop-mode | any core intent (refresh, Select, …)
-   ▼ reducer stores into FunctionPanelState (content_owner / ext_view; visible; sublayout)
-   ▼ render: core lays out the PanelView, applying the kernel-owned view geometry
+   ▼ kernel ──▶ owner.handle_intent(...)                         (sync)
+        returns: LoadContent | ShowFunctionContent{owner} | UpdateFunctionView
+                 | push-overlay / pop-mode | any core intent
+   ▼ reducer stores view state (content_owner, ext_view, scroll, search)
+   ▼ render: core pulls content_owner's view() and lays it out in the chrome
 ```
 
-For file-backed content (the cursor-follow), the content provider returns
-`LoadContent{owner, path}` from `on_cursor_changed`; the kernel turns it into the
-generic `Plan::Read{owner, path}`; the worker reads bytes/entries off-thread;
-`Payload::Read` carries `ReadResult::{Bytes, Dir}`; the kernel hands the result
-to `owner.accept_content`, which decodes + stashes (main thread). Staleness /
-cancellation follow the standard rules (one live `content` task; the cursor-changed
-broadcast fires only on an actual change) — see [ARCHITECTURE.md](ARCHITECTURE.md).
+For file-backed content the provider returns `LoadContent{owner, path, offset}`
+from `on_cursor_changed`; the worker reads one bounded chunk; the kernel hands
+the `Content` to `owner.accept_content`, which decodes and stashes it (main
+thread) and pages further chunks by returning LoadContent with the next offset.
+A provider declines to follow the cursor into a panel it does not own
+(`form_owner` set).
 
-`PanelView` is the extension-agnostic **logical** content core lays out:
-`Document(Vec<Block>)` — where a `Block` is `Field { label, value }`,
-`Line(spans)`, `Heading(spans)`, or `Rule` — or `Image { width, height, rgb }`.
-A `TextSpan { text, style }` carries `SpanStyle::{Default, Role(name), Rgb{fg,bg}}`:
-the extension tags spans with a theme **role** (re-themes automatically) or a
-literal color (syntax highlight); it never wraps, scrolls, numbers, or aligns —
-**core owns layout**, including search-match highlight.
+**The content owner.** The panel shows exactly one extension's content:
+`FunctionPanelState.content_owner`. It starts as the content provider. It
+becomes another extension when that extension claims the panel with
+`ShowFunctionContent{owner}` or follows the cursor with its own `LoadContent`;
+it returns to the provider when that extension's overlay mode pops, or
+whenever the function panel is hidden (in any mode). A form's own reads (CmdOp's browser) do not change it —
+the form is `form_owner`, drawn through `render_form`. Content search is routed
+to the content owner, so what is searched is always what is shown.
 
-### What lives where
+`PanelView` is the logical content core lays out: `Document(Vec<Block>)` — a
+`Block` is `Field { label, value }`, `Line(spans)` (one row, h-scrolled),
+`Para(spans)` (wrapped by core at the panel width), `Heading(spans)`, `Rule`,
+or `Image` — or a whole-panel `Image { width, height, rgb }`. A `TextSpan`
+carries `SpanStyle::{Default, Role(name), Rgb{fg,bg}}` and an emphasis. The
+extension tags spans; it never wraps, scrolls, numbers, aligns, or highlights.
+
+Search matches are **logical**: `(block index, byte start, byte end)` within
+the concatenated text of that block's spans (a `Field`'s value). The
+extension's matcher runs over its own document and never needs the panel
+geometry; core maps each match to the rows its block was laid out into.
 
 | Concern | Home |
 |---------|------|
-| Panel chrome (border, title, rect), the Exec frame + its scroll | core |
-| `PanelView` vocabulary + the layout engine (label alignment, wrap/h-scroll, line numbers, theming, search highlight, image→cells) | core |
-| Storing `content_owner` + `ext_view`; routing keys; calling `view()`; off-thread **byte read** + handing bytes to the extension | core |
-| Holding the **raw bytes + decoded representation** of the content | extension (interior mutability) |
-| Decoding bytes (MIME, syntax highlight) — on the main thread in `accept_content` | extension |
-| **Describing** the content as a logical `PanelView` (blocks + role/color spans) | extension (`view()`) |
-| The search matcher; cursor-follow policy | extension |
-| Key bindings, conditions, params | extension, declared in Scheme |
+| Panel chrome, the Exec frame | core |
+| The `PanelView` layout engine (alignment, wrap / h-scroll, line numbers, theming, search highlight, image → cells) and its layout cache | core |
+| `content_owner`, `ext_view`, scroll, the search match list | core (`AppState`) |
+| A dynamic extension's replied content | the loader's wrapper for that extension (served as its `view()`) |
+| Raw bytes and the decoded representation | extension (interior mutability) |
+| Decoding, the search matcher, the cursor-follow and paging policy | extension |
+| Keys, conditions, options | extension, declared in Scheme |
 
-Core knows the `PanelView` *shape* and how to lay it out (including search
-highlight, keyed by block index); the extension owns only *what* to show and the
-search *matcher*. **Core stores no content** (no `content_cache`): only
-`content_owner` + `ext_view` + the gated match list.
+Two constraints shape the seam:
 
-### Two constraints that shape the seam
+1. **`:when` predicates read only `AppState` and the OptionStore.** State that
+   gates a key lives in AppState or is an option — hence the search match list
+   is core's (`PanelSearch`), while the matcher is the extension's. The extension computes in `handle_intent`; the
+   reducer stores via `SetSearchMatches` / `SetScroll`.
+2. **The reducer cannot call extensions.** Extension-owned behavior routes
+   through the kernel (`handle_intent`), which returns generic intents.
 
-1. **`:when` predicates read only `&AppState`.** Any state that **gates a key**
-   must live in `AppState`. `n`/`p` are gated by has-matches, so the search
-   **match list stays in `AppState`** (as generic `PanelSearch`), even though the
-   *matcher* and *navigation algorithm* are the extension's. The extension
-   computes (in `handle_intent`); the reducer stores the result via the generic
-   setter intents (`SetSearchMatches`, `SetScroll`).
-2. **The reducer can't call extensions** (`apply_intent` has no registry).
-   Extension-owned search/scroll therefore routes through the **kernel**
-   (`handle_intent`), which returns generic intents the pure reducer applies.
-
-Consequence of "core holds no content": because the closed `Payload` ferries
-only core types, only raw bytes cross the worker→main boundary; the extension
-decodes + highlights in `accept_content` on the **main thread**, bounded by the
-read limit. Off-thread decode is rejected because it would force core to hold a
-decoded `PanelView`.
+Because the closed `Payload` carries only core types, only raw bytes cross the
+worker → main boundary; decoding runs in `accept_content` on the main thread,
+bounded by the chunk size.
 
 ## Bundled Extensions
 
-**PreviewExtension** provides file preview on the function panel — the reference
-"fat" content extension. It owns everything content-specific: decoding the bytes
-the kernel reads (MIME dispatch via wasdf-sdk → text / hex / image / dir), syntax
-highlighting (syntect, keyed by file extension), the less-style search matcher
-(`extension/preview/search.rs`), and its own keybindings + `:when` predicates
-declared in `scheme_source` — both in the **function** scope (overriding the core
-Enter/Esc/n bindings by layer priority while a search is active) and in the
-**file** scope, so the preview can be searched without focusing it: `/` (when the
-preview is visible) starts the search and the reducer borrows focus to type, then
-returns it to the file panel on submit/cancel where `n`/`p` step the matches
-([UI.md](UI.md)). The decoded
-content lives **inside the extension** (interior mutability / `RefCell`): the
-kernel's Read plan fetches bytes/entries off-thread, hands them to
-`accept_content` (decode + stash, main thread), and `view()` later returns the
-stash as a logical `PanelView` — text as `Line` blocks of syntax-colored spans,
-hex/dir as plain/role-styled lines, images as `PanelView::Image`. Images use
-Chafa's symbol-rendering core (chafa-syms-rs): core turns the decoded RGB buffer
-into a grid of truecolor symbol cells at layout time.
-
-The *layout* — wrapping/h-scroll, line numbers, theming, and search-match
-highlight — is core's generic engine (`ui/middle/function.rs` + `ui/content`,
-shared by every content extension); the extension just describes the `PanelView`.
-The function panel's *view geometry* (scroll, h-scroll, line numbers) and the
-search **match list** stay kernel-owned because the panel is kernel UI
-([UI.md](UI.md)), the vertical scroll is shared with the Exec frame, and the match
-list must be in `AppState` for `:when`. The extension supplies the keys that emit
-the intents and the matcher; the kernel stores the results and paints the matches.
-
-**ArchiveExtension** is fully self-contained pack and unpack. Its Scheme source
-declares entry bindings into File mode (pack when a selection exists, unpack
-when the cursor entry is an archive) and the matching palette commands. Pack
-pushes a `Mode::InputForm` prefilled with `archive.tar.gz` for the destination
-name; unpack needs no prompt at all, building its resolver plan directly from
-the cursor entry. Either way the final intent carries the resolver key and
-executes as a plan through the chain. No custom mode, no custom handler, no
-custom panel, and no edits outside its own directory.
-
-**CmdOpExtension** is the reference **form** extension (next to Preview's
-reference **content** role): the copy/move/rename/mkdir/touch command
-builder, hosted directly in the function panel rather than any popup or
-custom mode. It owns its live state in interior mutability (a
-`RefCell<Option<Form>>`), draws itself via `render_form(&self, frame, inner,
-ctx) -> Option<String>` — a real `&mut Frame` handed to the extension, since
-bundled (statically linked) extensions can take one; the returned string
-becomes the panel's title, core still owns the border/chrome — and reads its
-browse directory through the generic `LoadContent` → `accept_content` path
-used by content extensions too. `AppState.function.form_owner` names which
-extension (if any) is hosting the panel this way; `Intent::SetFunctionForm
-(Some(id)/None)` claims/releases it (shows + focuses the panel on claim,
-returns focus to the file panel on release). A `:when` predicate reading only
-`form_owner` (`"cmdop-active"`) gates the extension's own keybindings,
-declared in its own `scheme_source` (`extension/cmdop/keymap.scm`) at the
-Extension layer in the **file function** scope — high enough priority to
-override the core "file function" scope's own bindings for the same keys
-while the form is active. Copy/move/rename deliberately keep `wasd` on the
-core file-cursor bindings even so (using `hjkl` for their own
-builder/listing navigation instead), so the sources they're building a
-command for keep following the file cursor.
-
-Its destination browser's `/` is **two-stage**, deep-then-shallow (see
-[UI.md](UI.md)'s "Deep search vs. shallow filter"): the first `/` in a freshly
-browsed directory opens a submit-only input (`purpose: "search-deep"`) and, on
-submit, emits `Intent::LoadSearch{owner: ID, root: list_cwd, query}` — a
-recursive walk of the browsed subtree, ranked the same way file-search ranks
-its results. Landing entries (`accept_content`, gated the same as any other
-content load by `list_cwd == path`) flips `Form.deep_results`, and every `/`
-after that opens today's live substring filter (`purpose: "filter"`) over
-those landed results instead of issuing another walk. Changing the browsed
-directory (`descend`/`parent`) resets `deep_results`/`awaiting_deep` and
-clears `deep_query`, so `/` goes back to deep the moment the subtree it would
-search changes. `Form.deep_query` is display-only — the title shows
-`"<op> — search: <query>"` while deep results are active — and is kept
-separate from `filter_query` on purpose: reusing one field would re-narrow
-fuzzy-ranked deep results by strict literal substring, silently hiding
-matches whose names don't contain it verbatim.
-
-Its **create** mode (`M`, combining mkdir and touch) is shaped differently:
-no destination browser, no options — every name is created directly in
-`state.cwd` — so `start_create` skips `start`'s shared setup entirely and
-opens a **multi-line** `FunctionInput` (`purpose: "create-lines"`,
-`multiline: true`) instead. `multiline` is a small generic addition to
-`Intent::BeginInput`/`FunctionInput` (not a `create`-specific hack): when
-set, Enter inserts `\n` unless the line the caret is on is already empty, in
-which case it submits — a blank line terminates the batch, the free-text
-analogue of `InputKind::List`'s row-add/row-confirm split. `create_targets`
-parses the submitted buffer once non-blank lines are extracted: a trailing
-`/` picks `mkdir -p NAME` (slash stripped), otherwise `touch NAME`; `run_
-create` emits one `Intent::RunResolver` per line (no single resolver op
-covers "one or the other, per line"). `create_preview` (the same line
-parser, so the preview can never disagree with what actually runs) drives
-the same CLI-builder area copy/move/rename use for their own resolved
-command line, so typing shows the exact `mkdir`/`touch` invocations about to
-run. The palette's `mkdir`/`touch` commands both point at `start-create`
-too — one combined flow accessible under either familiar name.
-
-**ThemeExtension**'s per-role editor is **cursor-follow**, not an explicit
-open/confirm action: landing the file cursor on a custom theme's role leaf
-(`@/settings/Display/Themes/<theme>/<role>`) calls `on_cursor_changed`, which
-seeds a `ColorEdit { theme_name, role_tok, fg_rgb, fg_nil, bg_rgb, bg_nil,
-mods, channel }` in its own `RefCell` from the role's *resolved* fg, bg, and
-three style modifiers, and hosts the panel via
-`Intent::HostFunctionForm(Some("theme"))` — the **passive** sibling of
-`SetFunctionForm` (below) that shows the panel without moving focus, so the
-file panel keeps browsing with `wasd` while `hjkl` edits whatever role is
-currently under the cursor. Moving the cursor off a role (a preset's role, a
-non-role leaf, another category) releases it the same way, mirroring how the
-content provider's own cursor-follow drops a stale preview. A role's fg, bg,
-and its style are **one setting**, edited together: every role carries both a
-foreground and a background — `Color::Reset` is "nil", literally no color, not
-merely "unset" — plus Bold/Italic/Underline. `channel` walks eleven focusable
-controls **top-to-bottom, matching what's drawn**: an "FG nil" toggle
-(`FG_NIL_CHANNEL`), fg R/G/B (`FG_CHANNEL_BASE..`), the three modifiers
-(`MOD_CHANNEL_BASE..`), a "BG nil" toggle (`BG_NIL_CHANNEL`), then bg R/G/B
-(`BG_CHANNEL_BASE..=MAX_CHANNEL`) — so there is no separate leaf per attribute
-to fall out of sync with the rest, and `j`/`k` always moves to the next
-control actually visible below the current one. A nil toggle doesn't discard
-the RGB sliders underneath it; it only decides whether they're *applied* —
-toggling nil off again restores whatever the sliders last held. Its
-`render_form` draws, in that same order: the "FG nil" row, a horizontal
-`BarChart` (fg R/G/B, the focused channel bold/underlined), three stacked
-`Name      [x]`/`Name      [ ]` modifier rows — left-padded to a fixed label
-width so every `[ ]` lines up in a column — a blank separator row, the "BG
-nil" row, a second `BarChart` (bg R/G/B), and a live one-line swatch (a
-`Paragraph` styled with the role's actual resolved `fg`/`bg`/modifiers, not a
-blank color block, so what's shown is exactly what the role will look like)
-directly into the panel's inner rect, degrading gracefully (each section only
-draws if there's room) in a short panel. Its
-own `extension/theme/keymap.scm`, gated by a `"theme-color-active"` predicate
-(`form_owner == Some("theme")`), binds `hjkl` **in the file panel's own
-scope** (not `function` — the function panel has nothing else to scroll while
-showing this editor, so repurposing those keys is the point, the same way
-`FuncUp`/`FuncDown`/`FuncLeft`/`FuncRight` already let the file panel drive
-the function panel without a focus switch, just read-only): `j`/`k` (or
-Down/Up) move the focused control, `h`/`l` (or Left/Right) step it by 1 (or
-flip the focused toggle — a checkbox has no continuous value), `H`/`L` step
-by 10 (or also flip it). **There is no confirm or cancel** — every keypress
-writes the literal `#rrggbb` (or `nil`) and every modifier flag straight
-through via `apply_role` and persists immediately; the editor never buffers a
-value the real theme doesn't already have. An edit that lands exactly back on
-`registry::default_style(role)` — the role's built-in look, `DEFAULT_BOLD_ROLES`
-included — removes the override entirely rather than storing a redundant one.
-`edit-role` (the intent a leaf's `Enter` activation still carries) calls the
-same seed-and-host logic and is kept only as an idempotent manual fallback —
-cursor-follow is the primary path.
-
-On disk, a role's whole override is always one `define-theme` line, the full
-`(role fg bg bold italic underline)` shape — `fg`/`bg` a quoted color token or
-the bare symbol `nil` for "no color" (`Color::Reset`), the three modifiers
-`#t`/`#f` — e.g. `(entry-dir "#83a598" nil #t #f #f)`. There is no
-partial/merged/standalone form the way bold alone once had: a role's whole
-look is one setting, written and parsed as one line
-(`script::config::parse_role_style_overrides` / `ThemeWriter::upsert_theme`).
-
-**Base and the nil fallback chain.** `@/settings/Display/Themes/*/base`
-(`Role::Base`) is what the whole frame is painted with before any more
-specific role draws on top (see `ui/render.rs`) — its `fg` and `bg` are the
-base pair every other role falls back onto. Unlike every other role, where
-`bg` only ever means "this role's own background", `Base`'s `bg` slot *is*
-the fallback background directly — used as-is, not borrowed from anywhere
-else, so editing it in the cursor-follow editor (fg R/G/B, bg R/G/B) needs no
-special-casing there either. Every other role's `Theme::style`
-(`core/theme.rs`'s `resolved_fg_bg`) falls back onto base wherever it's nil:
-
-- A role's own explicit (non-nil) fg or bg always wins outright.
-- A nil bg falls back to base's bg.
-- A nil fg falls back to base's bg **if** the role set its own bg (not nil) —
-  a "knockout" look, text reading in base's bg color against the role's own
-  background, like it was punched out of it. This is the replacement for the
-  old reverse-video "Negative" toggle: the same badge/chip look, built from
-  two real colors instead of a modifier.
-- Otherwise (the role's bg is nil too) a nil fg falls back to base's plain fg.
-- If the fallback itself lands on nil (base has no override of its own
-  either), the result stays nil — the terminal's own color shows through,
-  exactly as it always did.
-
-`Role::Base` terminates the chain: asking for its own style resolves straight
-to its own fg/bg, no fallback.
+| Id | What it owns | Canon |
+|----|--------------|-------|
+| preview | The reference content provider: MIME dispatch via `wasdf-sdk` (text / hex / markdown / image / directory), syntax highlight (syntect), chunk paging, the less-style search matcher, and its keys — `/` `n` `p` in both the function scope and the file scope, so content can be searched without focusing it | this section |
+| archive | Pack (an InputForm for the archive name) and unpack (a resolver plan built from the cursor entry), as resolver entries + bindings gated by native predicates. No mode, no panel | this section |
+| pty | Pseudo-terminal sessions in the function panel; implements the command-runner contract (so `cmdop.runner = "pty"` runs builder commands on a PTY) and optionally hosts the editor | [PTY.md](PTY.md) |
+| theme | Theme presets and custom themes under `@/settings/Display/Themes`, the cursor-follow role color editor, publishing the active theme into ThemeCell, and a prelude (`define-theme`, `set-theme`) | [THEME.md](THEME.md) |
+| lscolors | File-list coloring (`entry_style`) from `LS_COLORS` or a named palette | this section |
+| bookmarks | `@/bookmarks`, `B` to add, removal on a bookmark leaf, the `bookmarks` / `add-bookmark` palette commands; the list is its own file, written through `Host.files` | this section |
+| repl | `@/repl`: a Scheme REPL on the resident session, as an active function-panel form — an input line (`BeginInput`) over the evaluation history; each submit emits `Eval{owner: "repl", expr}` and the result arrives in `accept_content` as `Content::Value`. Past evaluations are listed as leaves under `@/repl`; activating one opens the REPL with that expression in the input line, ready to edit and re-run. The `repl` palette command opens it | [SCHEME.md](SCHEME.md), The REPL |
+| settings | `@/settings`: every declared option as an editable leaf (showing which layer its value comes from, with reset), extension screens with About cards, hosting the contributed `SettingsNode`s (handing each its base path), key rebinding; every edit is a `Configure` intent; the `settings` palette command | this section |
 
 ## Registration
 
-At boot the kernel, for each extension, merges its `keymaps()` and its
-`scheme_source` keymap groups into the Extension layer (collision detection +
-user override), appends its palette commands, resolver entries, and VFS
-providers, and registers its `:when` predicates; then
-`ExtensionRegistry::register` stores the extension.
-The active **content provider** (first `provides_function_content`) receives
-cursor-follow Read results via `accept_content` and is asked for its `view()`
-when the function panel draws. Extension dispatch in the pipeline routes
-extension intents to their owner by id.
+At boot every extension — bundled and optional alike — goes through one
+registration path: its native `keymaps()` and `scheme_source` groups merge into
+the Extension layer (collision detection + user override); its commands,
+resolver entries, VFS providers, conditions, and settings nodes are collected;
+then it is stored in the ExtensionRegistry. After the user layer is applied and
+the resolver chain is finalized, every extension receives `bind(&Host)`.
+Extension dispatch routes extension intents to their owner by id.

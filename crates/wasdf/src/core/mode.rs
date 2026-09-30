@@ -104,6 +104,8 @@ pub struct InputFormSpec {
     /// existing `*-apply` handler needs no changes. Nothing is emitted before
     /// confirm; there is no live-apply.
     pub template: ExtensionIntent,
+    /// What this form's input is for; see [`SelectSpec::input_hint`].
+    pub input_hint: Option<String>,
 }
 
 impl InputFormSpec {
@@ -118,6 +120,7 @@ impl InputFormSpec {
             initial: initial.unwrap_or_default(),
             kind: InputKind::Text,
             template,
+            input_hint: Some("type value".into()),
         }
     }
 
@@ -128,7 +131,13 @@ impl InputFormSpec {
         kind: InputKind,
         initial: impl Into<String>,
     ) -> Self {
-        InputFormSpec { title: title.into(), initial: initial.into(), kind, template }
+        InputFormSpec {
+            title: title.into(),
+            initial: initial.into(),
+            kind,
+            template,
+            input_hint: Some("type value".into()),
+        }
     }
 }
 
@@ -235,6 +244,10 @@ pub struct SelectSpec {
     /// The resolved command-line skeleton for the Command panel; empty for every
     /// non-command Select. Filled from the resolver chain at push time.
     pub command_line: Vec<CmdToken>,
+    /// What this Select's input is *for*, shown keyless at the head of the help
+    /// row ("type to filter", "type argument"). It describes the mode, not a
+    /// key, so the mode that opens the input owns it (doc/HELP.md).
+    pub input_hint: Option<String>,
 }
 
 impl SelectSpec {
@@ -248,6 +261,7 @@ impl SelectSpec {
             initial_query: None,
             function_hint: Some(FunctionHint::DirListing),
             command_line: Vec::new(),
+            input_hint: Some("type to filter".into()),
         }
     }
 
@@ -264,6 +278,7 @@ impl SelectSpec {
             initial_query: None,
             function_hint: Some(FunctionHint::DirListing),
             command_line: Vec::new(),
+            input_hint: Some("type to filter".into()),
         }
     }
 
@@ -277,6 +292,7 @@ impl SelectSpec {
             initial_query: None,
             function_hint: None,
             command_line: Vec::new(),
+            input_hint: Some("type to filter".into()),
         }
     }
 
@@ -299,6 +315,7 @@ impl SelectSpec {
             function_hint: Some(FunctionHint::CommandSummary),
             // Filled at push time by the reducer from the resolver chain.
             command_line: Vec::new(),
+            input_hint: Some("type argument".into()),
         }
     }
 }

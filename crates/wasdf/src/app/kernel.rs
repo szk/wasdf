@@ -4,21 +4,22 @@
 //! contains no intent-specific branches beyond the two structural gates the
 //! spec names (extension resolver key, destructive → Policy).
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use crate::core::{
-    self, AppEvent, AppState, AsyncResult, AsyncStatus, ExtensionValue, Intent, Key, KeyCode, Mode,
-    OptionDef, OptionStore, Payload, Plan, Purpose, ResolverRequest, KEY_RESOLVER,
+    self, AppEvent, AppState, AsyncResult, AsyncStatus, ExtensionIntent, ExtensionValue, InputCapture,
+    Intent, Key, KeyCode, Mode, OptionDef, OptionStore, Payload, Plan, Purpose, ResolverRequest,
+    KEY_RESOLVER,
 };
+use super::defaults;
 use crate::extension::{self, Extension, ExtensionRegistry};
 use crate::runtime::TaskManager;
-use crate::script::condition::{Cond, Conditions};
-use crate::script::keymap::{Binding, KeymapRegistry, Layer};
-use crate::services::command::CommandDef;
-use crate::services::resolver::ResolverEntry;
-use crate::services::{CommandRegistry, MatcherConfig, ResolverChain, SkimMatcher};
+use crate::script::codec;
+use crate::script::condition::Conditions;
+use crate::script::keymap::KeymapRegistry;
+use crate::services::{CommandRegistry, ResolverChain, SkimMatcher};
 use crate::ui::UiManager;
 
 const REDISPATCH_CAP: u32 = 32;
@@ -33,8 +34,28 @@ pub struct App {
     pub tasks: TaskManager,
     pub ui: UiManager,
     pub scheme: Arc<crate::script::SchemeSession>,
-    /// The unified option store: all options (core + extensions) keyed by name.
+    /// The unified option store: all options (core + extensions) keyed by name —
+    /// the projection of the settings store's options.
     pub store: Arc<OptionStore>,
+    /// The settings store (in the Scheme session): the source of truth the
+    /// projections follow (doc/SCHEME.md).
+    pub settings: Arc<crate::script::store::Store>,
+    /// The user's bindings and commands as the store holds them; the keymap's
+    /// User layer and the user palette commands are built from it.
+    pub user_layer: crate::script::projection::UserLayer,
+    /// The core and extension palette commands; the user's are added on top
+    /// whenever the store's commands change.
+    base_commands: CommandRegistry,
+    /// Writes custom.scm when settings change.
+    persister: crate::services::persister::Persister,
+    /// The extensions (not CmdOp) in registration order — the base the
+    /// `extensions` display order ranks against.
+    registered: Vec<String>,
+    /// The extension list the settings screens show, kept in priority order.
+    ext_infos: extension::settings::ExtInfos,
+    /// The layouts render lays the frame out by: the core ones, replaced by
+    /// the user's.
+    pub layouts: crate::ui::layout::Layouts,
     pub vfs: Arc<crate::vfs::Vfs>,
     pub rx: Receiver<AppEvent>,
     pub tx: Sender<AppEvent>,
@@ -65,35 +86,27 @@ impl App {
 
         // Spawn the resident Scheme session first (pillar #3). Wait briefly for
         // it to be ready: the steel engine loads its stdlib on the dedicated
-        // thread and signals readiness. If it is not ready in time, fall back to
-        // native defaults so boot never freezes.
+        // thread and signals readiness. If it is not ready in time, the user's
+        // settings take the fallback path so boot never freezes.
         let scheme = crate::script::SchemeSession::spawn();
-        let scheme_ready = scheme.wait_ready(Duration::from_secs(3));
+        // custom.scm is data as well as a store program: two of its values are
+        // needed before anything else — how long to wait for the session, and
+        // which extensions not to load — so it is read here with the reader.
+        let custom_text = read_config_file("custom.scm");
+        let early = EarlySettings::from_custom(custom_text.as_deref());
+        let scheme_ready = scheme.wait_ready(Duration::from_millis(early.boot_timeout_ms));
 
-        // Keymaps, commands, and resolvers are sourced from embedded Scheme,
-        // evaluated by the session (Role 1), or native defaults if not ready.
+        // The embedded defaults are data, read without the session.
         let mut keymap = KeymapRegistry::new();
-        keymap.extend(if scheme_ready {
-            scheme_keymaps(&scheme)
-        } else {
-            crate::script::keymap::defaults()
-        });
+        keymap.extend(defaults::keymap());
 
         let mut conditions = Conditions::default();
 
         let mut commands = CommandRegistry::new();
-        commands.extend(if scheme_ready {
-            scheme_commands(&scheme)
-        } else {
-            crate::services::command::defaults()
-        });
+        commands.extend(defaults::commands());
 
         let mut resolver = ResolverChain::new();
-        resolver.extend(if scheme_ready {
-            scheme_resolvers(&scheme)
-        } else {
-            crate::services::resolver::defaults()
-        });
+        resolver.extend(defaults::resolvers());
 
         // Build the VFS: the embedded filesystem default, then extensions (each
         // contributes its own mount via `vfs_providers()`). The settings provider
@@ -104,51 +117,25 @@ impl App {
         // ── OptionStore ────────────────────────────────────────────────────────
         // Collect option defs from core + all extensions before registering, so
         // the store is built once with all defs (first-wins on duplicate keys).
-        let bundled_exts = extension::bundled(config_dir());
-        let optional_exts = load_optional_extensions();
+        let bundled_exts = early.without_disabled(extension::bundled(config_dir()));
+        let optional_exts = early.without_disabled(load_optional_extensions());
 
-        let mut all_option_defs = scheme_core_option_defs(&scheme, scheme_ready);
-        for ext in &bundled_exts {
-            all_option_defs.extend(extension_option_defs(&scheme, scheme_ready, ext.as_ref()));
-        }
-        for ext in &optional_exts {
-            all_option_defs.extend(extension_option_defs(&scheme, scheme_ready, ext.as_ref()));
+        // The theme registry is shared with the frame, so the theme extension is
+        // built here rather than in `bundled()`; its options are collected with
+        // everyone else's below.
+        let theme_registry: Arc<RwLock<extension::theme::ThemeRegistry>> =
+            Arc::new(RwLock::new(extension::theme::ThemeRegistry::bundled()));
+        let theme_ext = extension::theme::ThemeExtension::new(theme_registry.clone());
+
+        let mut all_option_defs = defaults::core_options();
+        all_option_defs.extend(defaults::extension_options(&theme_ext));
+        for ext in bundled_exts.iter().chain(&optional_exts) {
+            all_option_defs.extend(defaults::extension_options(ext.as_ref()));
         }
         let store: Arc<OptionStore> = Arc::new(OptionStore::new(all_option_defs));
+        conditions.bind_options(store.clone());
 
-        // Build the typed MatcherConfig from store defaults; SettingsExtension
-        // and TaskManager share the same Arc so live edits propagate without restart.
-        let matcher_cfg: Arc<Mutex<MatcherConfig>> = Arc::new(Mutex::new(MatcherConfig {
-            tail_bonus: store.get_i64("matcher.tail-bonus"),
-            depth_penalty: store.get_i64("matcher.depth-penalty"),
-            length_penalty: store.get_i64("matcher.length-penalty"),
-            exec_bonus: store.get_i64("matcher.exec-bonus"),
-            preferred_ext: store.get_list("matcher.preferred-ext"),
-            noise_ext: store.get_list("matcher.noise-ext"),
-            noise_dirs: store.get_list("matcher.noise-dirs"),
-            max_results: store.get_u32("matcher.max-results") as usize,
-        }));
 
-        // ── ThemeRegistry ──────────────────────────────────────────────────────
-        // Parse the bundled presets and build the registry. `ThemeExtension` is
-        // constructed before `SettingsExtension` so its `settings_nodes()` can be
-        // collected and passed into the settings constructor (plan §11, choice (b)).
-        let theme_presets = {
-            let datum = crate::script::sexpr::parse(extension::theme::PRESETS_SCHEME)
-                .unwrap_or(crate::script::sexpr::Datum::List(vec![]));
-            let inner = datum.as_list()
-                .and_then(|l| l.get(1))
-                .cloned()
-                .unwrap_or(crate::script::sexpr::Datum::List(vec![]));
-            crate::script::config::parse_theme_config(&inner)
-        };
-        let theme_registry: Arc<RwLock<extension::theme::ThemeRegistry>> =
-            Arc::new(RwLock::new(extension::theme::ThemeRegistry::with_presets(theme_presets)));
-
-        let theme_ext = extension::theme::ThemeExtension::new(
-            theme_registry.clone(),
-            config_dir().map(|d| d.join("config.scm")),
-        );
 
         // Collect SettingsNode contributions from theme_ext and every bundled
         // extension (e.g. lscolors' Themes, grafted onto its own screen) before
@@ -166,22 +153,26 @@ impl App {
         // The full extension list (id + About) is known only after every extension
         // is registered, so the settings provider reads it through this shared
         // OnceLock, which the kernel fills at the end of construction.
-        let ext_infos: extension::settings::ExtInfos = Arc::new(std::sync::OnceLock::new());
+        let ext_infos: extension::settings::ExtInfos = Arc::default();
 
         let settings_ext = extension::settings::SettingsExtension::new(
             store.clone(),
-            matcher_cfg.clone(),
             settings_nodes,
-            config_dir().map(|d| d.join("config.scm")),
             ext_infos.clone(),
         );
 
+        // CmdOp is built in: registered first and never disabled. Its keys and
+        // commands are in the core sources; it learns the registered extension
+        // ids at the end of construction (for `cmdop.runner`).
+        let extension_ids: Arc<std::sync::OnceLock<Vec<String>>> = Arc::default();
+        let mut extensions = ExtensionRegistry::new();
+        extensions.register(Box::new(super::cmdop::CmdOp::new(extension_ids.clone())));
+
         // Register bundled extensions: keymaps, commands, resolver entries,
         // conditions. The only place bundled extensions are named is the facade.
-        let mut extensions = ExtensionRegistry::new();
         for ext in bundled_exts {
-            keymap.extend(ext.keymaps());
-            keymap.extend(extension_scheme_keymaps(&scheme, scheme_ready, ext.as_ref()));
+            keymap.extend_owned(ext.id(), ext.keymaps());
+            keymap.extend_owned(ext.id(), defaults::extension_keymap(ext.as_ref()));
             commands.extend(ext.commands());
             resolver.extend(ext.resolver_entries());
             vfs.extend(ext.vfs_providers());
@@ -202,8 +193,8 @@ impl App {
             store.clone(),
         )) as Box<dyn crate::vfs::VfsProvider>]);
         extensions.register(Box::new(settings_ext));
-        keymap.extend(theme_ext.keymaps());
-        keymap.extend(extension_scheme_keymaps(&scheme, scheme_ready, &theme_ext));
+        keymap.extend_owned(theme_ext.id(), theme_ext.keymaps());
+        keymap.extend_owned(theme_ext.id(), defaults::extension_keymap(&theme_ext));
         commands.extend(theme_ext.commands());
         resolver.extend(theme_ext.resolver_entries());
         theme_ext.register_conditions(&mut conditions);
@@ -218,8 +209,8 @@ impl App {
                 crate::services::messages::log(format!("optional extension id collides ({}); disabled", ext.id()), true);
                 continue;
             }
-            keymap.extend(ext.keymaps());
-            keymap.extend(extension_scheme_keymaps(&scheme, scheme_ready, ext.as_ref()));
+            keymap.extend_owned(ext.id(), ext.keymaps());
+            keymap.extend_owned(ext.id(), defaults::extension_keymap(ext.as_ref()));
             commands.extend(ext.commands());
             resolver.extend(ext.resolver_entries());
             vfs.extend(ext.vfs_providers());
@@ -227,29 +218,75 @@ impl App {
             extensions.register(ext);
         }
 
-        // Give every extension the store so they can read their own options.
+        // Give every extension the store so they can read their own options,
+        // and a way to wake the loop for those that own an I/O source of their
+        // own (a PTY reader thread has nobody else to announce it).
         for ext in extensions.iter() {
             ext.bind_store(&store);
+            ext.bind_events(tx.clone());
         }
 
         // Publish the full extension list (id + About) to the settings provider so
         // @/settings/Extensions can list every extension and its About card.
-        let _ = ext_infos.set(
-            extensions
-                .iter()
-                .map(|e| extension::settings::ExtInfo { id: e.id().to_string(), about: e.about() })
-                .collect(),
-        );
+        // CmdOp rides the extension registry for its form seam, but it is part
+        // of the kernel: not listed as an extension, not a runner candidate.
+        let real_extensions = || extensions.iter().filter(|e| e.id() != "cmdop");
+        let registered: Vec<String> = real_extensions().map(|e| e.id().to_string()).collect();
+        let _ = extension_ids.set(registered.clone());
 
-        // User layer last: apply to store (warns on invalid values for known keys);
-        // then project any matcher.* changes into the shared MatcherConfig.
-        if scheme_ready {
-            let (user_binds, user_opts) = scheme_user_config(&scheme, &store);
-            keymap.extend(user_binds);
-            for (k, v) in &user_opts {
-                apply_option(&store, k, v);
+        // The user's settings last: build the settings store (config.scm, then
+        // custom.scm) and project it — options into the OptionStore, bindings
+        // and commands into the User layer.
+        let settings = Arc::new(crate::script::store::Store::new(scheme.clone()));
+        let mut user_layer = crate::script::projection::UserLayer::default();
+        let config_text = read_or_create_config(&store);
+        let preludes: Vec<(String, String)> =
+            extensions.iter().filter_map(|e| e.prelude().map(|p| (e.id().to_string(), p))).collect();
+        let custom_loaded = load_user_settings(
+            &settings,
+            scheme_ready,
+            &store,
+            &preludes,
+            config_text.as_deref(),
+            custom_text.as_deref(),
+            &mut user_layer,
+        );
+        let (user_binds, problems) = user_layer.bindings();
+        keymap.extend(user_binds);
+        let base_commands = commands.clone();
+        let (user_commands, more) = user_layer.commands();
+        commands.extend(user_commands);
+        for p in problems.into_iter().chain(more) {
+            crate::services::messages::log(p, true);
+        }
+        // A custom.scm that did not load cleanly is never overwritten this
+        // session: the user's file is what they have to fix.
+        let custom_path = if custom_loaded { config_dir().map(|d| d.join("custom.scm")) } else { None };
+        if !custom_loaded {
+            crate::services::messages::log("custom.scm had errors; settings changed now are not saved this session", true);
+        }
+        let persister = crate::services::persister::Persister::spawn(
+            settings.clone(),
+            if cfg!(test) { None } else { custom_path },
+            custom_text.clone(),
+        );
+        // An old-format config.scm has just been loaded through the bridge;
+        // migrate it once, so the next start reads a program and a custom.scm.
+        if !cfg!(test)
+            && let Some(text) = config_text.as_deref()
+            && crate::script::user_config::is_legacy(text)
+            && let Some(dir) = config_dir()
+        {
+            match crate::script::user_config::migrate(&dir, text, &store, defaults::KEYMAP_SCHEME) {
+                Ok(kept) => {
+                    crate::services::messages::log(
+                        format!("config.scm migrated to the new format; the old file is kept as {kept}"),
+                        false,
+                    );
+                    persister.wake(); // the old managed block, now in the custom layer
+                }
+                Err(e) => crate::services::messages::log(format!("config.scm migration failed ({e}); it stays in the old format"), true),
             }
-            project_matcher(&store, &matcher_cfg);
         }
         // Apply the message-log cap now that the user's value (if any) is in
         // the store; MessagesProvider re-reads it on every @/messages listing,
@@ -273,9 +310,9 @@ impl App {
             tx.clone(),
             resolver.clone(),
             matcher,
-            Some(scheme.clone()),
+            Some(settings.clone()),
             vfs.clone(),
-            matcher_cfg.clone(),
+            store.clone(),
         );
 
         let state = AppState::new(cwd.clone());
@@ -292,6 +329,13 @@ impl App {
             ui,
             scheme,
             store,
+            settings,
+            user_layer,
+            base_commands,
+            persister,
+            registered,
+            ext_infos,
+            layouts: crate::ui::layout::Layouts::new(defaults::layouts()),
             vfs,
             rx,
             tx,
@@ -301,6 +345,8 @@ impl App {
             msg_seen,
             option_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
+        app.apply_orders();
+        app.apply_layouts();
         // Initial listing.
         app.spawn_plan(Plan::ReadDir { path: cwd, show_hidden: false });
         app
@@ -309,6 +355,11 @@ impl App {
     /// Handle one key: resolve to an intent, or deliver a RawKeyEvent in
     /// Select / InputForm (the popup text-entry dialog).
     pub fn handle_key(&mut self, key: Key) {
+        if let Some(cap) = self.state.input_capture.clone() {
+            self.handle_captured_key(&cap, key);
+            self.broadcast_cursor_changed();
+            return;
+        }
         // While the function-panel search input is open, keys edit the query — except
         // Enter (submit) and Esc (cancel), which still resolve via the keymap.
         if self.state.function.search.input_active
@@ -338,8 +389,57 @@ impl App {
         self.broadcast_cursor_changed();
     }
 
+    /// One key while an [`InputCapture`] is installed. The keymap is bypassed
+    /// for everything except the two escapes core itself owns, so a terminal
+    /// (or anything else driving a child keystroke-by-keystroke) sees `q`,
+    /// `Ctrl-C` and the arrows unchanged.
+    fn handle_captured_key(&mut self, cap: &InputCapture, key: Key) {
+        // The hard release, first and unconditional: this is the only thing
+        // standing between a wedged extension and a user who cannot quit, so
+        // it must not depend on the extension answering the "prefix" that
+        // follows — or on it being reachable at all.
+        if key == cap.release {
+            self.dispatch(Intent::SetInputCapture(None));
+            self.dispatch(Intent::Extension(ExtensionIntent {
+                extension: cap.owner.clone(),
+                intent: "prefix".into(),
+                data: ExtensionValue::Nil,
+            }));
+            return;
+        }
+        // Intent escapes: resolve exactly as an uncaptured key would, and if
+        // the user pressed something that *means* "move the cursor", release
+        // and let it mean that. Releasing and dispatching here — rather than
+        // handing the extension the job of replaying the key — is what keeps
+        // the two in the right order without any dispatch-ordering subtlety.
+        if !cap.escape.is_empty() {
+            let panel = self.state.focused_panel.clone();
+            if let Some(intent) = self.keymap.resolve(&self.conditions, &self.state, &panel, key)
+                && cap.escape.contains(&intent)
+            {
+                self.dispatch(Intent::SetInputCapture(None));
+                self.dispatch(intent);
+                return;
+            }
+        }
+        self.dispatch(Intent::Extension(ExtensionIntent {
+            extension: cap.owner.clone(),
+            intent: "key".into(),
+            data: codec::encode_key(key),
+        }));
+    }
+
     /// Handle an async completion: drop stale (mode-bound) results, then reduce.
     pub fn handle_async(&mut self, result: AsyncResult) {
+        // A settings-store evaluation (a Configure, a REPL line) — successful or
+        // not — may have changed entries: follow them in the projections first.
+        if let Payload::Scheme { changes, owner, value } = &result.payload {
+            let changes = changes.clone();
+            self.apply_settings_changes(&changes);
+            if let Some(ext) = owner.as_deref().and_then(|o| self.extensions.find(o)) {
+                ext.accept_content(std::path::Path::new(""), &core::Content::Value(value.clone()));
+            }
+        }
         // Content reads are handed to the owning extension (which decodes +
         // stashes); they do not flow through the pure reducer.
         if result.purpose == Purpose::Content {
@@ -381,6 +481,81 @@ impl App {
         self.broadcast_cursor_changed();
     }
 
+    /// Fold a store change set into the projections: options into the
+    /// OptionStore, bindings and commands into the User layer (rebuilding the
+    /// keymap layer and the palette when they changed), then let the
+    /// Persister write custom.scm. A virtual listing (the settings tree shows
+    /// option values) is refreshed so it shows the new values.
+    fn apply_settings_changes(&mut self, printed: &str) {
+        use crate::script::store::Section;
+        let changes = match crate::script::store::parse_changes(printed) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::services::messages::log(format!("settings store: change set unreadable ({e})"), true);
+                return;
+            }
+        };
+        if changes.is_empty() {
+            return;
+        }
+        for p in crate::script::projection::apply_options(&changes, &self.store) {
+            crate::services::messages::log(p, true);
+        }
+        self.user_layer.absorb(&changes);
+        if changes.iter().any(|c| c.section == Section::Binding) {
+            let (binds, problems) = self.user_layer.bindings();
+            for w in self.keymap.replace_user_layer(binds) {
+                crate::services::messages::log(format!("warning: {w}"), true);
+            }
+            for p in problems {
+                crate::services::messages::log(p, true);
+            }
+        }
+        if changes.iter().any(|c| c.section == Section::Command) {
+            let (user_commands, problems) = self.user_layer.commands();
+            let mut commands = self.base_commands.clone();
+            commands.extend(user_commands);
+            self.commands = commands;
+            for p in problems {
+                crate::services::messages::log(p, true);
+            }
+        }
+        if changes.iter().any(|c| c.section == Section::Order) {
+            self.apply_orders();
+        }
+        if changes.iter().any(|c| c.section == Section::Layout) {
+            self.apply_layouts();
+        }
+        self.persister.wake();
+        if crate::vfs::is_virtual(&self.state.cwd) {
+            self.dispatch(Intent::Refresh);
+        }
+    }
+
+    fn apply_layouts(&mut self) {
+        let (user, problems) = self.user_layer.layouts();
+        self.layouts.set_user(user);
+        for p in problems {
+            crate::services::messages::log(p, true);
+        }
+    }
+
+    /// Project the store's display orders: extension priority (the registry,
+    /// the Extension keymap layer, the settings list) and the help-row order.
+    fn apply_orders(&mut self) {
+        let ranked = extension::registry::rank(&self.registered, &self.user_layer.order("extensions"));
+        self.extensions.set_order(&ranked);
+        self.keymap.set_extension_order(&ranked);
+        self.keymap.set_help_order(self.user_layer.order("help"));
+        if let Ok(mut infos) = self.ext_infos.write() {
+            *infos = ranked
+                .iter()
+                .filter_map(|id| self.extensions.find(id))
+                .map(|e| extension::settings::ExtInfo { id: e.id().to_string(), about: e.about() })
+                .collect();
+        }
+    }
+
     /// The cursor identity for the broadcast gate: what's under the cursor (the
     /// File-mode entry, or the file-search candidate) and whether the function
     /// panel is open. Generic — it carries no extension-specific notion.
@@ -409,9 +584,39 @@ impl App {
             return;
         }
         self.last_cursor = sig;
+        let had_form = self.state.function.form_owner.is_some();
+        self.notify_cursor_subscribers();
+        // A subscriber may have handed the function panel back — a hosted
+        // terminal stepping aside when the user moves the file cursor. Everyone
+        // else already answered while it still owned the panel, and a content
+        // provider declines to follow the cursor into a panel it does not own,
+        // so they get one more pass. Exactly one: the panel cannot be handed
+        // back twice, so this cannot recurse.
+        if had_form && self.state.function.form_owner.is_none() {
+            self.notify_cursor_subscribers();
+        }
+    }
+
+    fn notify_cursor_subscribers(&mut self) {
         let intents: Vec<Intent> = {
             let state = &self.state;
-            self.extensions.iter().flat_map(|e| e.on_cursor_changed(state)).collect()
+            // Highest priority last, so its intents are the ones that stick.
+            let exts: Vec<_> = self.extensions.iter().collect();
+            exts.into_iter().rev().flat_map(|e| e.on_cursor_changed(state)).collect()
+        };
+        for i in intents {
+            self.dispatch_depth(i, false, 0);
+        }
+    }
+
+    /// Give every extension a chance to turn out-of-band state into intents,
+    /// once per event-loop pass. Unlike `broadcast_cursor_changed` this is not
+    /// deduplicated — that is the whole point, since what it exists to catch
+    /// (a child exiting on its own thread) leaves no trace in `AppState`.
+    pub fn tick(&mut self) {
+        let intents: Vec<Intent> = {
+            let state = &self.state;
+            self.extensions.iter().flat_map(|e| e.on_tick(state)).collect()
         };
         for i in intents {
             self.dispatch_depth(i, false, 0);
@@ -644,163 +849,6 @@ fn resolver_request(data: &ExtensionValue) -> Option<ResolverRequest> {
     Some(ResolverRequest { op, src, dst, path, paths, opts, label })
 }
 
-/// The embedded core option declarations; evaluated by the session (or parsed
-/// directly when the session is not yet ready) to seed the `OptionStore`.
-const CORE_OPTIONS_SCHEME: &str = include_str!("options.scm");
-
-/// The embedded default resolver schema, in Scheme. Evaluated by the session so
-/// Scheme is genuinely the source of truth for this configuration.
-const RESOLVER_SCHEME: &str = include_str!("resolver.scm");
-
-/// Eval a config Scheme const through the session, parse it into the registry
-/// type, and fall back to the native embedded defaults on any eval or parse
-/// failure (disable, notify, continue). The single shape shared by every
-/// `scheme_*` config source below.
-fn scheme_config<T>(
-    session: &crate::script::SchemeSession,
-    src: &str,
-    label: &str,
-    parse: impl FnOnce(&crate::script::sexpr::Datum) -> Result<Vec<T>, String>,
-    fallback: impl FnOnce() -> Vec<T>,
-) -> Vec<T> {
-    session
-        .eval(src)
-        .and_then(|printed| crate::script::sexpr::parse(&printed))
-        .and_then(|datum| parse(&datum))
-        .unwrap_or_else(|e| {
-            crate::services::messages::log(format!("scheme {label} config failed ({e}); using embedded defaults"), true);
-            fallback()
-        })
-}
-
-/// Source resolver entries from Scheme via the session; fall back to the native
-/// embedded defaults on any eval or parse failure.
-fn scheme_resolvers(session: &crate::script::SchemeSession) -> Vec<ResolverEntry> {
-    scheme_config(
-        session,
-        RESOLVER_SCHEME,
-        "resolver",
-        |d| crate::script::config::parse_resolver_config(d),
-        crate::services::resolver::defaults,
-    )
-}
-
-
-/// The embedded default command palette, in Scheme: (name description intent).
-const COMMAND_SCHEME: &str = include_str!("command.scm");
-
-/// Source palette commands from Scheme via the session; fall back to defaults.
-fn scheme_commands(session: &crate::script::SchemeSession) -> Vec<CommandDef> {
-    scheme_config(
-        session,
-        COMMAND_SCHEME,
-        "command",
-        |d| crate::script::config::parse_command_config(d),
-        crate::services::command::defaults,
-    )
-}
-
-/// The embedded default keymap, in Scheme. Each group is
-/// (mode panel-or-#f (binding...)); each binding is (key intent) or
-/// (key intent when). This is the core layer only; extensions add their own.
-const KEYMAP_SCHEME: &str = include_str!("keymap.scm");
-
-/// Source the core keymap from Scheme via the session; fall back to defaults.
-fn scheme_keymaps(session: &crate::script::SchemeSession) -> Vec<Binding> {
-    scheme_config(
-        session,
-        KEYMAP_SCHEME,
-        "keymap",
-        |d| crate::script::config::parse_keymap_config(d, Layer::Core),
-        crate::script::keymap::defaults,
-    )
-}
-
-/// Shared dual-path Scheme evaluator: when the session is ready, evaluate `src`
-/// through it and re-parse the printed result; otherwise parse the quoted literal
-/// directly and unwrap the inner datum. Both paths return a `Datum` ready for a
-/// config parser. `kind_desc` names the source for error messages.
-fn eval_quoted_scheme(
-    session: &crate::script::SchemeSession,
-    ready: bool,
-    src: &str,
-    kind_desc: &str,
-) -> Result<crate::script::sexpr::Datum, String> {
-    if ready {
-        session.eval(src).and_then(|p| crate::script::sexpr::parse(&p))
-    } else {
-        crate::script::sexpr::parse(src).and_then(|d| {
-            d.as_list()
-                .and_then(|l| l.get(1).cloned())
-                .ok_or_else(|| format!("{kind_desc} is not a (quote …) form"))
-        })
-    }
-}
-
-/// Parse the core option declarations (`options.scm`) into `OptionDef`s.
-fn scheme_core_option_defs(
-    session: &crate::script::SchemeSession,
-    ready: bool,
-) -> Vec<OptionDef> {
-    match eval_quoted_scheme(session, ready, CORE_OPTIONS_SCHEME, "core options source")
-        .and_then(|d| crate::script::config::parse_option_config(&d))
-    {
-        Ok(defs) => defs,
-        Err(e) => {
-            crate::services::messages::log(format!("core option defs failed ({e}); no options registered"), true);
-            Vec::new()
-        }
-    }
-}
-
-/// Parse an extension's `option_scheme()` into `OptionDef`s.
-fn extension_option_defs(
-    session: &crate::script::SchemeSession,
-    ready: bool,
-    ext: &dyn crate::extension::Extension,
-) -> Vec<OptionDef> {
-    let Some(src) = ext.option_scheme() else {
-        return Vec::new();
-    };
-    match eval_quoted_scheme(session, ready, &src, "extension option source")
-        .and_then(|d| crate::script::config::parse_option_config(&d))
-    {
-        Ok(mut defs) => {
-            // Tag each def with its owning extension so settings groups them under
-            // @/settings/Extensions/<id> rather than as a flat category.
-            for d in &mut defs {
-                d.owner = Some(ext.id().to_string());
-            }
-            defs
-        }
-        Err(e) => {
-            crate::services::messages::log(format!("extension '{}' option defs failed ({e}); ignoring", ext.id()), true);
-            Vec::new()
-        }
-    }
-}
-
-/// Evaluate an extension's declarative Scheme source into Extension-layer keymap
-/// bindings. The source is `(quote ((mode panel (binding…)) …))`.
-fn extension_scheme_keymaps(
-    session: &crate::script::SchemeSession,
-    ready: bool,
-    ext: &dyn crate::extension::Extension,
-) -> Vec<Binding> {
-    let Some(src) = ext.scheme_source() else {
-        return Vec::new();
-    };
-    match eval_quoted_scheme(session, ready, &src, "extension scheme source")
-        .and_then(|d| crate::script::config::parse_keymap_config(&d, Layer::Extension))
-    {
-        Ok(binds) => binds,
-        Err(e) => {
-            crate::services::messages::log(format!("extension '{}' scheme keymap failed ({e}); ignoring", ext.id()), true);
-            Vec::new()
-        }
-    }
-}
-
 /// Load optional extensions from the extensions directory. Skipped in tests
 /// (the loader's glue parsing is covered directly).
 fn load_optional_extensions() -> Vec<Box<dyn crate::extension::Extension>> {
@@ -832,178 +880,141 @@ fn config_dir() -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
-/// Apply a single `(set-option key value)` pair from the config loader. Warns
-/// when the value is rejected by the def's kind validator (unknown keys are
-/// silently stashed in `unowned` for late-arriving optional extensions).
-fn apply_option(store: &OptionStore, key: &str, val: &str) {
-    if !store.set(key, val) && store.def(key).is_some() {
-        crate::services::messages::log(format!("user config: invalid value '{val}' for option '{key}'"), true);
-    }
+/// The two settings boot needs before the session is ready, read from
+/// custom.scm's literal store calls.
+struct EarlySettings {
+    boot_timeout_ms: u64,
+    disabled: Vec<String>,
 }
 
-/// Rebuild the typed `MatcherConfig` from current store values. Mirrors the
-/// same helper in `settings.rs`; called at boot after user config is applied.
-fn project_matcher(os: &OptionStore, cfg: &Mutex<MatcherConfig>) {
-    let mut mc = cfg.lock().unwrap();
-    mc.tail_bonus = os.get_i64("matcher.tail-bonus");
-    mc.depth_penalty = os.get_i64("matcher.depth-penalty");
-    mc.length_penalty = os.get_i64("matcher.length-penalty");
-    mc.exec_bonus = os.get_i64("matcher.exec-bonus");
-    mc.preferred_ext = os.get_list("matcher.preferred-ext");
-    mc.noise_ext = os.get_list("matcher.noise-ext");
-    mc.noise_dirs = os.get_list("matcher.noise-dirs");
-    mc.max_results = os.get_u32("matcher.max-results") as usize;
-}
-
-/// Load the user configuration: write the commented template (`config.scm`) if
-/// absent, then parse the uncommented `(bind …)` and `(set-option …)` lines.
-/// The User layer wins via priority; deleting the file reproduces the defaults.
-fn scheme_user_config(
-    session: &crate::script::SchemeSession,
-    store: &OptionStore,
-) -> (Vec<Binding>, Vec<(String, String)>) {
-    // Tests never touch the real user config; the user-config decode path is
-    // covered directly by parse_user_config / config_template tests.
-    if cfg!(test) {
-        return (Vec::new(), Vec::new());
-    }
-    let Some(dir) = config_dir() else { return (Vec::new(), Vec::new()) };
-    // Accept config.scm; fall back to the old keybindings.scm name for
-    // backward compatibility with existing user configs.
-    let path = {
-        let new_path = dir.join("config.scm");
-        let old_path = dir.join("keybindings.scm");
-        if !new_path.exists() && old_path.exists() {
-            old_path
-        } else {
-            if !new_path.exists() {
-                let _ = std::fs::write(&new_path, config_template(store));
-            }
-            new_path
-        }
-    };
-    let Ok(contents) = std::fs::read_to_string(&path) else { return (Vec::new(), Vec::new()) };
-    // Read the uncommented forms as data through the session, so the Scheme
-    // reader handles comment stripping and syntax validation.
-    let expr = format!("(quote ({contents}))");
-    match session
-        .eval(&expr)
-        .and_then(|printed| crate::script::sexpr::parse(&printed))
-        .and_then(|datum| parse_user_config(&datum))
-    {
-        Ok(result) => result,
-        Err(e) => {
-            crate::services::messages::log(format!("user config failed ({e}); ignoring user overrides"), true);
-            (Vec::new(), Vec::new())
-        }
-    }
-}
-
-fn parse_user_config(
-    datum: &crate::script::sexpr::Datum,
-) -> Result<(Vec<Binding>, Vec<(String, String)>), String> {
-    use crate::script::sexpr::Datum;
-    let forms = datum.as_list().ok_or("user config is not a list")?;
-    let mut binds = Vec::new();
-    let mut opts = Vec::new();
-    for form in forms {
-        let p = form.as_list().ok_or("config form is not a list")?;
-        match p.first().and_then(|d| d.as_sym()) {
-            Some("bind") => {
-                let mode =
-                    p.get(1).and_then(|d| d.as_sym()).ok_or("bind missing mode")?.to_string();
-                let panel = match p.get(2) {
-                    Some(Datum::Bool(false)) => None,
-                    Some(d) => d.as_sym().map(str::to_string),
-                    None => None,
-                };
-                let key_name = p.get(3).and_then(|d| d.text()).ok_or("bind missing key")?;
-                let key = crate::script::codec::parse_key(key_name)
-                    .ok_or_else(|| format!("unknown key: {key_name}"))?;
-                let intent = p
-                    .get(4)
-                    .and_then(crate::script::codec::intent_from_datum)
-                    .ok_or("bind has an unknown intent")?;
-                let when = match p.get(5) {
-                    Some(d) => crate::script::codec::cond_from_datum(d),
-                    None => Cond::Always,
-                };
-                binds.push(Binding { mode, panel, key, intent, when, layer: Layer::User });
-            }
-            Some("set-option") => {
-                let key =
-                    p.get(1).and_then(|d| d.text()).ok_or("set-option missing key")?.to_string();
-                let val =
-                    p.get(2).and_then(|d| d.text()).ok_or("set-option missing value")?.to_string();
-                opts.push((key, val));
-            }
-            // Theme forms live in the same managed block but are consumed by the
-            // theme extension's own boot loader (see extension/theme.rs), not here.
-            Some("set-theme") | Some("define-theme") => {}
-            // Other unrecognised forms are skipped silently: this runs after the
-            // TUI owns the alternate screen, so an eprintln would corrupt it.
-            Some(_) => {}
-            None => return Err("empty config form".into()),
-        }
-    }
-    Ok((binds, opts))
-}
-
-/// Generate the unified configuration template (`config.scm`): option stubs
-/// derived from the store's declared options, followed by every default
-/// keybinding commented out so the user can uncomment and edit individual lines.
-fn config_template(store: &OptionStore) -> String {
-    let mut s = String::from(
-        ";; wasdf configuration — uncomment and edit a line to override a default.\n\
-         ;; Deleting this file restores the built-in defaults exactly.\n\n\
-         ;; Options\n",
-    );
-    for (cat, defs) in store.categories() {
-        s.push_str(&format!(";; {cat}\n"));
-        for def in defs {
-            let hint = def.kind.hint();
-            if hint.is_empty() {
-                s.push_str(&format!(
-                    ";; (set-option \"{}\" \"{}\")\n",
-                    def.key, def.default
-                ));
-            } else {
-                s.push_str(&format!(
-                    ";; (set-option \"{}\" \"{}\")  ; {}\n",
-                    def.key, def.default, hint
-                ));
-            }
-        }
-    }
-    s.push_str("\n;; Keybindings\n;; Form: (bind <mode> <panel|#f> \"<key>\" <intent> [<when>])\n\n");
-    if let Ok(quoted) = crate::script::sexpr::parse(KEYMAP_SCHEME) {
-        // KEYMAP_SCHEME parses as (quote (<group> …)); take the groups.
-        if let Some(groups) = quoted.as_list().and_then(|l| l.get(1)).and_then(|d| d.as_list()) {
-            for group in groups {
-                let Some(g) = group.as_list() else { continue };
-                let (Some(mode), Some(panel), Some(binds)) =
-                    (g.first(), g.get(1), g.get(2).and_then(|d| d.as_list()))
-                else {
-                    continue;
-                };
-                for b in binds {
-                    let Some(bp) = b.as_list() else { continue };
-                    let mut parts = vec![
-                        "bind".to_string(),
-                        crate::script::sexpr::render(mode),
-                        crate::script::sexpr::render(panel),
-                    ];
-                    for el in bp {
-                        parts.push(crate::script::sexpr::render(el));
-                    }
-                    s.push_str("; (");
-                    s.push_str(&parts.join(" "));
-                    s.push_str(")\n");
+impl EarlySettings {
+    fn from_custom(text: Option<&str>) -> Self {
+        let mut early = EarlySettings { boot_timeout_ms: 3000, disabled: Vec::new() };
+        let changes = text.map(crate::script::store::changes_from_literal_program).unwrap_or(Ok(Vec::new()));
+        for c in changes.unwrap_or_default() {
+            match (c.id.text(), &c.value) {
+                (Some("scheme.boot-timeout-ms"), Some(crate::script::sexpr::Datum::Int(ms))) => {
+                    early.boot_timeout_ms = (*ms).max(0) as u64;
                 }
+                (Some("extensions.disabled"), Some(crate::script::sexpr::Datum::List(ids))) => {
+                    early.disabled = ids.iter().filter_map(|d| d.text().map(str::to_string)).collect();
+                }
+                _ => {}
             }
         }
+        early
     }
-    s
+
+    /// Drop the extensions the user disabled, noting each in @/messages.
+    fn without_disabled(
+        &self,
+        exts: Vec<Box<dyn crate::extension::Extension>>,
+    ) -> Vec<Box<dyn crate::extension::Extension>> {
+        exts.into_iter()
+            .filter(|e| {
+                let off = self.disabled.iter().any(|d| d == e.id());
+                if off {
+                    crate::services::messages::log(format!("extension {} is disabled (extensions.disabled)", e.id()), false);
+                }
+                !off
+            })
+            .collect()
+    }
+}
+
+/// Read a file from the user config directory. Tests never touch the real
+/// user configuration.
+fn read_config_file(name: &str) -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
+    std::fs::read_to_string(config_dir()?.join(name)).ok()
+}
+
+/// Read config.scm, writing the template first when it does not exist.
+fn read_or_create_config(options: &OptionStore) -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
+    let path = config_dir()?.join("config.scm");
+    if !path.exists() {
+        let _ = std::fs::write(&path, crate::script::user_config::config_template(options, defaults::KEYMAP_SCHEME));
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// Build the settings store from the user's files and fold the result into the
+/// projections: declare every option, evaluate config.scm into the `config`
+/// layer (an old-format file through the bridge: its own forms → `config`, its
+/// managed block → `custom`), then custom.scm into `custom`. Without the
+/// session, config.scm is skipped and custom.scm's literal calls apply
+/// directly.
+fn load_user_settings(
+    settings: &crate::script::store::Store,
+    ready: bool,
+    options: &OptionStore,
+    preludes: &[(String, String)],
+    config_text: Option<&str>,
+    custom_text: Option<&str>,
+    user: &mut crate::script::projection::UserLayer,
+) -> bool {
+    use crate::script::store::{changes_from_literal_program, Layer};
+    use crate::script::user_config;
+    let log = |m: String| crate::services::messages::log(m, true);
+    let mut changes = Vec::new();
+    // Whether every form ran: `false` when this file had errors.
+    let mut run = |layer: Layer, text: &str, file: &str| -> bool {
+        let (c, errors) = settings.eval_program(layer, text);
+        changes.extend(c);
+        let clean = errors.is_empty();
+        for e in errors {
+            log(format!("{file}:{}: {}", e.line, e.message));
+        }
+        clean
+    };
+    let mut custom_ok = true;
+    if ready {
+        let defs: Vec<OptionDef> = options.keys().iter().filter_map(|k| options.def(k).cloned()).collect();
+        if let Err(e) = settings.declare_options(&defs) {
+            log(format!("settings store: declaring options failed ({e})"));
+        }
+        let mut taken: std::collections::HashSet<String> =
+            crate::script::store::CORE_VOCABULARY.iter().map(|s| s.to_string()).collect();
+        for (owner, src) in preludes {
+            for p in settings.load_prelude(owner, src, &mut taken) {
+                log(p);
+            }
+        }
+        if let Some(text) = config_text {
+            if user_config::is_legacy(text) {
+                let p = user_config::legacy_programs(text, options);
+                run(Layer::Config, &p.config, "config.scm");
+                run(Layer::Custom, &p.custom, "config.scm (managed block)");
+            } else {
+                run(Layer::Config, text, "config.scm");
+            }
+        }
+        if let Some(text) = custom_text {
+            custom_ok = run(Layer::Custom, text, "custom.scm");
+        }
+    } else {
+        if config_text.is_some() {
+            log("scheme session not ready: config.scm skipped".into());
+        }
+        match custom_text.map(changes_from_literal_program) {
+            Some(Ok(c)) => changes.extend(c),
+            Some(Err(e)) => {
+                custom_ok = false;
+                log(e);
+            }
+            None => {}
+        }
+    }
+    for p in crate::script::projection::apply_options(&changes, options) {
+        log(p);
+    }
+    user.absorb(&changes);
+    custom_ok
 }
 
 #[cfg(test)]
@@ -1056,9 +1067,9 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::SubLayout;
+    use crate::core::{Mods, SubLayout};
 
-    fn temp_dir_with_files() -> std::path::PathBuf {
+    pub(super) fn temp_dir_with_files() -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -1070,6 +1081,183 @@ mod tests {
         std::fs::write(dir.join("beta.txt"), b"second file").unwrap();
         std::fs::create_dir_all(dir.join("subdir")).unwrap();
         dir
+    }
+
+    /// An extension that records the captured keys it is handed and otherwise
+    /// does nothing at all — in particular it never releases the capture. The
+    /// lockout guarantee only means something if it holds against an extension
+    /// that refuses to cooperate, so that is what these tests use.
+    #[derive(Default)]
+    struct InertCapturer {
+        got: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Extension for InertCapturer {
+        fn id(&self) -> &str {
+            "capturer"
+        }
+        fn handle_intent(&self, i: &ExtensionIntent, _s: &AppState) -> Vec<Intent> {
+            let label = match i.intent.as_str() {
+                "key" => codec::decode_key(&i.data).map(codec::key_name).unwrap_or_default(),
+                other => format!("<{other}>"),
+            };
+            self.got.lock().unwrap().push(label);
+            Vec::new()
+        }
+    }
+
+    /// Boot an app with `InertCapturer` registered and a capture already
+    /// installed: released by `Ctrl-b`, escaping on `escape`.
+    fn app_capturing(escape: Vec<Intent>) -> (App, std::sync::Arc<InertCapturer>) {
+        // The registry takes a Box, so keep a parallel Arc purely to read the
+        // recorded keys back out; both point at the same recording Mutex only
+        // if we register the Arc itself.
+        let ext = std::sync::Arc::new(InertCapturer::default());
+        struct Shim(std::sync::Arc<InertCapturer>);
+        impl Extension for Shim {
+            fn id(&self) -> &str {
+                self.0.id()
+            }
+            fn handle_intent(&self, i: &ExtensionIntent, s: &AppState) -> Vec<Intent> {
+                self.0.handle_intent(i, s)
+            }
+        }
+        let dir = temp_dir_with_files();
+        let mut app = App::boot(dir);
+        app.pump_one();
+        app.extensions.register(Box::new(Shim(ext.clone())));
+        app.dispatch_for_test(Intent::SetInputCapture(Some(Box::new(InputCapture {
+            owner: "capturer".into(),
+            release: Key::new(KeyCode::Char('b'), Mods::CTRL),
+            escape,
+        }))));
+        (app, ext)
+    }
+
+    #[test]
+    fn a_captured_bound_key_reaches_the_extension_instead_of_acting() {
+        let (mut app, ext) = app_capturing(Vec::new());
+        // `q` quits in File mode. Under capture it must not.
+        app.handle_key(Key::plain(KeyCode::Char('q')));
+        assert!(!app.state.quit, "q must not quit while captured");
+        assert_eq!(ext.got.lock().unwrap().as_slice(), ["q"]);
+    }
+
+    #[test]
+    fn the_release_key_frees_the_user_even_when_the_extension_does_nothing() {
+        let (mut app, ext) = app_capturing(Vec::new());
+        app.handle_key(Key::new(KeyCode::Char('b'), Mods::CTRL));
+        assert!(
+            app.state.input_capture.is_none(),
+            "the release must not depend on the extension answering"
+        );
+        assert_eq!(ext.got.lock().unwrap().as_slice(), ["<prefix>"]);
+    }
+
+    #[test]
+    fn an_escape_intent_releases_the_capture_and_still_performs_the_move() {
+        let escape = vec![Intent::CursorUp, Intent::CursorDown, Intent::CursorLeft,
+                          Intent::CursorRight, Intent::CursorTop, Intent::CursorBottom];
+        let (mut app, ext) = app_capturing(escape);
+        assert_eq!(app.state.cursor, 0);
+        // `s` is CursorDown in the default file-panel keymap.
+        app.handle_key(Key::plain(KeyCode::Char('s')));
+        assert!(app.state.input_capture.is_none(), "escape intent releases");
+        assert_eq!(app.state.cursor, 1, "and the move it stands for happens");
+        assert!(ext.got.lock().unwrap().is_empty(), "the key never reaches the extension");
+    }
+
+    #[test]
+    fn cursor_bottom_escapes_too_not_just_the_four_wasd_moves() {
+        let escape = vec![Intent::CursorUp, Intent::CursorDown, Intent::CursorLeft,
+                          Intent::CursorRight, Intent::CursorTop, Intent::CursorBottom];
+        let (mut app, _) = app_capturing(escape);
+        // `S` (shift-s) is CursorBottom.
+        app.handle_key(Key::plain(KeyCode::Char('S')));
+        assert!(app.state.input_capture.is_none());
+        assert_eq!(app.state.cursor, app.state.entries.len() - 1);
+    }
+
+    #[test]
+    fn with_no_escape_intents_a_movement_key_goes_to_the_child() {
+        let (mut app, ext) = app_capturing(Vec::new());
+        app.handle_key(Key::plain(KeyCode::Char('s')));
+        assert!(app.state.input_capture.is_some(), "PrefixOnly keeps the capture");
+        assert_eq!(app.state.cursor, 0, "and the cursor stays put");
+        assert_eq!(ext.got.lock().unwrap().as_slice(), ["s"]);
+    }
+
+    #[test]
+    fn activate_is_not_an_escape() {
+        let escape = vec![Intent::CursorUp, Intent::CursorDown, Intent::CursorLeft,
+                          Intent::CursorRight, Intent::CursorTop, Intent::CursorBottom];
+        let (mut app, ext) = app_capturing(escape);
+        app.handle_key(Key::plain(KeyCode::Enter));
+        assert!(app.state.input_capture.is_some());
+        assert_eq!(ext.got.lock().unwrap().as_slice(), ["Enter"]);
+    }
+
+    #[test]
+    fn a_key_release_never_fires_its_binding() {
+        let dir = temp_dir_with_files();
+        let mut app = App::boot(dir);
+        app.pump_one();
+        let down = Key::plain(KeyCode::Char('s'));
+        app.handle_key(down);
+        app.handle_key(Key { kind: crate::core::KeyKind::Release, ..down });
+        assert_eq!(app.state.cursor, 1, "the release must not move the cursor a second time");
+    }
+
+    #[test]
+    fn cmdop_is_built_in_and_runs_through_the_core_keymap() {
+        let mut app = App::boot(std::env::temp_dir());
+        assert!(app.extensions.iter().any(|e| e.id() == "cmdop"), "always registered");
+        assert!(app.store.def("cmdop.runner").is_some(), "the runner option is core");
+        assert!(app.store.def("pty.cmdop-host").is_none(), "the old pty switch is gone");
+        app.dispatch(Intent::Extension(ExtensionIntent {
+            extension: "cmdop".into(),
+            intent: "start-create".into(),
+            data: ExtensionValue::Nil,
+        }));
+        assert_eq!(app.state.function.form_owner.as_deref(), Some("cmdop"));
+    }
+
+    #[test]
+    fn the_extensions_order_reranks_the_registry_and_the_settings_list() {
+        let mut app = App::boot(temp_dir_with_files());
+        app.scheme.wait_ready(Duration::from_secs(600));
+        app.pump_one(); // initial ReadDir
+        let first = |app: &App| app.ext_infos.read().unwrap()[0].id.clone();
+        assert_eq!(first(&app), "preview", "registration order by default");
+        app.dispatch_for_test(Intent::Configure(crate::core::ConfigWrite::SetOrder {
+            name: "extensions".into(),
+            items: vec!["repl".into()],
+        }));
+        app.pump_one(); // the Scheme result
+        assert_eq!(first(&app), "repl");
+        assert_eq!(app.extensions.iter().next().map(|e| e.id()), Some("repl"));
+        assert_eq!(app.ext_infos.read().unwrap().len(), app.registered.len(), "every extension is still ranked");
+    }
+
+    #[test]
+    fn a_layout_written_at_the_repl_replaces_the_core_one() {
+        let mut app = App::boot(temp_dir_with_files());
+        app.scheme.wait_ready(Duration::from_secs(600));
+        app.pump_one(); // initial ReadDir
+        let tree = "(column (panel file) (panel help (size 1)))";
+        app.dispatch_for_test(Intent::Eval { owner: "repl".into(), expr: format!("(layout! 'file '{tree})") });
+        app.pump_one();
+        let expected = crate::script::layout::parse("file", &crate::script::sexpr::parse(tree).unwrap()).unwrap();
+        assert_eq!(app.layouts.get("file"), Some(&expected));
+        assert!(app.layouts.get("select").is_some(), "the other core layout stays");
+    }
+
+    #[test]
+    fn every_bundled_extensions_options_are_declared_at_boot() {
+        let app = App::boot(std::env::temp_dir());
+        for key in ["theme.active", "theme.custom", "lscolors.palette", "lscolors.custom", "pty.edit-host"] {
+            assert!(app.store.def(key).is_some(), "{key} is declared");
+        }
     }
 
     #[test]
@@ -1143,7 +1331,7 @@ mod tests {
             payload: Payload::Read {
                 owner: "preview".into(),
                 path: dir.join("alpha.txt"),
-                result: crate::core::ReadResult::Bytes {
+                result: crate::core::Content::Bytes {
                     offset: 0,
                     bytes: b"STALE\n".to_vec(),
                     eof: true,
@@ -1281,15 +1469,15 @@ mod tests {
 
     #[test]
     fn content_auto_update_follows_file_cursor() {
-        use crate::core::{Key, KeyCode, Mods};
+        use crate::core::{Key, KeyCode};
         let dir = temp_dir_with_files();
         let mut app = App::boot(dir);
         app.pump_one();
-        app.store.set("content-auto-update", "#t");
+        app.store.set_str("content-auto-update", "#t");
         app.state.function.visible = true;
         app.state.focused_panel = "file".into();
         // Move the file cursor; the on_cursor_move hook reads the file's content.
-        app.handle_key(Key { code: KeyCode::Char('s'), mods: Mods::NONE });
+        app.handle_key(Key::plain(KeyCode::Char('s')));
         assert_eq!(app.state.cursor, 1);
         app.pump_one(); // the auto-update content read
         assert!(app.function_content_rows().is_some());
@@ -1326,10 +1514,8 @@ mod tests {
     }
 
     #[test]
-    fn resolver_table_sourced_from_scheme() {
-        let session = crate::script::SchemeSession::spawn();
-        session.wait_ready(Duration::from_secs(600));
-        let entries = scheme_resolvers(&session);
+    fn the_core_resolver_table_reads() {
+        let entries = defaults::resolvers();
         let copy = entries.iter().find(|e| e.key == "copy").expect("copy entry");
         assert!(!copy.destructive);
         let del = entries.iter().find(|e| e.key == "delete").expect("delete entry");
@@ -1339,110 +1525,136 @@ mod tests {
     }
 
     #[test]
-    fn commands_sourced_from_scheme() {
-        let session = crate::script::SchemeSession::spawn();
-        session.wait_ready(Duration::from_secs(600));
-        let cmds = scheme_commands(&session);
-        assert!(cmds.iter().any(|c| c.name == "quit"));
-        // copy/move/rename/mkdir/touch are contributed natively by the cmdop
-        // extension's commands(), not command.scm — see its own doc comment.
-        let home = cmds.iter().find(|c| c.name == "home").expect("home command");
-        assert!(matches!(home.intent, Intent::NavigateTo(_)), "home navigates to the VFS root");
-    }
-
-    #[test]
-    fn keymap_sourced_from_scheme() {
+    fn the_core_keymap_resolves() {
         use crate::core::{Key, KeyCode, Mods};
-        let session = crate::script::SchemeSession::spawn();
-        session.wait_ready(Duration::from_secs(600));
-        let binds = scheme_keymaps(&session);
-        assert!(binds.len() > 30, "core keymap has many bindings, got {}", binds.len());
+        let binds = defaults::keymap();
 
         let mut km = KeymapRegistry::new();
         km.extend(binds);
         let conds = Conditions::default();
         let state = AppState::new(std::env::temp_dir());
         // file mode, file panel: 'w' resolves to CursorUp via the Scheme keymap.
-        let up = km.resolve(&conds, &state, "file", Key { code: KeyCode::Char('w'), mods: Mods::NONE });
+        let up = km.resolve(&conds, &state, "file", Key::plain(KeyCode::Char('w')));
         assert_eq!(up, Some(Intent::CursorUp));
         // Ctrl-a resolves to SelectAll (modifier parsing works).
-        let all = km.resolve(&conds, &state, "file", Key { code: KeyCode::Char('a'), mods: Mods::CTRL });
+        let all = km.resolve(&conds, &state, "file", Key::new(KeyCode::Char('a'), Mods::CTRL));
         assert_eq!(all, Some(Intent::SelectAll));
         // Delete fires on both Backspace and Delete.
         for code in [KeyCode::Backspace, KeyCode::Delete] {
-            let got = km.resolve(&conds, &state, "file", Key { code, mods: Mods::NONE });
+            let got = km.resolve(&conds, &state, "file", Key::plain(code));
             assert_eq!(got, Some(Intent::DeleteSelected), "{code:?} → delete");
         }
     }
 
-    #[test]
-    fn user_keybindings_parsed_at_user_layer() {
-        use crate::core::{Key, KeyCode, Mods};
+    fn core_options() -> OptionStore {
+        OptionStore::new(defaults::core_options())
+    }
+
+    fn ready_settings() -> crate::script::store::Store {
         let session = crate::script::SchemeSession::spawn();
-        session.wait_ready(Duration::from_secs(600));
-        // Commented lines are ignored; uncommented (bind …) forms become User
-        // overrides. Includes a `:when` and a #f (no-panel) scope.
-        let printed = session
-            .eval(
-                "(quote (\
-                   ; (bind file file \"w\" cursor-up)\n\
-                   (bind file file \"z\" cursor-bottom)\
-                   (bind file #f \"Q\" quit)))",
-            )
-            .unwrap();
-        let datum = crate::script::sexpr::parse(&printed).unwrap();
-        let (binds, opts) = parse_user_config(&datum).unwrap();
-        assert_eq!(binds.len(), 2, "the commented line is skipped");
-        assert!(opts.is_empty());
-        assert!(binds.iter().all(|b| b.layer == Layer::User));
-        let z = &binds[0];
-        assert_eq!(z.key, Key { code: KeyCode::Char('z'), mods: Mods::NONE });
+        assert!(session.wait_ready(Duration::from_secs(600)));
+        crate::script::store::Store::new(session)
+    }
+
+    #[test]
+    fn boot_builds_the_projections_from_config_and_custom() {
+        use crate::core::{Key, KeyCode};
+        let options = core_options();
+        let mut user = crate::script::projection::UserLayer::default();
+        let config = "(define macos? (equal? (os) (os)))\n\
+                      (when macos? (opt-set! 'border-style \"rounded\"))\n\
+                      (opt-set! 'border-style \"wavy\")\n\
+                      (bind! 'file 'file \"z\" 'cursor-bottom \"bottom\")\n\
+                      (opt-set! 'content-auto-update #t)\n";
+        let custom = "(opt-set! 'content-auto-update #f)\n(unbind! 'file #f \"Q\")\n";
+        load_user_settings(&ready_settings(), true, &options, &[], Some(config), Some(custom), &mut user);
+        assert_eq!(options.get_str("border-style"), "rounded", "the failing form was skipped");
+        assert!(!options.get_bool("content-auto-update"), "custom.scm overrides config.scm");
+        let (binds, problems) = user.bindings();
+        assert!(problems.is_empty(), "{problems:?}");
+        let z = binds.iter().find(|b| b.key == Key::plain(KeyCode::Char('z'))).unwrap();
         assert_eq!(z.intent, Intent::CursorBottom);
-        assert_eq!(binds[1].panel, None);
+        assert_eq!(z.layer, crate::script::keymap::Layer::User);
+        let q = binds.iter().find(|b| b.key == Key::plain(KeyCode::Char('Q'))).unwrap();
+        assert_eq!(q.intent, Intent::Noop, "unbind! is a tombstone");
     }
 
     #[test]
-    fn config_template_is_commented() {
-        let defs = {
-            let outer = crate::script::sexpr::parse(CORE_OPTIONS_SCHEME).unwrap();
-            let inner = outer.as_list().unwrap()[1].clone();
-            crate::script::config::parse_option_config(&inner).unwrap()
-        };
-        let store = OptionStore::new(defs);
-        let t = config_template(&store);
-        assert!(t.contains("; (bind file file \"w\" cursor-up)"));
-        assert!(t.contains("; (bind select #f \"Enter\" confirm)"));
-        // Every binding line is commented out.
-        assert!(t.lines().filter(|l| l.contains("(bind ")).all(|l| l.trim_start().starts_with(';')));
-        // Option stubs are present.
-        assert!(t.contains("set-option \"border-style\""));
+    fn an_old_format_config_still_loads_through_the_bridge() {
+        let options = core_options();
+        let mut user = crate::script::projection::UserLayer::default();
+        let legacy = ";; >>> wasdf settings (managed — edited via the SETTINGS panel; do not hand-edit)\n\
+                      (set-option \"border-style\" \"double\")\n\
+                      ;; <<< wasdf settings\n\
+                      (bind file #f \"Q\" quit)\n";
+        load_user_settings(&ready_settings(), true, &options, &[], Some(legacy), None, &mut user);
+        assert_eq!(options.get_str("border-style"), "double");
+        assert_eq!(user.bindings().0.len(), 1);
     }
 
     #[test]
-    fn set_option_parsed_from_config() {
-        use crate::script::SchemeSession;
-        let session = SchemeSession::spawn();
-        session.wait_ready(Duration::from_secs(600));
-        let printed = session
-            .eval("(quote ((set-option \"border-style\" \"rounded\") (set-option \"content-auto-update\" \"#t\")))")
-            .unwrap();
-        let datum = crate::script::sexpr::parse(&printed).unwrap();
-        let (binds, opts) = parse_user_config(&datum).unwrap();
-        assert!(binds.is_empty());
-        assert_eq!(opts.len(), 2);
-        assert_eq!(opts[0], ("border-style".into(), "rounded".into()));
-        assert_eq!(opts[1], ("content-auto-update".into(), "#t".into()));
-        let defs = {
-            let outer = crate::script::sexpr::parse(CORE_OPTIONS_SCHEME).unwrap();
-            let inner = outer.as_list().unwrap()[1].clone();
-            crate::script::config::parse_option_config(&inner).unwrap()
-        };
-        let store = OptionStore::new(defs);
-        for (k, v) in &opts {
-            apply_option(&store, k, v);
-        }
-        assert_eq!(store.get_str("border-style"), "rounded");
-        assert!(store.get_bool("content-auto-update"));
+    fn an_old_managed_block_keeps_its_theme_through_the_theme_prelude() {
+        let theme = crate::extension::theme::ThemeExtension::new(Arc::new(RwLock::new(
+            crate::extension::theme::ThemeRegistry::bundled(),
+        )));
+        let mut defs = defaults::core_options();
+        defs.extend(defaults::extension_options(&theme));
+        let options = OptionStore::new(defs);
+        let preludes = vec![("theme".to_string(), theme.prelude().unwrap())];
+        let legacy = ";; >>> wasdf settings (managed — edited via the SETTINGS panel; do not hand-edit)\n\
+                      (define-theme \"mine\"\n  (title \"#112233\" nil #t #f #f))\n\
+                      (set-theme \"mine\")\n\
+                      ;; <<< wasdf settings\n";
+        let mut user = crate::script::projection::UserLayer::default();
+        load_user_settings(&ready_settings(), true, &options, &preludes, Some(legacy), None, &mut user);
+        assert_eq!(options.get_str("theme.active"), "mine");
+        assert!(matches!(options.value("theme.custom"), Some(crate::core::OptionValue::Map(m)) if m.contains_key("mine")));
+    }
+
+    #[test]
+    fn without_the_session_custom_scm_still_applies() {
+        let options = core_options();
+        let mut user = crate::script::projection::UserLayer::default();
+        let session = crate::script::SchemeSession::spawn();
+        let settings = crate::script::store::Store::new(session);
+        let custom = "(opt-set! 'border-style \"double\")\n(bind! 'file 'file \"z\" 'quit)\n";
+        load_user_settings(&settings, false, &options, &[], Some("(opt-set! 'border-style \"ascii\")"), Some(custom), &mut user);
+        assert_eq!(options.get_str("border-style"), "double", "config.scm is skipped, custom.scm applies");
+        assert_eq!(user.bindings().0.len(), 1);
+    }
+
+    #[test]
+    fn every_line_of_the_template_is_a_valid_store_call() {
+        let options = core_options();
+        let template = crate::script::user_config::config_template(&options, defaults::KEYMAP_SCHEME);
+        let program: String = template
+            .lines()
+            .filter_map(|l| l.strip_prefix(";; ("))
+            .map(|l| format!("({}\n", l.split("  ;").next().unwrap()))
+            .collect();
+        let settings = ready_settings();
+        let defs: Vec<OptionDef> = options.keys().iter().filter_map(|k| options.def(k).cloned()).collect();
+        settings.declare_options(&defs).unwrap();
+        let (changes, errors) = settings.eval_program(crate::script::store::Layer::Config, &program);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(crate::script::projection::apply_options(&changes, &options).is_empty());
+        let mut user = crate::script::projection::UserLayer::default();
+        user.absorb(&changes);
+        let (binds, problems) = user.bindings();
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(binds.len() > 50, "the default keymap came through: {}", binds.len());
+    }
+
+    #[test]
+    fn early_settings_read_the_timeout_and_the_disabled_extensions() {
+        let early = EarlySettings::from_custom(Some(
+            "(opt-set! 'scheme.boot-timeout-ms 500)\n(opt-set! 'extensions.disabled '(\"pty\"))\n",
+        ));
+        assert_eq!(early.boot_timeout_ms, 500);
+        assert_eq!(early.disabled, vec!["pty"]);
+        let kept = early.without_disabled(crate::extension::bundled(None));
+        assert!(kept.iter().all(|e| e.id() != "pty"));
+        assert_eq!(EarlySettings::from_custom(None).boot_timeout_ms, 3000);
     }
 
     #[test]
@@ -1478,16 +1690,57 @@ mod tests {
         let mut app = App::boot(dir);
         app.scheme.wait_ready(Duration::from_secs(600));
         app.pump_one(); // initial ReadDir
-        // Issue an EvalScheme plan; the resident Scheme session computes it and the
-        // result returns as an AsyncResult the reducer turns into a notice.
-        let generation = app.state.mode_generation();
-        let cwd = app.cwd();
-        app.tasks
-            .spawn(Plan::EvalScheme { expr: "(+ 40 2)".into() }, generation, cwd);
+        // A Configure runs as a store call on a worker; its change set comes back
+        // with the result and the kernel folds it into the projections.
+        assert!(!app.store.get_bool("content-auto-update"));
+        app.dispatch_for_test(Intent::Configure(crate::core::ConfigWrite::SetOption {
+            key: "content-auto-update".into(),
+            value: crate::core::OptionValue::Bool(true),
+        }));
         app.pump_one(); // Scheme result
-        app.surface_new_messages(); // notices reach the screen via the per-frame pump
+        assert!(app.store.get_bool("content-auto-update"), "the projection followed the store");
+        // An invalid write fails in the store and surfaces as an error notice.
+        app.dispatch_for_test(Intent::Configure(crate::core::ConfigWrite::SetOption {
+            key: "border-style".into(),
+            value: crate::core::OptionValue::Text("wavy".into()),
+        }));
+        app.pump_one();
+        app.surface_new_messages();
         let shown = app.ui.live_notice().map(|n| n.text.clone()).unwrap_or_default();
-        assert!(shown.contains("42"), "scheme result surfaced: {shown:?}");
+        assert!(shown.contains("border-style"), "the store's error surfaced: {shown:?}");
+        assert_eq!(app.store.get_str("border-style"), "single");
+    }
+
+    #[test]
+    fn a_repl_line_typed_and_entered_evaluates_in_the_session_layer() {
+        use crate::core::{Key, KeyCode};
+        let mut app = App::boot(temp_dir_with_files());
+        app.scheme.wait_ready(Duration::from_secs(600));
+        app.pump_one(); // initial ReadDir
+        app.dispatch_for_test(Intent::Extension(ExtensionIntent {
+            extension: "repl".into(),
+            intent: "open".into(),
+            data: ExtensionValue::Nil,
+        }));
+        assert_eq!(app.state.function.form_owner.as_deref(), Some("repl"));
+        for c in "(opt-set! 'border-style \"double\")".chars() {
+            app.handle_key(Key::plain(KeyCode::Char(c)));
+        }
+        app.handle_key(Key::plain(KeyCode::Enter));
+        app.pump_one(); // the Scheme result
+        assert_eq!(app.store.get_str("border-style"), "double", "a REPL write reaches the projection");
+        assert_eq!(app.state.function.input.as_ref().map(|i| i.query.as_str()), Some(""), "ready for the next line");
+        let listed = app.vfs.list(&crate::vfs::vfs_root().join("repl"), false).unwrap();
+        assert_eq!(listed.len(), 1, "the expression is in @/repl");
+        // An error stays in the REPL; it is not also logged as a notice. (The
+        // log is process-global, so look for this error's own text.)
+        for c in "(repl-probe-unbound)".chars() {
+            app.handle_key(Key::plain(KeyCode::Char(c)));
+        }
+        app.handle_key(Key::plain(KeyCode::Enter));
+        app.pump_one();
+        let logged = crate::services::messages::global().lines();
+        assert!(!logged.iter().any(|(l, _)| l.contains("repl-probe-unbound")), "no notice for a REPL error");
     }
 
     #[test]
@@ -1520,7 +1773,7 @@ mod tests {
 
     #[test]
     fn preview_extension_owns_function_panel_search_keys() {
-        use crate::core::{Key, KeyCode, Mods};
+        use crate::core::{Key, KeyCode};
         // The preview extension registers its function-panel bindings (search,
         // horizontal scroll) via scheme_source at the Extension layer; they
         // resolve through the live keymap and override the core bindings by
@@ -1531,8 +1784,8 @@ mod tests {
         app.state.function.visible = true;
         app.state.function.sublayout = SubLayout::Content;
         app.state.focused_panel = "function".into();
-        let ch = |c| Key { code: KeyCode::Char(c), mods: Mods::NONE };
-        let enter = Key { code: KeyCode::Enter, mods: Mods::NONE };
+        let ch = |c| Key::plain(KeyCode::Char(c));
+        let enter = Key::plain(KeyCode::Enter);
         let resolve = |app: &App, k| app.keymap.resolve(&app.conditions, &app.state, "function", k);
 
         // Extension-owned bindings: `/` opens search, h/l scroll horizontally.
@@ -1561,5 +1814,77 @@ mod tests {
         // Candidates filled from the registry.
         let n = app.state.select.as_ref().unwrap().results.len();
         assert!(n > 5, "palette has the default commands");
+    }
+}
+
+#[cfg(test)]
+mod frame_dump {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    pub fn dump(app: &mut App, w: u16, h: u16) -> String {
+        let s = &app.store;
+        let top = crate::ui::top::TopOptions {
+            border_style: s.get_str("border-style"),
+            monitor: crate::ui::top::MonitorOptions::from_store(s),
+            scrollbar: crate::ui::chrome::ScrollbarChars {
+                thumb: s.get_str("scrollbar-thumb"),
+                rail: s.get_str("scrollbar-rail"),
+                disabled: s.get_str("scrollbar-disabled"),
+            },
+            file_row_size_graph: s.get_bool("file-row-size-graph"),
+        };
+        let theme = app.theme_registry.read().unwrap().resolve_active();
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let view = crate::ui::render::View { layouts: &app.layouts, options: &app.store, keymap: &app.keymap, conds: &app.conditions };
+        term.draw(|f| app.ui.render(f, &app.state, &app.extensions, &app.vfs, &top, &view, &theme)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h).map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "\n").collect()
+    }
+
+    fn rows(frame: &str) -> Vec<&str> {
+        frame.lines().collect()
+    }
+
+    #[test]
+    fn frames_draw_from_the_layouts() {
+        let mut app = App::boot(super::tests::temp_dir_with_files());
+        app.pump_one();
+        let cwd = app.state.cwd.display().to_string();
+
+        // file layout, Compact (14 rows → a 5-row top): the path sits on the
+        // line the top row shares with the file panel, the help row is last.
+        let f = dump(&mut app, 100, 14);
+        let r = rows(&f);
+        assert!(r[4].starts_with("└─[ ") && r[4].contains(&cwd[..20]), "{f}");
+        assert!(r[5].starts_with("  "), "the file panel has no left border:\n{f}");
+        assert!(r[13].contains("quit"), "{f}");
+
+        // With the function panel, its border crosses the shared line.
+        app.state.function.visible = true;
+        let f = dump(&mut app, 100, 14);
+        assert!(rows(&f)[6].contains('│'), "{f}");
+
+        // select layout: the input row, then the candidates below its line.
+        app.state.function.visible = false;
+        app.dispatch_for_test(Intent::PushMode(Box::new(Mode::Select(crate::core::SelectSpec::file_search()))));
+        let f = dump(&mut app, 100, 14);
+        assert!(rows(&f)[5].starts_with(" ›"), "{f}");
+        assert!(rows(&f)[6].starts_with("────"), "{f}");
+        app.dispatch_for_test(Intent::PopMode);
+
+        // A user layout: the function panel under the file panel keeps its own
+        // title on its own border, and help still has the last row.
+        app.state.function.visible = true;
+        let tree = crate::script::sexpr::parse(
+            "(column (row (size 5) (panel nav) (panel monitor (min 16))) (panel file) \
+             (panel function (size 5) (when function-visible)) (panel help (size 1)))",
+        )
+        .unwrap();
+        app.layouts.set_user(vec![("file".into(), crate::script::layout::parse("file", &tree).unwrap())]);
+        let f = dump(&mut app, 100, 16);
+        let r = rows(&f);
+        assert!(r[10].starts_with("──[ "), "{f}");
+        assert!(r[15].contains("quit"), "{f}");
     }
 }

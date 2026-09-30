@@ -5,10 +5,11 @@
 
 pub mod archive;
 pub mod bookmarks;
-pub mod cmdop;
 pub mod loader;
 pub mod lscolors;
 pub mod preview;
+pub mod pty;
+pub mod repl;
 pub mod registry;
 pub mod settings;
 pub mod theme; // bundled id: "theme"
@@ -22,7 +23,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 
 use crate::core::state::FunctionPanelState;
-use crate::core::{AppState, Entry, ExtensionIntent, Intent, OptionStore, PanelView, ReadResult, Theme};
+use crate::core::{AppState, Entry, ExtensionIntent, Intent, OptionStore, PanelView, Content, Theme};
 use crate::script::condition::Conditions;
 use crate::script::keymap::Binding;
 use crate::services::command::CommandDef;
@@ -122,6 +123,16 @@ pub trait Extension: Send {
     /// default no-op leaves existing extensions unaffected.
     fn bind_store(&self, _store: &Arc<OptionStore>) {}
 
+    /// Hand the extension a clone of the event-loop sender, so one that owns an
+    /// I/O source of its own — a PTY reader thread, a file watcher — can ask for
+    /// a repaint when its state changes out of band. Send `AppEvent::Tick`: the
+    /// loop already treats it as "redraw, nothing changed", so this needs no new
+    /// event, plan, or purpose.
+    ///
+    /// Bundled-only: `Sender<AppEvent>` does not cross the C ABI, so the dynamic
+    /// loader never calls it. Called once at registration, beside `bind_store`.
+    fn bind_events(&self, _tx: std::sync::mpsc::Sender<crate::core::AppEvent>) {}
+
     /// Called once at registration with the resolver chain, for extensions that
     /// build external command lines (option/skeleton lookup) — e.g. the CmdOp
     /// command builder, which has no `CmdCtx` inside `handle_intent`. Default no-op.
@@ -150,6 +161,14 @@ pub trait Extension: Send {
     /// via the shared `OptionStore` (bundled) or a `wasdf_sdk::Settings` snapshot
     /// (dynamic) — with zero edits to core. Default `None` leaves no options.
     fn option_scheme(&self) -> Option<String> {
+        None
+    }
+
+    /// Scheme code loaded into the settings store's session at registration,
+    /// before `config.scm` runs: convenience procedures for users, built on the
+    /// store procedures (doc/SCHEME.md, Preludes). It may only define; a name
+    /// already taken is reported and that definition skipped.
+    fn prelude(&self) -> Option<String> {
         None
     }
 
@@ -189,7 +208,7 @@ pub trait Extension: Send {
     /// decodes it (MIME, highlight, …) and stashes it internally (interior
     /// mutability); `view` later renders from that stash. Runs on the
     /// main thread; core retains nothing.
-    fn accept_content(&self, _path: &Path, _result: &ReadResult) {}
+    fn accept_content(&self, _path: &Path, _result: &Content) {}
 
     /// Produce this extension's function-panel content as a logical [`PanelView`]
     /// (sections / fields / lines of role- or color-styled spans). **Core owns the
@@ -218,6 +237,15 @@ pub trait Extension: Send {
         None
     }
 
+    /// The scroll extent of the form this extension just drew, as
+    /// `(total rows, position)`. Core turns it into the same scrollbar and the
+    /// same post-draw scroll clamp every other function-panel frame gets, so a
+    /// hosted form scrolls like the rest of the panel instead of being a
+    /// special case. `None` (the default) means the form does not scroll.
+    fn form_scroll(&self, _ctx: &FunctionRenderCtx) -> Option<(usize, usize)> {
+        None
+    }
+
     /// Subtrees grafted under `@/settings/<category>`, or onto this
     /// extension's own screen at `@/settings/Extensions/<id>` (anchor the
     /// node's "category" to `id()`, e.g. lscolors' Themes). The
@@ -236,6 +264,19 @@ pub trait Extension: Send {
     fn on_cursor_changed(&self, _state: &AppState) -> Vec<Intent> {
         Vec::new()
     }
+
+    /// Called once per event-loop pass, idle ticks included. For an extension
+    /// whose state can change with no intent behind it — a child process
+    /// exiting, a watched file changing — this is the only place that change
+    /// can become intents.
+    ///
+    /// `on_cursor_changed` cannot serve: it is deduplicated on the cursor
+    /// signature, so it never fires when nothing the *user* did has changed.
+    /// Keep this cheap and return nothing when there is nothing to say — it
+    /// runs on every pass, for every extension.
+    fn on_tick(&self, _state: &AppState) -> Vec<Intent> {
+        Vec::new()
+    }
 }
 
 /// Construct the bundled extensions. The only place they are named. (Settings
@@ -248,8 +289,9 @@ pub fn bundled(config_dir: Option<std::path::PathBuf>) -> Vec<Box<dyn Extension>
     vec![
         Box::new(preview::PreviewExtension::default()),
         Box::new(archive::ArchiveExtension),
-        Box::new(cmdop::CmdOpExtension::default()),
+        Box::new(pty::PtyExtension::new()),
         Box::new(bookmarks::BookmarksExtension::new(config_dir.clone())),
-        Box::new(lscolors::LsColorsExtension::new(config_dir)),
+        Box::new(lscolors::LsColorsExtension::new()),
+        Box::new(repl::ReplExtension::default()),
     ]
 }

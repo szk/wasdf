@@ -2,10 +2,11 @@
 //! formats or parses these names — used by the help panel and to decode the
 //! Scheme-sourced configuration (keymaps and commands) into core types.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::core::{
-    Block, ExtensionIntent, ExtensionValue, Intent, Key, KeyCode, Mode, Mods, PanelView,
+    Block, ExtensionIntent, ExtensionValue, Intent, Key, KeyCode, KeyKind, Mode, Mods, PanelView,
     SelectSpec, SpanStyle, SubLayout, TextSpan,
 };
 use crate::script::condition::Cond;
@@ -13,8 +14,7 @@ use crate::script::sexpr::Datum;
 
 /// A human-readable name for a key, e.g. `Ctrl-a`, `Enter`, `w` — the format
 /// counterpart to [`parse_key`]. Kept as the codec's key-string surface (the
-/// single owner of key string forms); not yet wired to a caller.
-#[allow(dead_code)]
+/// single owner of key string forms).
 pub fn key_name(key: Key) -> String {
     let mut s = String::new();
     if key.mods.ctrl {
@@ -23,6 +23,15 @@ pub fn key_name(key: Key) -> String {
     if key.mods.alt {
         s.push_str("Alt-");
     }
+    if key.mods.sup {
+        s.push_str("Super-");
+    }
+    if key.mods.hyper {
+        s.push_str("Hyper-");
+    }
+    if key.mods.meta {
+        s.push_str("Meta-");
+    }
     if key.mods.shift {
         if let KeyCode::Char(_) = key.code {
             // shift is folded into the character; do not prefix
@@ -30,7 +39,15 @@ pub fn key_name(key: Key) -> String {
             s.push_str("Shift-");
         }
     }
-    s.push_str(&match key.code {
+    s.push_str(&code_name(key.code));
+    s
+}
+
+/// The bare code's spelling, without any modifier prefix. Split out from
+/// [`key_name`] because [`encode_key`] carries the modifiers as separate
+/// fields and must not have them baked into the code string.
+pub fn code_name(code: KeyCode) -> String {
+    match code {
         KeyCode::Char(' ') => "Space".into(),
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Enter => "Enter".into(),
@@ -39,6 +56,7 @@ pub fn key_name(key: Key) -> String {
         KeyCode::BackTab => "Shift-Tab".into(),
         KeyCode::Backspace => "Backspace".into(),
         KeyCode::Delete => "Delete".into(),
+        KeyCode::Insert => "Insert".into(),
         KeyCode::Left => "Left".into(),
         KeyCode::Right => "Right".into(),
         KeyCode::Up => "Up".into(),
@@ -47,8 +65,8 @@ pub fn key_name(key: Key) -> String {
         KeyCode::End => "End".into(),
         KeyCode::PageUp => "PageUp".into(),
         KeyCode::PageDown => "PageDown".into(),
-    });
-    s
+        KeyCode::F(n) => format!("F{n}"),
+    }
 }
 
 // --- parse direction: decode Scheme-sourced config into core types ----------
@@ -68,6 +86,15 @@ pub fn parse_key(name: &str) -> Option<Key> {
         } else if let Some(r) = rest.strip_prefix("Shift-") {
             mods.shift = true;
             rest = r;
+        } else if let Some(r) = rest.strip_prefix("Super-") {
+            mods.sup = true;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("Hyper-") {
+            mods.hyper = true;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("Meta-") {
+            mods.meta = true;
+            rest = r;
         } else {
             break;
         }
@@ -79,6 +106,7 @@ pub fn parse_key(name: &str) -> Option<Key> {
         "BackTab" => KeyCode::BackTab,
         "Backspace" => KeyCode::Backspace,
         "Delete" => KeyCode::Delete,
+        "Insert" => KeyCode::Insert,
         "Space" => KeyCode::Char(' '),
         "Up" => KeyCode::Up,
         "Down" => KeyCode::Down,
@@ -89,19 +117,73 @@ pub fn parse_key(name: &str) -> Option<Key> {
         "PageUp" => KeyCode::PageUp,
         "PageDown" => KeyCode::PageDown,
         s => {
-            let mut chars = s.chars();
-            let c = chars.next()?;
-            if chars.next().is_some() {
-                return None; // multi-char unknown name
+            // `F` + digits, before the single-char fallback, so `F5` is the
+            // function key and a lone `F` is still the letter.
+            if let Some(n) = s.strip_prefix('F').and_then(|d| d.parse::<u8>().ok()) {
+                KeyCode::F(n)
+            } else {
+                let mut chars = s.chars();
+                let c = chars.next()?;
+                if chars.next().is_some() {
+                    return None; // multi-char unknown name
+                }
+                KeyCode::Char(c)
             }
-            KeyCode::Char(c)
         }
     };
     // Shift-Tab is its own code.
     if mods.shift && code == KeyCode::Tab {
-        return Some(Key { code: KeyCode::BackTab, mods: Mods::NONE });
+        return Some(Key::plain(KeyCode::BackTab));
     }
-    Some(Key { code, mods })
+    Some(Key::new(code, mods))
+}
+
+/// A [`Key`] as an [`ExtensionValue::Map`] — the wire form of a captured
+/// keystroke on its way to the owning extension. Lossless, unlike
+/// [`key_name`], which has no spelling for [`KeyKind`] and folds `Shift-Tab`
+/// into a code.
+pub fn encode_key(key: Key) -> ExtensionValue {
+    let mut m = BTreeMap::new();
+    m.insert("code".into(), ExtensionValue::String(code_name(key.code)));
+    for (name, on) in [
+        ("ctrl", key.mods.ctrl),
+        ("shift", key.mods.shift),
+        ("alt", key.mods.alt),
+        ("super", key.mods.sup),
+        ("hyper", key.mods.hyper),
+        ("meta", key.mods.meta),
+    ] {
+        m.insert(name.into(), ExtensionValue::Bool(on));
+    }
+    let kind = match key.kind {
+        KeyKind::Press => "press",
+        KeyKind::Repeat => "repeat",
+        KeyKind::Release => "release",
+    };
+    m.insert("kind".into(), ExtensionValue::String(kind.into()));
+    ExtensionValue::Map(m)
+}
+
+/// Inverse of [`encode_key`].
+pub fn decode_key(v: &ExtensionValue) -> Option<Key> {
+    let ExtensionValue::Map(m) = v else { return None };
+    let flag = |k: &str| m.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+    // `parse_key` owns every code spelling; going through it keeps one table.
+    let mut key = parse_key(m.get("code")?.as_str()?)?;
+    key.mods = Mods {
+        ctrl: flag("ctrl"),
+        shift: flag("shift"),
+        alt: flag("alt"),
+        sup: flag("super"),
+        hyper: flag("hyper"),
+        meta: flag("meta"),
+    };
+    key.kind = match m.get("kind").and_then(|v| v.as_str()) {
+        Some("repeat") => KeyKind::Repeat,
+        Some("release") => KeyKind::Release,
+        _ => KeyKind::Press,
+    };
+    Some(key)
 }
 
 /// Decode an intent datum (a symbol, or a small list form) into a core Intent.
@@ -302,9 +384,15 @@ pub fn cond_from_datum(d: &Datum) -> Cond {
             },
             Some("and") => Cond::And(items[1..].iter().map(cond_from_datum).collect()),
             Some("or") => Cond::Or(items[1..].iter().map(cond_from_datum).collect()),
-            _ => Cond::Always,
+            Some("option") => match items.get(1).and_then(Datum::text) {
+                Some(key) => Cond::Option(key.to_string()),
+                None => Cond::Pred(String::new()),
+            },
+            // Not part of the grammar: never holds (an empty predicate name is
+            // never registered), per "an unknown condition is false".
+            _ => Cond::Pred(String::new()),
         },
-        _ => Cond::Always,
+        _ => Cond::Pred(String::new()),
     }
 }
 
@@ -530,5 +618,80 @@ mod tests {
         assert_eq!(ext_value_to_scheme(&ExtensionValue::Int(7)), "7");
         assert_eq!(ext_value_to_scheme(&ExtensionValue::Bool(true)), "#t");
         assert_eq!(ext_value_to_scheme(&ExtensionValue::String("a\"b".into())), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn function_keys_and_insert_round_trip_through_their_names() {
+        for code in [KeyCode::F(1), KeyCode::F(12), KeyCode::F(35), KeyCode::Insert] {
+            let name = code_name(code);
+            assert_eq!(parse_key(&name).map(|k| k.code), Some(code), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_lone_f_is_still_the_letter() {
+        assert_eq!(parse_key("F").map(|k| k.code), Some(KeyCode::Char('F')));
+    }
+
+    #[test]
+    fn the_kitty_modifiers_survive_a_name_round_trip() {
+        let key = Key::new(
+            KeyCode::Char('b'),
+            Mods { ctrl: true, sup: true, hyper: true, meta: true, ..Mods::NONE },
+        );
+        assert_eq!(parse_key(&key_name(key)), Some(key));
+    }
+
+    #[test]
+    fn encode_key_round_trips_every_code_modifier_and_kind() {
+        let codes = [
+            KeyCode::Char('a'),
+            KeyCode::Char(' '),
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Tab,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Insert,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::F(5),
+        ];
+        let kinds = [KeyKind::Press, KeyKind::Repeat, KeyKind::Release];
+        for code in codes {
+            // Every one of the 64 modifier combinations, so a dropped flag or a
+            // swapped pair (super/hyper/meta are easy to transpose) shows up.
+            for bits in 0u8..64 {
+                for kind in kinds {
+                    let key = Key {
+                        code,
+                        mods: Mods {
+                            ctrl: bits & 1 != 0,
+                            shift: bits & 2 != 0,
+                            alt: bits & 4 != 0,
+                            sup: bits & 8 != 0,
+                            hyper: bits & 16 != 0,
+                            meta: bits & 32 != 0,
+                        },
+                        kind,
+                    };
+                    assert_eq!(decode_key(&encode_key(key)), Some(key), "{key:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encode_key_keeps_modifiers_out_of_the_code_field() {
+        let key = Key::new(KeyCode::Char('b'), Mods::CTRL);
+        let ExtensionValue::Map(m) = encode_key(key) else { panic!("not a map") };
+        assert_eq!(m.get("code").and_then(|v| v.as_str()), Some("b"));
+        assert_eq!(m.get("ctrl").and_then(|v| v.as_bool()), Some(true));
     }
 }

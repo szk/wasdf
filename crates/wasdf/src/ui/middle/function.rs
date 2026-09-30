@@ -13,14 +13,14 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::core::{AppState, Block, FunctionHint, Mode, PanelView, Role, SpanStyle, SubLayout, TextSpan, Theme, LINE_NUMBER_WIDTH};
 use crate::extension::{ExtensionRegistry, FunctionDraw, FunctionRenderCtx};
-use crate::ui::chrome::{self, PanelFrame, ScrollInfo};
+use crate::ui::chrome::{PanelArea, PanelFrame, ScrollInfo};
 use crate::ui::content;
 
 use super::{max_scroll, scrolled, ScrollMemory};
 
-pub(super) fn render_function(
+pub fn render_function(
     frame: &mut Frame,
-    area: Rect,
+    area: PanelArea,
     state: &AppState,
     extensions: &ExtensionRegistry,
     hint: Option<FunctionHint>,
@@ -28,7 +28,7 @@ pub(super) fn render_function(
     panels: &mut Vec<PanelFrame>,
     theme: &Theme,
 ) {
-    let inner = chrome::inner_open_bottom(area);
+    let inner = area.inner();
     let focused = super::focus(state).is_function();
     let scroll = state.function.scroll.offset();
 
@@ -40,7 +40,17 @@ pub(super) fn render_function(
             let sources = state.targets();
             let ctx = FunctionRenderCtx { width: inner.width, height: inner.height, focused, func: &state.function, sources: &sources, theme };
             if let Some(title) = ext.render_form(frame, inner, &ctx) {
-                panels.push(PanelFrame::new(area).title(title).focused(focused).open_bottom(true));
+                match ext.form_scroll(&ctx) {
+                    Some((total, position)) => {
+                        push_function(panels, area, &title, focused, total, inner.height, position, mem)
+                    }
+                    None => {
+                        mem.set_function_title(&title);
+                        panels.push(
+                            area.frame().title(title).focused(focused),
+                        );
+                    }
+                }
             }
             return;
         }
@@ -71,7 +81,7 @@ pub(super) fn render_function(
 
     // Content frame: dispatch by hint (Select) or by the content provider (File).
     match hint {
-        Some(FunctionHint::CommandSummary) => render_command_summary(frame, area, inner, state, focused, panels, theme),
+        Some(FunctionHint::CommandSummary) => render_command_summary(frame, area, inner, state, focused, panels, mem, theme),
         Some(FunctionHint::DirListing) => render_dir_listing(frame, area, inner, state, extensions, focused, mem, panels, theme),
         Some(FunctionHint::Extension(_)) | None => {
             let sources = state.targets();
@@ -103,7 +113,9 @@ pub(super) fn render_function(
                     Paragraph::new(Span::styled(msg, theme.style(Role::Muted))),
                     inner,
                 );
-                panels.push(PanelFrame::new(area).title("content").focused(focused).open_bottom(true));
+                mem.set_function_title("content");
+                mem.set_function_title("content");
+    panels.push(area.frame().title("content").focused(focused));
             }
         }
     }
@@ -111,7 +123,7 @@ pub(super) fn render_function(
 
 fn push_function(
     panels: &mut Vec<PanelFrame>,
-    area: Rect,
+    area: PanelArea,
     title: &str,
     focused: bool,
     total: usize,
@@ -122,7 +134,8 @@ fn push_function(
     // Record the scroll bound for the kernel's post-draw clamp (kernel-owned
     // scroll; the reducer can't see the viewport).
     mem.function_max = max_scroll(total, viewport as usize);
-    let mut f = PanelFrame::new(area).title(title).focused(focused).open_bottom(true);
+    mem.set_function_title(title);
+    let mut f = area.frame().title(title).focused(focused);
     if total > viewport as usize {
         f = f.scroll(ScrollInfo { total, viewport: viewport as usize, position });
     }
@@ -136,7 +149,7 @@ fn push_function(
 /// extension returned.
 fn draw_function(
     frame: &mut Frame,
-    area: Rect,
+    area: PanelArea,
     inner: Rect,
     draw: FunctionDraw,
     focused: bool,
@@ -325,7 +338,7 @@ fn content_target(state: &AppState) -> Option<std::path::PathBuf> {
 
 fn render_dir_listing(
     frame: &mut Frame,
-    area: Rect,
+    area: PanelArea,
     inner: Rect,
     state: &AppState,
     extensions: &ExtensionRegistry,
@@ -348,7 +361,7 @@ fn render_dir_listing(
         None => vec![Line::from("(no selection)")],
     };
     frame.render_widget(Paragraph::new(lines), inner);
-    panels.push(PanelFrame::new(area).title("content").focused(focused).open_bottom(true));
+    panels.push(area.frame().title("content").focused(focused));
 }
 
 /// Whether the active Select is the command flow (Argument input + Options list).
@@ -356,7 +369,8 @@ pub(super) fn is_command_select(state: &AppState) -> bool {
     matches!(state.mode(), Mode::Select(s) if s.id == "command")
 }
 
-fn render_command_summary(frame: &mut Frame, area: Rect, inner: Rect, state: &AppState, focused: bool, panels: &mut Vec<PanelFrame>, theme: &Theme) {
+#[allow(clippy::too_many_arguments)]
+fn render_command_summary(frame: &mut Frame, area: PanelArea, inner: Rect, state: &AppState, focused: bool, panels: &mut Vec<PanelFrame>, mem: &mut ScrollMemory, theme: &Theme) {
     let mut lines: Vec<Line> = Vec::new();
     if let Mode::Select(spec) = state.mode() {
         if let crate::core::OnConfirm::Resolve { template, fill } = &spec.on_confirm {
@@ -422,5 +436,6 @@ fn render_command_summary(frame: &mut Frame, area: Rect, inner: Rect, state: &Ap
         }
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-    panels.push(PanelFrame::new(area).title("Command").focused(focused).open_bottom(true));
+    mem.set_function_title("Command");
+    panels.push(area.frame().title("Command").focused(focused));
 }

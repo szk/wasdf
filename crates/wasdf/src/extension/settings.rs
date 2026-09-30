@@ -4,29 +4,21 @@
 //! group under `@/settings/Extensions/<ext-id>` — one per-extension settings
 //! screen per extension that declared options (Preview's live there, not as a
 //! flat root category). Each leaf shows the current value and opens an inline
-//! editor on Enter. Confirmed edits apply live (via `OptionStore::set`) and
-//! persist to `~/.config/wasdf/config.scm` inside the managed block.
-//!
-//! After the `Options` struct was deleted, this extension is the only writer to
-//! the store for live edits. Matcher settings additionally refresh the shared
-//! `Arc<Mutex<MatcherConfig>>` so the search worker picks up new weights without a
-//! restart.
-
-mod writer;
+//! editor on Enter. A confirmed edit is a `Configure` intent: the settings
+//! store validates it, the projections pick it up, and the Persister writes it
+//! to `custom.scm` (doc/SCHEME.md).
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, RwLock};
 
 use crate::core::{
-    AppState, Entry, ExtensionIntent, ExtensionValue, InputFormSpec, InputKind, Intent, Mode,
-    OptionKind, OptionStore, KEY_ITEM,
+    AppState, ConfigWrite, Entry, ExtensionIntent, ExtensionValue, InputFormSpec, InputKind, Intent,
+    Mode, OptionKind, OptionStore, OptionValue, KEY_ITEM,
 };
 use crate::extension::{About, Extension};
-use crate::services::MatcherConfig;
 use crate::vfs::{vfs_root, VfsProvider};
 
-use writer::ConfigWriter;
 
 // ── SettingsNode ──────────────────────────────────────────────────────────────
 
@@ -71,16 +63,16 @@ impl SettingsStore {
 // ── SettingsProvider ──────────────────────────────────────────────────────────
 
 /// One registered extension's id + About card, for the `@/settings/Extensions`
-/// listing. Populated once after all extensions are registered (the kernel knows
-/// the full set only then), so it is shared as a `OnceLock`.
+/// listing, in priority order. The kernel fills it once every extension is
+/// registered and rewrites it whenever the `extensions` order changes.
 #[derive(Debug, Clone)]
 pub struct ExtInfo {
     pub id: String,
     pub about: About,
 }
 
-/// The set of registered extensions, filled once at the end of boot.
-pub type ExtInfos = Arc<OnceLock<Vec<ExtInfo>>>;
+/// The registered extensions, highest priority first.
+pub type ExtInfos = Arc<RwLock<Vec<ExtInfo>>>;
 
 pub struct SettingsProvider {
     store: Arc<SettingsStore>,
@@ -94,8 +86,8 @@ impl SettingsProvider {
     }
 
     /// The registered extensions (or empty until boot fills them).
-    fn extensions(&self) -> &[ExtInfo] {
-        self.ext_infos.get().map(Vec::as_slice).unwrap_or(&[])
+    fn extensions(&self) -> Vec<ExtInfo> {
+        self.ext_infos.read().map(|v| v.clone()).unwrap_or_default()
     }
 
     /// The ids to list under `@/settings/Extensions`: all registered extensions,
@@ -110,19 +102,13 @@ impl SettingsProvider {
     }
 
     /// The About card for an extension id, if the list has been filled.
-    fn about_for(&self, id: &str) -> Option<&About> {
-        self.extensions().iter().find(|i| i.id == id).map(|i| &i.about)
+    fn about_for(&self, id: &str) -> Option<About> {
+        self.extensions().into_iter().find(|i| i.id == id).map(|i| i.about)
     }
 
-    /// The extension's precedence rank as `(1-based position, total)`, in the
-    /// order the kernel registers and consults extensions. That order is the
-    /// precedence for both input and display: a key collision resolves to the
-    /// **lowest**-ranked extension that binds it (earlier registration wins on a
-    /// tie — see `KeymapRegistry::resolve`), while the function panel is claimed
-    /// by the **highest**-ranked extension that pushes on a cursor event (later
-    /// registration overwrites — see the kernel's cursor-changed broadcast). So
-    /// if the top holder of a key is disabled, the key falls to the next-ranked
-    /// extension that binds it.
+    /// The extension's priority rank as `(1-based position, total)`: lower is
+    /// higher priority wherever one extension is chosen over another (a key
+    /// collision, the content provider, `entry_style` — doc/UI.md).
     fn rank_of(&self, id: &str) -> Option<(usize, usize)> {
         let ids = self.extension_ids();
         ids.iter().position(|i| i == id).map(|p| (p + 1, ids.len()))
@@ -252,14 +238,19 @@ impl VfsProvider for SettingsProvider {
                         entries.push(Entry::virtual_dir(base().join(EXTENSIONS_DIR).join(id).join(nn), nn.to_string()));
                     }
                 }
-                // A read-only Priority leaf: the extension's precedence rank in the
-                // registration/consultation order (keys: lower rank wins a
-                // collision; panel: higher rank overwrites on a cursor event).
+                // The Priority leaf: the extension's rank, editable (it rewrites
+                // the store's `extensions` order).
                 if let Some((rank, total)) = self.rank_of(id) {
-                    entries.push(Entry::virtual_leaf(
+                    let mut e = Entry::virtual_leaf(
                         base().join(EXTENSIONS_DIR).join(id).join("Priority"),
-                        format!("Priority: [{rank}] of {total} — keys: lower wins; panel: higher wins"),
-                    ));
+                        format!("Priority: {rank} of {total} (1 = highest)"),
+                    );
+                    e.activation = Some(ExtensionIntent {
+                        extension: "settings".into(),
+                        intent: "edit-priority".into(),
+                        data: ExtensionValue::String(id.to_string()),
+                    });
+                    entries.push(e);
                 }
                 // A read-only About leaf carrying the version / description.
                 if let Some(about) = self.about_for(id) {
@@ -400,9 +391,7 @@ impl SettingsNode for MonitorNode {
 
 pub struct SettingsExtension {
     store: Arc<SettingsStore>,
-    matcher_cfg: Arc<Mutex<MatcherConfig>>,
     nodes: Vec<Arc<dyn SettingsNode>>,
-    writer: Option<ConfigWriter>,
     /// The registered extensions (id + About), filled by the kernel once all
     /// extensions are known; shared with the provider so it can list them under
     /// `@/settings/Extensions`.
@@ -410,35 +399,22 @@ pub struct SettingsExtension {
 }
 
 impl SettingsExtension {
+    fn ranked_ids(&self) -> Vec<String> {
+        self.ext_infos.read().map(|v| v.iter().map(|i| i.id.clone()).collect()).unwrap_or_default()
+    }
+
     pub fn new(
         option_store: Arc<OptionStore>,
-        matcher_cfg: Arc<Mutex<MatcherConfig>>,
         nodes: Vec<Arc<dyn SettingsNode>>,
-        config_scm: Option<PathBuf>,
         ext_infos: ExtInfos,
     ) -> Self {
         let store = Arc::new(SettingsStore::new(option_store));
-        let writer = config_scm.map(ConfigWriter::new);
         // The Monitor node is settings-owned (it reorganises this store's own
         // monitor.* options), so it is grafted here rather than collected in kernel.
         let mut nodes = nodes;
         nodes.push(Arc::new(MonitorNode { store: store.option_store.clone() }));
-        SettingsExtension { store, matcher_cfg, nodes, writer, ext_infos }
+        SettingsExtension { store, nodes, ext_infos }
     }
-}
-
-/// Rebuild the typed `MatcherConfig` from current store values. Called after any
-/// `matcher.*` key is updated so the search worker picks up new weights.
-fn project_matcher(os: &OptionStore, cfg: &Mutex<MatcherConfig>) {
-    let mut mc = cfg.lock().unwrap();
-    mc.tail_bonus = os.get_i64("matcher.tail-bonus");
-    mc.depth_penalty = os.get_i64("matcher.depth-penalty");
-    mc.length_penalty = os.get_i64("matcher.length-penalty");
-    mc.exec_bonus = os.get_i64("matcher.exec-bonus");
-    mc.preferred_ext = os.get_list("matcher.preferred-ext");
-    mc.noise_ext = os.get_list("matcher.noise-ext");
-    mc.noise_dirs = os.get_list("matcher.noise-dirs");
-    mc.max_results = os.get_u32("matcher.max-results") as usize;
 }
 
 impl Extension for SettingsExtension {
@@ -475,7 +451,10 @@ impl Extension for SettingsExtension {
                 let kind = match &def.kind {
                     OptionKind::Bool => InputKind::Bool,
                     OptionKind::Text => InputKind::Text,
-                    OptionKind::List => InputKind::List,
+                    OptionKind::List(_) => InputKind::List,
+                    // Structured values have no one-line form; their editors are
+                    // settings nodes of the owning extension.
+                    OptionKind::Record(_) | OptionKind::Map(_) => return Vec::new(),
                     OptionKind::Int { min, max } => InputKind::Int { min: *min, max: *max },
                     OptionKind::Choice(opts) => InputKind::Choice(opts.clone()),
                 };
@@ -486,6 +465,29 @@ impl Extension for SettingsExtension {
 
                 vec![Intent::PushMode(Box::new(Mode::InputForm(spec)))]
             }
+            "edit-priority" => {
+                let Some(id) = intent.data.as_str() else { return Vec::new() };
+                let ids = self.ranked_ids();
+                let Some(pos) = ids.iter().position(|i| i == id) else { return Vec::new() };
+                let template = ExtensionIntent {
+                    extension: "settings".into(),
+                    intent: "set-priority".into(),
+                    data: ExtensionValue::Nil.with("field", ExtensionValue::String(id.into())),
+                };
+                let kind = InputKind::Int { min: 1, max: ids.len() as i64 };
+                let spec = InputFormSpec::emit_input_widget(format!("{id} priority (1 = highest)"), template, kind, (pos + 1).to_string());
+                vec![Intent::PushMode(Box::new(Mode::InputForm(spec)))]
+            }
+            "set-priority" => {
+                let Some(id) = intent.data.get("field").and_then(|v| v.as_str()) else { return Vec::new() };
+                let Some(rank) = intent.data.get(KEY_ITEM).and_then(|v| v.as_str()).and_then(|v| v.trim().parse::<usize>().ok())
+                else {
+                    return Vec::new();
+                };
+                let mut items: Vec<String> = self.ranked_ids().into_iter().filter(|i| i != id).collect();
+                items.insert((rank.max(1) - 1).min(items.len()), id.to_string());
+                vec![Intent::Configure(ConfigWrite::SetOrder { name: "extensions".into(), items })]
+            }
             "set" => {
                 let Some(key) = intent.data.get("field").and_then(|v| v.as_str()) else {
                     return Vec::new();
@@ -494,20 +496,15 @@ impl Extension for SettingsExtension {
                     return Vec::new();
                 };
 
-                if !self.store.option_store.set(key, val) {
-                    return Vec::new();
+                let value = self
+                    .store
+                    .option_store
+                    .def(key)
+                    .and_then(|def| OptionValue::parse_flat(&def.kind, val));
+                match value {
+                    Some(value) => vec![Intent::Configure(ConfigWrite::SetOption { key: key.to_string(), value })],
+                    None => vec![Intent::Notify(format!("{key}: invalid value {val:?}"))],
                 }
-
-                // Refresh the typed matcher config when a matcher.* key changes.
-                if key.starts_with("matcher.") {
-                    project_matcher(&self.store.option_store, &self.matcher_cfg);
-                }
-
-                if let Some(w) = &self.writer {
-                    let _ = w.upsert_option(key, val);
-                }
-
-                vec![Intent::Refresh]
             }
             _ => Vec::new(),
         }
@@ -551,7 +548,7 @@ mod tests {
                 category: "Display".into(),
                 label: "border-style".into(),
                 kind: OptionKind::Choice(vec!["single".into()]),
-                default: "single".into(),
+                default: crate::core::OptionValue::Text("single".into()),
                 owner: None,
             },
             OptionDef {
@@ -559,17 +556,14 @@ mod tests {
                 category: "Preview".into(),
                 label: "tab-width".into(),
                 kind: OptionKind::Int { min: 1, max: 8 },
-                default: "4".into(),
+                default: crate::core::OptionValue::Int(4),
                 owner: Some("preview".into()),
             },
         ]);
-        let infos: ExtInfos = Arc::new(OnceLock::new());
-        infos
-            .set(vec![
-                ExtInfo { id: "preview".into(), about: About::new("Preview", "file preview") },
-                ExtInfo { id: "archive".into(), about: About::new("Archive", "pack/unpack") },
-            ])
-            .ok();
+        let infos: ExtInfos = Arc::new(RwLock::new(vec![
+            ExtInfo { id: "preview".into(), about: About::new("Preview", "file preview") },
+            ExtInfo { id: "archive".into(), about: About::new("Archive", "pack/unpack") },
+        ]));
         SettingsProvider {
             store: Arc::new(SettingsStore::new(Arc::new(os))),
             nodes,
@@ -649,13 +643,28 @@ mod tests {
     }
 
     #[test]
-    fn extension_screen_shows_its_precedence_rank() {
-        // `archive` is registered second → rank [2] of 2; the leaf is read-only.
+    fn extension_screen_shows_its_priority_and_editing_it_writes_the_order() {
+        // `archive` is listed second → priority 2 of 2.
         let path = vfs_root().join("settings").join(EXTENSIONS_DIR).join("archive");
-        let list = provider().list(&path).unwrap();
+        let p = provider();
+        let list = p.list(&path).unwrap();
         let prio = list.iter().find(|e| e.name.starts_with("Priority:")).expect("Priority leaf");
-        assert!(prio.name.contains("[2] of 2"), "rank shown: {}", prio.name);
-        assert!(prio.activation.is_none(), "Priority is read-only");
+        assert!(prio.name.contains("2 of 2"), "rank shown: {}", prio.name);
+        let ext = SettingsExtension::new(p.store.option_store.clone(), vec![], p.ext_infos.clone());
+        let set = ExtensionIntent {
+            extension: "settings".into(),
+            intent: "set-priority".into(),
+            data: ExtensionValue::Nil
+                .with("field", ExtensionValue::String("archive".into()))
+                .with(KEY_ITEM, ExtensionValue::String("1".into())),
+        };
+        assert_eq!(
+            ext.handle_intent(&set, &AppState::new(std::env::temp_dir())),
+            vec![Intent::Configure(ConfigWrite::SetOrder {
+                name: "extensions".into(),
+                items: vec!["archive".into(), "preview".into()],
+            })]
+        );
     }
 
     // A **user** extension dropped into the extensions dir (the same path the
@@ -680,8 +689,7 @@ mod tests {
         assert_eq!(about.version, env!("CARGO_PKG_VERSION"), "default About carries the app version");
 
         // Fed into the settings provider exactly as the kernel does at boot.
-        let infos: ExtInfos = Arc::new(OnceLock::new());
-        infos.set(vec![ExtInfo { id: ue.id().to_string(), about }]).ok();
+        let infos: ExtInfos = Arc::new(RwLock::new(vec![ExtInfo { id: ue.id().to_string(), about }]));
         let p = SettingsProvider {
             store: Arc::new(SettingsStore::new(Arc::new(OptionStore::new(vec![])))),
             nodes: vec![],
@@ -702,5 +710,31 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_confirmed_edit_is_a_typed_configure_and_a_bad_value_a_notice() {
+        let store = Arc::new(OptionStore::new(vec![OptionDef {
+            key: "n".into(),
+            category: "Display".into(),
+            label: "n".into(),
+            kind: OptionKind::Int { min: 1, max: 9 },
+            default: OptionValue::Int(1),
+            owner: None,
+        }]));
+        let ext = SettingsExtension::new(store.clone(), vec![], Arc::default());
+        let set = |val: &str| {
+            let data = ExtensionValue::Nil
+                .with("field", ExtensionValue::String("n".into()))
+                .with(KEY_ITEM, ExtensionValue::String(val.into()));
+            let intent = ExtensionIntent { extension: "settings".into(), intent: "set".into(), data };
+            ext.handle_intent(&intent, &AppState::new(std::env::temp_dir()))
+        };
+        assert_eq!(
+            set("7"),
+            vec![Intent::Configure(ConfigWrite::SetOption { key: "n".into(), value: OptionValue::Int(7) })]
+        );
+        assert!(matches!(set("70").as_slice(), [Intent::Notify(_)]), "out of range");
+        assert_eq!(store.get_i64("n"), 1, "the extension never writes the projection itself");
     }
 }

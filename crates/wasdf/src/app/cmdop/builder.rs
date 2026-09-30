@@ -1,11 +1,9 @@
-//! CmdOpExtension: the copy / move / rename command builder, hosted in the
-//! function panel as an **interactive form** (the reference "form" extension,
-//! next to `PreviewExtension` the reference "content" one). It owns its state in
-//! interior mutability, handles its keys via `handle_intent`, draws itself via
-//! `render_form`, and reads its browse directory through the generic
-//! `LoadContent` → `accept_content` path. Core / app / ui never touch its
-//! internals — only the generic seams (`form_owner`, `FunctionInput`,
-//! `render_form`, `bind_services`).
+//! The command builder, hosted in the function panel as an **interactive
+//! form** — the reference form, next to preview's reference content. It owns
+//! its state in interior mutability, handles its keys via `handle_intent`,
+//! draws itself via `render_form`, and reads its browse directory through the
+//! generic `LoadContent` → `accept_content` path, so core / ui see only the
+//! generic seams (`form_owner`, `FunctionInput`, `render_form`).
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -21,16 +19,13 @@ use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarStat
 use crate::core::event::ResolverRequest;
 use crate::core::scroll::Scroll;
 use crate::core::{
-    AppState, CmdToken, Entry, ExtensionIntent, ExtensionValue, FunctionInput, Intent, ReadResult,
+    AppState, CmdToken, Entry, ExtensionIntent, ExtensionValue, FunctionInput, Intent, Content,
     Role, PANEL_FUNCTION,
 };
 use crate::extension::{Extension, FunctionRenderCtx};
-use crate::script::condition::Conditions;
-use crate::services::command::CommandDef;
 use crate::services::resolver::{ArgEl, ResolverChain, Slot};
 
 const ID: &str = "cmdop";
-const KEYMAP_SCHEME: &str = include_str!("keymap.scm");
 /// Rows the CLI-builder preview occupies at the top of the panel.
 const PREVIEW_H: u16 = 5;
 /// `"[x] "` — the pinned option-checkbox prefix width.
@@ -189,24 +184,30 @@ impl Form {
 }
 
 /// The bundled CmdOp form extension.
-pub struct CmdOpExtension {
+pub struct CmdOp {
     form: RefCell<Option<Form>>,
     resolver: OnceLock<Arc<ResolverChain>>,
     /// Memo of `--help`-parsed options, one entry per external command.
     opt_cache: RefCell<HashMap<String, Vec<(String, String)>>>,
+    store: OnceLock<Arc<crate::core::OptionStore>>,
+    /// Every registered extension id, filled by the kernel once all are
+    /// registered: `cmdop.runner` is user data and may name one that is not.
+    extension_ids: Arc<OnceLock<Vec<String>>>,
 }
 
-impl Default for CmdOpExtension {
-    fn default() -> Self {
-        CmdOpExtension {
+impl CmdOp {
+    pub fn new(extension_ids: Arc<OnceLock<Vec<String>>>) -> Self {
+        CmdOp {
             form: RefCell::new(None),
             resolver: OnceLock::new(),
             opt_cache: RefCell::new(HashMap::new()),
+            store: OnceLock::new(),
+            extension_ids,
         }
     }
 }
 
-impl CmdOpExtension {
+impl CmdOp {
     /// The option rows for an op: declared options, or those parsed once from the
     /// resolved command's `--help` (memoized).
     fn options_for(&self, op: Op) -> Vec<OptRow> {
@@ -531,7 +532,7 @@ impl CmdOpExtension {
                     if argv.is_empty() {
                         vec![Intent::SetFunctionForm(None)]
                     } else {
-                        vec![Intent::Execute { argv }, Intent::SetFunctionForm(None)]
+                        self.run_command(argv, state)
                     }
                 } else {
                     Vec::new() // back to builder navigation
@@ -547,6 +548,37 @@ impl CmdOpExtension {
             }
             _ => Vec::new(),
         }
+    }
+}
+
+impl CmdOp {
+    /// How to run a command the builder assembled: `Execute` into the Exec
+    /// frame, or — when `cmdop.runner` names a registered extension — that
+    /// extension's `"run"` (the runner contract, doc/CMDOP.md). The runner
+    /// claims the panel itself, so the form is released first.
+    fn run_command(&self, argv: Vec<String>, state: &AppState) -> Vec<Intent> {
+        let runner = self.store.get().map(|s| s.get_str("cmdop.runner")).unwrap_or_default();
+        if runner.is_empty() {
+            return vec![Intent::SetFunctionForm(None), Intent::Execute { argv }];
+        }
+        if !self.extension_ids.get().is_some_and(|ids| ids.contains(&runner)) {
+            return vec![
+                Intent::SetFunctionForm(None),
+                Intent::Notify(format!("cmdop.runner: no extension \"{runner}\"; running captured")),
+                Intent::Execute { argv },
+            ];
+        }
+        let label = argv.join(" ");
+        let data = std::collections::BTreeMap::from([
+            ("argv".to_string(), ExtensionValue::List(argv.into_iter().map(ExtensionValue::String).collect())),
+            ("cwd".to_string(), ExtensionValue::Path(state.cwd.clone())),
+            ("label".to_string(), ExtensionValue::String(label)),
+            ("escape".to_string(), ExtensionValue::String("prefix-and-cursor".into())),
+        ]);
+        vec![
+            Intent::SetFunctionForm(None),
+            Intent::Extension(ExtensionIntent { extension: runner, intent: "run".into(), data: ExtensionValue::Map(data) }),
+        ]
     }
 }
 
@@ -779,7 +811,7 @@ fn section_scrollbar(
     frame.render_stateful_widget(bar, Rect { x, y, width: 1, height }, &mut st);
 }
 
-impl Extension for CmdOpExtension {
+impl Extension for CmdOp {
     fn id(&self) -> &str {
         ID
     }
@@ -788,35 +820,8 @@ impl Extension for CmdOpExtension {
         crate::extension::About::new("CmdOp", "Copy / move / rename command builder in the function panel")
     }
 
-    fn scheme_source(&self) -> Option<String> {
-        Some(KEYMAP_SCHEME.to_string())
-    }
-
-    fn commands(&self) -> Vec<CommandDef> {
-        let cmd = |name: &str, desc: &str, intent: &str| CommandDef {
-            name: name.into(),
-            description: desc.into(),
-            intent: Intent::Extension(ExtensionIntent {
-                extension: ID.into(),
-                intent: intent.into(),
-                data: ExtensionValue::Nil,
-            }),
-        };
-        vec![
-            cmd("copy", "copy selection/cursor", "start-copy"),
-            cmd("move", "move selection/cursor", "start-move"),
-            cmd("rename", "rename the cursor entry", "start-rename"),
-            // Both names open the same combined multi-line builder (M) — a
-            // line's trailing `/` picks mkdir vs touch, so there is only one
-            // flow to keep discoverable under either familiar term.
-            cmd("mkdir", "make a directory (or touch a file — M)", "start-create"),
-            cmd("touch", "create an empty file (or mkdir a directory — M)", "start-create"),
-        ]
-    }
-
-    fn register_conditions(&self, c: &mut Conditions) {
-        // Gates every CmdOp key — reads only &AppState (the generic form_owner).
-        c.register("cmdop-active", Box::new(|s| s.function.form_owner.as_deref() == Some(ID)));
+    fn bind_store(&self, store: &Arc<crate::core::OptionStore>) {
+        let _ = self.store.set(store.clone());
     }
 
     fn bind_services(&self, resolver: &Arc<ResolverChain>) {
@@ -905,12 +910,12 @@ impl Extension for CmdOpExtension {
         }
     }
 
-    fn accept_content(&self, path: &std::path::Path, result: &ReadResult) {
+    fn accept_content(&self, path: &std::path::Path, result: &Content) {
         // Self-gate: only accept the listing for the directory we are browsing
         // (also rejects a deep-search completion that arrives after the user
         // has since browsed elsewhere — `awaiting_deep` for the old dir is
         // already false by then, reset by `Form::reset_deep`).
-        if let ReadResult::Dir { entries } = result {
+        if let Content::Dir { entries } = result {
             if let Some(form) = self.form.borrow_mut().as_mut() {
                 if form.list_cwd == path {
                     form.entries = entries.clone();
@@ -1175,7 +1180,7 @@ mod tests {
 
     #[test]
     fn start_copy_opens_the_form_and_reads_the_listing() {
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         let out = ext.handle_intent(&ei("start-copy"), &state_with_cursor());
         assert!(ext.form.borrow().is_some(), "the form is activated");
         // Shows/focuses the panel and reads the browse directory off-thread.
@@ -1185,7 +1190,7 @@ mod tests {
 
     #[test]
     fn start_copy_without_a_target_is_a_no_op() {
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         let s = AppState::new(std::path::PathBuf::from("/d")); // no entries → no targets
         assert!(ext.handle_intent(&ei("start-copy"), &s).is_empty());
         assert!(ext.form.borrow().is_none());
@@ -1193,21 +1198,21 @@ mod tests {
 
     #[test]
     fn accept_content_stashes_the_listing_for_the_browsed_dir() {
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         ext.handle_intent(&ei("start-copy"), &state_with_cursor());
         let entries = vec![entry("/d/x", "x", true), entry("/d/y", "y", false)];
-        ext.accept_content(std::path::Path::new("/d"), &ReadResult::Dir { entries: entries.clone() });
+        ext.accept_content(std::path::Path::new("/d"), &Content::Dir { entries: entries.clone() });
         assert_eq!(ext.form.borrow().as_ref().unwrap().entries.len(), 2);
         // A stale read for another directory is ignored.
-        ext.accept_content(std::path::Path::new("/other"), &ReadResult::Dir { entries: vec![] });
+        ext.accept_content(std::path::Path::new("/other"), &Content::Dir { entries: vec![] });
         assert_eq!(ext.form.borrow().as_ref().unwrap().entries.len(), 2);
     }
 
     #[test]
     fn cursor_moves_within_the_form() {
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         ext.handle_intent(&ei("start-copy"), &state_with_cursor());
-        ext.accept_content(std::path::Path::new("/d"), &ReadResult::Dir {
+        ext.accept_content(std::path::Path::new("/d"), &Content::Dir {
             entries: vec![entry("/d/x", "x", false), entry("/d/y", "y", false)],
         });
         // No options → cursor starts at 0 (first listing row); down moves to 1.
@@ -1222,10 +1227,10 @@ mod tests {
 
     #[test]
     fn space_marks_the_listing_entry_independently() {
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         let s = state_with_cursor();
         ext.handle_intent(&ei("start-copy"), &s);
-        ext.accept_content(std::path::Path::new("/d"), &ReadResult::Dir {
+        ext.accept_content(std::path::Path::new("/d"), &Content::Dir {
             entries: vec![entry("/d/x", "x", true)],
         });
         ext.handle_intent(&ei("space"), &s);
@@ -1233,9 +1238,55 @@ mod tests {
         assert!(s.selection.is_empty(), "the file selection is untouched");
     }
 
+    fn store_with_runner(runner: &str) -> Arc<crate::core::OptionStore> {
+        let store = Arc::new(crate::core::OptionStore::new(vec![crate::core::OptionDef {
+            key: "cmdop.runner".into(),
+            category: "CmdOp".into(),
+            label: "runner".into(),
+            kind: crate::core::OptionKind::Text,
+            default: crate::core::OptionValue::Text(String::new()),
+            owner: None,
+        }]));
+        store.set("cmdop.runner", crate::core::OptionValue::Text(runner.into()));
+        store
+    }
+
+    fn cmdop_with(runner: &str, registered: &[&str]) -> CmdOp {
+        let ids = Arc::new(OnceLock::new());
+        let _ = ids.set(registered.iter().map(|s| s.to_string()).collect());
+        let c = CmdOp::new(ids);
+        c.bind_store(&store_with_runner(runner));
+        c
+    }
+
+    #[test]
+    fn with_no_runner_a_built_command_runs_captured() {
+        let got = cmdop_with("", &["pty"]).run_command(vec!["ls".into()], &state_with_cursor());
+        assert!(matches!(got.as_slice(), [Intent::SetFunctionForm(None), Intent::Execute { .. }]), "{got:?}");
+    }
+
+    #[test]
+    fn an_unregistered_runner_is_noticed_and_runs_captured() {
+        let got = cmdop_with("pty", &[]).run_command(vec!["ls".into()], &state_with_cursor());
+        assert!(matches!(got.as_slice(), [Intent::SetFunctionForm(None), Intent::Notify(_), Intent::Execute { .. }]), "{got:?}");
+    }
+
+    #[test]
+    fn a_registered_runner_gets_the_run_contract() {
+        let got = cmdop_with("pty", &["pty"]).run_command(vec!["rg".into(), "foo".into()], &state_with_cursor());
+        let [Intent::SetFunctionForm(None), Intent::Extension(e)] = got.as_slice() else { panic!("{got:?}") };
+        assert_eq!((e.extension.as_str(), e.intent.as_str()), ("pty", "run"));
+        let ExtensionValue::Map(m) = &e.data else { panic!("expected a map") };
+        assert_eq!(m.get("label").and_then(|v| v.as_str()), Some("rg foo"));
+        assert_eq!(m.get("escape").and_then(|v| v.as_str()), Some("prefix-and-cursor"));
+        assert!(matches!(m.get("cwd"), Some(ExtensionValue::Path(_))));
+        let Some(ExtensionValue::List(argv)) = m.get("argv") else { panic!("expected argv") };
+        assert_eq!(argv.len(), 2);
+    }
+
     #[test]
     fn confirm_emits_the_resolver_and_closes() {
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         let s = state_with_cursor();
         ext.handle_intent(&ei("start-copy"), &s);
         let out = ext.handle_intent(&ei("confirm"), &s);
@@ -1246,7 +1297,7 @@ mod tests {
 
     #[test]
     fn cancel_closes_the_form() {
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         let s = state_with_cursor();
         ext.handle_intent(&ei("start-copy"), &s);
         let out = ext.handle_intent(&ei("cancel"), &s);
@@ -1258,7 +1309,7 @@ mod tests {
 
     #[test]
     fn slash_opens_a_deep_search_input_when_no_deep_results_are_active() {
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         let s = state_with_cursor();
         ext.handle_intent(&ei("start-copy"), &s);
         let out = ext.handle_intent(&ei("filter-start"), &s);
@@ -1268,7 +1319,7 @@ mod tests {
         );
     }
 
-    fn submit_search_deep(ext: &CmdOpExtension, s: &AppState, text: &str) -> Vec<Intent> {
+    fn submit_search_deep(ext: &CmdOp, s: &AppState, text: &str) -> Vec<Intent> {
         let data = ExtensionValue::Map(
             [
                 ("purpose".to_string(), ExtensionValue::String("search-deep".into())),
@@ -1282,7 +1333,7 @@ mod tests {
 
     #[test]
     fn deep_submit_emits_load_search_for_the_browsed_dir() {
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         let s = state_with_cursor();
         ext.handle_intent(&ei("start-copy"), &s);
         let out = submit_search_deep(&ext, &s, "needle");
@@ -1299,10 +1350,10 @@ mod tests {
 
     #[test]
     fn an_empty_deep_submit_issues_no_search_and_leaves_the_browser_untouched() {
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         let s = state_with_cursor();
         ext.handle_intent(&ei("start-copy"), &s);
-        ext.accept_content(std::path::Path::new("/d"), &ReadResult::Dir { entries: vec![entry("/d/x", "x", false)] });
+        ext.accept_content(std::path::Path::new("/d"), &Content::Dir { entries: vec![entry("/d/x", "x", false)] });
         let out = submit_search_deep(&ext, &s, "");
         assert!(out.is_empty());
         assert!(!ext.form.borrow().as_ref().unwrap().awaiting_deep);
@@ -1311,7 +1362,7 @@ mod tests {
 
     #[test]
     fn accepting_deep_results_flips_slash_to_the_shallow_filter() {
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         let s = state_with_cursor();
         ext.handle_intent(&ei("start-copy"), &s);
         submit_search_deep(&ext, &s, "needle");
@@ -1319,7 +1370,7 @@ mod tests {
         // The deep search completes (owner-addressed Search → the same
         // generic content Read every LoadContent completion uses).
         let found = vec![entry("/d/sub/needle.txt", "needle.txt", false)];
-        ext.accept_content(std::path::Path::new("/d"), &ReadResult::Dir { entries: found.clone() });
+        ext.accept_content(std::path::Path::new("/d"), &Content::Dir { entries: found.clone() });
         assert!(ext.form.borrow().as_ref().unwrap().deep_results);
         assert!(!ext.form.borrow().as_ref().unwrap().awaiting_deep);
         assert_eq!(ext.form.borrow().as_ref().unwrap().entries, found);
@@ -1332,11 +1383,11 @@ mod tests {
 
     #[test]
     fn changing_the_browse_dir_resets_to_deep() {
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         let s = state_with_cursor();
         ext.handle_intent(&ei("start-copy"), &s);
         submit_search_deep(&ext, &s, "needle");
-        ext.accept_content(std::path::Path::new("/d"), &ReadResult::Dir {
+        ext.accept_content(std::path::Path::new("/d"), &Content::Dir {
             entries: vec![entry("/d/sub", "sub", true)],
         });
         assert!(ext.form.borrow().as_ref().unwrap().deep_results);
@@ -1356,7 +1407,7 @@ mod tests {
 
     #[test]
     fn a_stale_deep_completion_for_an_abandoned_dir_is_ignored() {
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         let s = state_with_cursor();
         ext.handle_intent(&ei("start-copy"), &s);
         submit_search_deep(&ext, &s, "needle");
@@ -1367,7 +1418,7 @@ mod tests {
         assert_eq!(ext.form.borrow().as_ref().unwrap().list_cwd, std::path::PathBuf::from("/"));
         // The stale completion, addressed to the old path, must not resurrect
         // deep_results/entries for the directory no longer being browsed.
-        ext.accept_content(std::path::Path::new("/d"), &ReadResult::Dir {
+        ext.accept_content(std::path::Path::new("/d"), &Content::Dir {
             entries: vec![entry("/d/needle.txt", "needle.txt", false)],
         });
         assert!(!ext.form.borrow().as_ref().unwrap().deep_results);
@@ -1377,7 +1428,7 @@ mod tests {
     fn start_create_needs_no_targets_and_opens_a_multiline_input() {
         // Unlike copy/move/rename, create works even with nothing selected —
         // an empty directory is a perfectly good place to make a new file.
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         let s = AppState::new(std::path::PathBuf::from("/d")); // no entries
         let out = ext.handle_intent(&ei("start-create"), &s);
         assert!(ext.form.borrow().is_some());
@@ -1402,7 +1453,7 @@ mod tests {
 
     #[test]
     fn run_create_emits_one_run_resolver_per_line_and_closes() {
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         let s = state_with_cursor();
         ext.handle_intent(&ei("start-create"), &s);
         let data = ExtensionValue::Map(
@@ -1431,7 +1482,7 @@ mod tests {
 
     #[test]
     fn create_lines_cancel_closes_without_running_anything() {
-        let ext = CmdOpExtension::default();
+        let ext = CmdOp::new(Arc::default());
         let s = state_with_cursor();
         ext.handle_intent(&ei("start-create"), &s);
         let data = ExtensionValue::Map(

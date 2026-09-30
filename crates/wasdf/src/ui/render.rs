@@ -19,53 +19,8 @@ use ratatui::widgets::{
 
 use crate::core::{AppState, InputFormState, Mode, Notice, Role, Theme};
 use crate::extension::ExtensionRegistry;
-use crate::ui::chrome::{self, PanelFrame};
+use crate::ui::chrome::{self, PanelArea, PanelFrame};
 use crate::ui::middle::ScrollMemory;
-
-fn top_rows(height: u16) -> u16 {
-    if height >= 25 { 7 } else { 5 }
-}
-
-/// Split a rect into left and right sharing the divider column.
-pub(crate) fn split_h(r: Rect, left_w: u16) -> (Rect, Rect) {
-    let left_w = left_w.clamp(2, r.width.saturating_sub(2).max(2));
-    let sx = r.x + left_w - 1;
-    let left = Rect { x: r.x, y: r.y, width: sx - r.x + 1, height: r.height };
-    let right = Rect { x: sx, y: r.y, width: r.x + r.width - sx, height: r.height };
-    (left, right)
-}
-
-/// Split a rect into top and bottom sharing the divider row.
-pub(crate) fn split_v(r: Rect, top_h: u16) -> (Rect, Rect) {
-    let top_h = top_h.clamp(2, r.height.saturating_sub(2).max(2));
-    let sy = r.y + top_h - 1;
-    let top = Rect { x: r.x, y: r.y, width: r.width, height: sy - r.y + 1 };
-    let bot = Rect { x: r.x, y: sy, width: r.width, height: r.y + r.height - sy };
-    (top, bot)
-}
-
-pub(crate) fn ratio_left(width: u16, lw: u32, rw: u32) -> u16 {
-    ((width as u32 * lw) / (lw + rw)) as u16
-}
-
-/// Pre-compute the absolute X column of the function panel's left border for the
-/// current frame so `render_top` can place the bottom border path/filename labels.
-/// Returns `None` when the function panel is not visible this frame.
-fn compute_func_x(state: &AppState, main: Rect) -> Option<u16> {
-    use crate::core::Mode;
-    let show = match state.mode() {
-        Mode::Select(spec) => spec.function_hint.is_some(),
-        _ => state.function.visible,
-    };
-    if !show {
-        return None;
-    }
-    let (lw, rw) = state.function.ratio.weights();
-    // Replicate split_h's clamped left_w to find the shared column.
-    let target = ratio_left(main.width, lw, rw);
-    let left_w = target.clamp(2, main.width.saturating_sub(2).max(2));
-    Some(main.x + left_w - 1)
-}
 
 pub fn render(
     frame: &mut Frame,
@@ -75,6 +30,7 @@ pub fn render(
     notice: Option<&Notice>,
     vfs: &crate::vfs::Vfs,
     opts: &crate::ui::top::TopOptions,
+    view: &View,
     theme: &Theme,
 ) {
     let area = frame.area();
@@ -85,37 +41,59 @@ pub fn render(
     // Global base colors: fg/bg paint the entire frame — including the cells
     // behind the border and every panel — and are overridden per-cell wherever
     // a more specific role sets its own fg/bg. Applied first so everything that
-    // follows composes on top of it. `theme.style(Role::Base)` already resolves
-    // to the base fg/bg pair (see `Theme::resolved_fg_bg`), so no manual `.bg`
-    // override is needed here anymore.
+    // follows composes on top of it.
     frame.buffer_mut().set_style(area, theme.style(Role::Base));
 
-    let tr = top_rows(area.height);
-    // help on the last row (unboxed); the box spans the rest. Top and main
-    // overlap by one row so their borders share a single divider line.
-    let help_y = area.y + area.height - 1;
-    let top = Rect { x: area.x, y: area.y, width: area.width, height: tr };
-    let main = Rect {
-        x: area.x,
-        y: area.y + tr - 1,
-        width: area.width,
-        height: area.height.saturating_sub(tr),
+    let (layout_id, hint) = match state.mode() {
+        Mode::Select(spec) => ("select", spec.function_hint.clone()),
+        _ => ("file", None),
     };
-    let help = Rect { x: area.x, y: help_y, width: area.width, height: 1 };
+    let Some(tree) = view.layouts.get(layout_id) else { return };
+    let env = crate::ui::layout::Env { state, options: view.options, conds: view.conds };
+    let placed = crate::ui::layout::solve(tree, area, &env);
+    let panel = |id: &str| placed.iter().find(|(p, _)| p == id).map(|(_, r)| panel_area(*r, area, &placed));
 
     // Default to "no clamp"; the function-panel render records real bounds only
     // when it draws a scrollable frame this pass.
     scroll.reset_function_bounds();
     let mut panels: Vec<PanelFrame> = Vec::new();
-    let func_x = compute_func_x(state, main);
-    crate::ui::top::render_top(frame, top, state, vfs, &mut panels, opts, func_x, theme);
-    match state.mode() {
-        Mode::Select(_) => crate::ui::middle::render_select_main(frame, main, state, extensions, scroll, &mut panels, theme),
-        _ => crate::ui::middle::render_file_main(frame, main, state, extensions, scroll, &mut panels, theme, opts.file_row_size_graph),
+    // The main panels draw first, so the border labels can use the title the
+    // function panel actually ended up with.
+    for (id, _) in &placed {
+        let Some(pa) = panel(id) else { continue };
+        match id.as_str() {
+            "file" => crate::ui::middle::render_file_list(frame, pa, state, extensions, scroll, &mut panels, theme, opts.file_row_size_graph),
+            "select-input" => crate::ui::middle::render_select_input(frame, pa, state, &mut panels, theme),
+            "select-candidates" => crate::ui::middle::render_select_candidates(frame, pa, state, extensions, scroll, &mut panels, theme),
+            "function" => crate::ui::middle::render_function(frame, pa, state, extensions, hint.clone(), scroll, &mut panels, theme),
+            _ => {}
+        }
     }
+    for (id, _) in &placed {
+        let Some(pa) = panel(id) else { continue };
+        match id.as_str() {
+            "nav" => crate::ui::top::render_nav(frame, pa, state, vfs, &mut panels, theme),
+            "prop" => crate::ui::top::render_prop(frame, pa, state, &mut panels, theme),
+            "monitor" => crate::ui::top::render_monitor(frame, pa, state, &mut panels, &opts.border_style, &opts.monitor, theme),
+            _ => {}
+        }
+    }
+    let anchor = ["file", "select-input", "select-candidates"].into_iter().find_map(|id| panel(id));
+    let labels = match anchor {
+        Some(a) => crate::ui::top::border_labels(
+            state,
+            a.rect,
+            panel("function").map(|f| f.rect),
+            scroll.function_title(),
+            &opts.border_style,
+        ),
+        None => Vec::new(),
+    };
 
-    chrome::render(frame, &panels, &opts.border_style, &opts.scrollbar, theme);
-    crate::ui::bottom::render_bottom(frame, help, state, theme);
+    chrome::render(frame, &panels, &labels, &opts.border_style, &opts.scrollbar, theme);
+    if let Some(help) = panel("help") {
+        crate::ui::bottom::render_bottom(frame, help.rect, state, view.keymap, view.conds, theme);
+    }
 
     if let Some(n) = notice {
         render_notice(frame, area, n, theme);
@@ -127,6 +105,30 @@ pub fn render(
         if let Some(form) = &state.input_form {
             render_input_form(frame, area, spec, form, theme);
         }
+    }
+}
+
+/// What render reads besides AppState: the layouts, and the projections a
+/// layout's attributes and conditions consult.
+pub struct View<'a> {
+    pub layouts: &'a crate::ui::layout::Layouts,
+    pub options: &'a crate::core::OptionStore,
+    pub keymap: &'a crate::script::keymap::KeymapRegistry,
+    pub conds: &'a crate::script::condition::Conditions,
+}
+
+/// A solved panel with its open edges (doc/UI.md, Screen chrome): no left
+/// border where it meets the frame's left edge below the top row, no bottom
+/// border where it rests on an unboxed panel or the frame's bottom edge.
+fn panel_area(r: Rect, area: Rect, placed: &[(String, Rect)]) -> PanelArea {
+    let below = r.y + r.height;
+    let on_unboxed = placed.iter().any(|(id, o)| {
+        !crate::script::layout::is_boxed(id) && o.y == below && o.x < r.x + r.width && r.x < o.x + o.width
+    });
+    PanelArea {
+        rect: r,
+        open_left: r.x == area.x && r.y > area.y,
+        open_bottom: on_unboxed || below == area.y + area.height,
     }
 }
 

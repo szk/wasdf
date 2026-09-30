@@ -14,19 +14,19 @@ pub mod theme;
 
 pub use event::{
     AppEvent, AsyncResult, AsyncStatus, Block, Emph, ExecOutput, OpDone, PanelView, Payload, Plan,
-    Purpose, ReadResult, ResolverRequest, SpanStyle, TextSpan, LINE_NUMBER_WIDTH,
+    Purpose, Content, ResolverRequest, SpanStyle, TextSpan, LINE_NUMBER_WIDTH,
 };
 pub use extension_value::{ExtensionValue, KEY_ITEM, KEY_RESOLVER};
-pub use intent::{ExtensionIntent, Intent, Key, KeyCode, Mods};
+pub use intent::{ExtensionIntent, Intent, Key, KeyCode, KeyKind, Mods};
 pub use mode::{
     Candidate, CmdToken, ConfirmShape, FunctionHint, InputFormSpec, InputKind, Mode, OnConfirm,
     ResolveFill, SelectInput, SelectSource, SelectSpec, SubLayout,
 };
-pub use option::{OptionDef, OptionKind, OptionStore};
+pub use option::{ConfigWrite, OptionDef, OptionKind, OptionStore, OptionValue};
 pub use scroll::Scroll;
 pub use theme::{color_to_rgb, color_token, parse_color, Role, Theme};
 pub use reducer::{CommandLookup, Effects, Notice, apply_intent, apply_result};
 pub use state::{
-    AppState, Entry, EntryList, FunctionInput, InputFormState, ListGeom, ListLayout, PanelSearch,
-    SelectPhase, PANEL_FILE, PANEL_FUNCTION,
+    AppState, Entry, EntryList, FunctionInput, InputCapture, InputFormState, ListGeom, ListLayout,
+    PanelSearch, SelectPhase, PANEL_FILE, PANEL_FUNCTION,
 };

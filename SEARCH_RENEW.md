@@ -65,7 +65,7 @@ Everything else — Esc semantics, `filter_stack`, `filter-maxed` gating,
   bindings.
 - `cursor_path()` (`core/state.rs:447`) keys the Select arm on
   `spec.id == "file-search"`.
-- CmdOp browser: `crates/wasdf/src/extension/cmdop/extension.rs` —
+- CmdOp browser: `crates/wasdf/src/app/cmdop/builder.rs` —
   `Form.entries` + `filter_query`; `/` → `filter-start` → `FunctionInput`
   purpose `"filter"`, live shallow filter via `active_filter` (~503);
   directory listings arrive through the generic Read

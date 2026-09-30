@@ -72,11 +72,12 @@ impl UiManager {
         extensions: &ExtensionRegistry,
         vfs: &crate::vfs::Vfs,
         opts: &crate::ui::top::TopOptions,
+        view: &crate::ui::render::View,
         theme: &crate::core::Theme,
     ) {
         let notice = self.notice.as_ref().and_then(|(n, at)| {
             (at.elapsed() < NOTICE_TTL).then_some(n)
         });
-        crate::ui::render::render(frame, state, extensions, &mut self.scroll, notice, vfs, opts, theme);
+        crate::ui::render::render(frame, state, extensions, &mut self.scroll, notice, vfs, opts, view, theme);
     }
 }
