@@ -60,11 +60,10 @@ pub fn highlight_lines(path: &Path, lines: &[String]) -> Vec<Vec<TextSpan>> {
             spans.push(TextSpan::styled(text, SpanStyle::Rgb { fg: (c.r, c.g, c.b), bg: None }));
             pos = end;
         }
-        if pos < line.len() {
-            if let Some(rest) = line.get(pos..) {
+        if pos < line.len()
+            && let Some(rest) = line.get(pos..) {
                 spans.push(TextSpan::plain(rest.to_string()));
             }
-        }
         out.push(spans);
     }
     out

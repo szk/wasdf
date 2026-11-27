@@ -217,7 +217,7 @@ pub trait Extension: Send {
     /// describes *what* to show. `None` means "nothing to draw" (core shows a
     /// placeholder). This is the single pull-render path, replacing the old
     /// extension-assembled `FunctionDraw`.
-    fn view(&self, _ctx: &FunctionRenderCtx) -> Option<PanelView> {
+    fn view(&self, _ctx: &FunctionRenderCtx) -> Option<Arc<PanelView>> {
         None
     }
 

@@ -30,7 +30,7 @@ impl VfsProvider for BookmarksProvider {
 
     fn list(&self, _path: &Path) -> io::Result<Vec<Entry>> {
         let saved = self.paths.read().map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "bookmark lock poisoned")
+            io::Error::other("bookmark lock poisoned")
         })?;
         Ok(saved
             .iter()

@@ -17,6 +17,14 @@ pub const PANEL_FILE: &str = "file";
 /// right-hand renderer container).
 pub const PANEL_FUNCTION: &str = "function";
 
+/// One ancestor level of the current directory: the directories beside it and
+/// which one is on the path.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TrailColumn {
+    pub names: Vec<String>,
+    pub index: usize,
+}
+
 /// A single directory entry.
 ///
 /// `Eq` is intentionally absent: `activation` carries `ExtensionValue` which
@@ -32,6 +40,11 @@ pub struct Entry {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
+    /// The owner's and group's names, resolved where the entry is read (a
+    /// kernel task), so render never asks the user database. Empty when the
+    /// id has no name — render shows the number then.
+    pub owner: std::sync::Arc<str>,
+    pub group: std::sync::Arc<str>,
     pub modified: Option<SystemTime>,
     pub created: Option<SystemTime>,
     pub accessed: Option<SystemTime>,
@@ -58,6 +71,8 @@ impl Entry {
             mode: 0,
             uid: 0,
             gid: 0,
+            owner: "".into(),
+            group: "".into(),
             modified: None,
             created: None,
             accessed: None,
@@ -77,6 +92,8 @@ impl Entry {
             mode: 0,
             uid: 0,
             gid: 0,
+            owner: "".into(),
+            group: "".into(),
             modified: None,
             created: None,
             accessed: None,
@@ -203,11 +220,15 @@ pub struct PanelSearch {
     pub query: String,
     /// Caret byte offset within the query (readline editing).
     pub caret: usize,
-    /// Match positions as (line index, byte start, byte end) within the content
-    /// text lines, in document order.
+    /// Match positions in logical coordinates — (block index, byte start, byte
+    /// end) within the block's text (`Block::text`) — sorted. Core maps them
+    /// to panel rows at layout (doc/EXTENSION.md).
     pub matches: Vec<(usize, usize, usize)>,
     /// Index into `matches` of the current match (the one `n`/`p` move from).
     pub current: usize,
+    /// Bring the current match into view at the next layout. The reducer
+    /// cannot: which row a block lands on depends on the panel's geometry.
+    pub reveal: bool,
     /// What the open input is for, shown keyless at the head of the help row.
     /// The same idea as `SelectSpec::input_hint`, but this input is a panel
     /// state rather than a mode, so it carries its own (doc/HELP.md).
@@ -228,7 +249,7 @@ pub struct FunctionPanelState {
     /// Generic extension content shown in the Content frame (the Phase-B push
     /// path), and the id of the extension that owns the current content. The
     /// owning extension renders via its hook; this is its push-style buffer.
-    pub content: Option<PanelView>,
+    pub content: Option<std::sync::Arc<PanelView>>,
     pub content_owner: Option<String>,
     /// The id of the extension currently hosting an **interactive form** in the
     /// panel (e.g. the CmdOp builder), distinct from the passive cursor-follow
@@ -364,6 +385,9 @@ pub const MAX_FILTER_DEPTH: usize = 5;
 pub struct AppState {
     pub cwd: PathBuf,
     pub entries: Vec<Entry>,
+    /// The nav panel's ancestor columns for `cwd`, root first, read with the
+    /// listing (doc/ARCHITECTURE.md, Render Contract).
+    pub trail: Vec<TrailColumn>,
     pub cursor: usize,
     pub selection: HashSet<PathBuf>,
     pub show_hidden: bool,
@@ -431,6 +455,7 @@ impl AppState {
         AppState {
             cwd,
             entries: Vec::new(),
+            trail: Vec::new(),
             cursor: 0,
             selection: HashSet::new(),
             show_hidden: false,

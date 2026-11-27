@@ -107,7 +107,7 @@ fn save_bookmarks(path: &Path, paths: &[PathBuf]) -> io::Result<()> {
         body.push_str(&format!("  {:?}\n", p.display().to_string()));
     }
     body.push_str("))\n");
-    let dir = path.parent().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no parent dir"))?;
+    let dir = path.parent().ok_or_else(|| io::Error::other("no parent dir"))?;
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(".bookmark_scm_tmp");
     std::fs::write(&tmp, &body)?;

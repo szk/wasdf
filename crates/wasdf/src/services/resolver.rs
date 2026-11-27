@@ -138,10 +138,7 @@ impl ResolverChain {
             if !cand.kind.os_matches() {
                 continue;
             }
-            let argv = match expand(&cand.argv, req, cwd) {
-                Ok(a) => a,
-                Err(e) => return Err(e),
-            };
+            let argv = expand(&cand.argv, req, cwd)?;
             if argv.is_empty() {
                 continue;
             }

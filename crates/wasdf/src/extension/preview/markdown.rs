@@ -288,22 +288,12 @@ fn parse_options() -> ParseOptions {
         | ParseOptions::ENABLE_TABLES
 }
 
-/// The plain text of a block, for the search matcher. An image has no text; it
-/// still occupies rows, so callers must account for its footprint separately.
-pub fn block_text(b: &Block) -> Option<String> {
-    let spans = match b {
-        Block::Line(v) | Block::Heading(v) | Block::Field { value: v, .. } => v,
-        Block::Rule | Block::Image { .. } => return None,
-    };
-    Some(spans.iter().map(|s| s.text.as_str()).collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn texts(blocks: &[Block]) -> Vec<String> {
-        blocks.iter().map(|b| block_text(b).unwrap_or_else(|| "<image>".into())).collect()
+        blocks.iter().map(|b| b.text().unwrap_or_else(|| "<image>".into())).collect()
     }
 
     #[test]
@@ -347,7 +337,7 @@ mod tests {
     fn undecodable_local_image_reports_why() {
         let src = "![alt](missing.png)\n";
         let blocks = render(Path::new("/tmp/wasdf-md-test/a.md"), src, 4);
-        let text = block_text(&blocks[0]).expect("a placeholder line");
+        let text = blocks[0].text().expect("a placeholder line");
         assert!(text.starts_with("[image: missing.png — "), "got {text:?}");
     }
 

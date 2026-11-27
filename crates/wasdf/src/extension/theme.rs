@@ -337,11 +337,10 @@ impl Extension for ThemeExtension {
     /// never touches focus, so the file panel keeps browsing with wasd while
     /// hjkl edits whatever role is currently under the cursor.
     fn on_cursor_changed(&self, state: &AppState) -> Vec<Intent> {
-        if let Some((theme_name, role_tok)) = theme_role_from_path(state.cursor_path().as_deref()) {
-            if let Some(out) = self.open_editor(&theme_name, &role_tok) {
+        if let Some((theme_name, role_tok)) = theme_role_from_path(state.cursor_path().as_deref())
+            && let Some(out) = self.open_editor(&theme_name, &role_tok) {
                 return out;
             }
-        }
         self.release()
     }
 
@@ -939,9 +938,7 @@ mod tests {
         };
         assert!(!ext.color_edit.borrow().as_ref().unwrap().fg_nil, "entry-symlink starts with a real fg color");
         assert!(ext.color_edit.borrow().as_ref().unwrap().bg_nil, "entry-symlink carries no bg override in gruvbox, so bg starts nil");
-        for _ in 0..FG_NIL_CHANNEL {
-            go("channel-next");
-        }
+        assert_eq!(ext.color_edit.borrow().as_ref().unwrap().channel, FG_NIL_CHANNEL, "the edit starts on the FG-nil control");
         go("color-dec"); // toggle FG nil on
         assert!(ext.color_edit.borrow().as_ref().unwrap().fg_nil);
         assert!(ext.color_edit.borrow().as_ref().unwrap().bg_nil, "toggling fg-nil must not touch bg-nil");
@@ -1040,7 +1037,7 @@ mod tests {
             size: 0,
             mode: 0,
             uid: 0,
-            gid: 0,
+            gid: 0, owner: "".into(), group: "".into(),
             modified: None,
             created: None,
             accessed: None,
@@ -1080,7 +1077,7 @@ mod tests {
             size: 0,
             mode: 0,
             uid: 0,
-            gid: 0,
+            gid: 0, owner: "".into(), group: "".into(),
             modified: None,
             created: None,
             accessed: None,

@@ -17,6 +17,9 @@
   (option "cmdop.runner"        "CmdOp" text ""  "runner")
 
   ;; Layout
+  ;; How often the top row's live readout (the clock) redraws when nothing
+  ;; else does.
+  (option "prop.refresh-ms"     "Layout" (int 100 60000) 1000 "prop-refresh-ms")
   (option "top.nav-weight"      "Layout" (int 1 99) 5    "nav-weight")
   (option "top.prop-visible"    "Layout" bool #t  "prop-visible")
   (option "top.prop-weight"     "Layout" (int 1 99) 2    "prop-weight")

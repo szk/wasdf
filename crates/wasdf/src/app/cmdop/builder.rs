@@ -139,11 +139,10 @@ impl Form {
                 return p.clone();
             }
         }
-        if self.cursor >= self.options.len() {
-            if let Some(e) = self.entries.get(self.cursor - self.options.len()) {
+        if self.cursor >= self.options.len()
+            && let Some(e) = self.entries.get(self.cursor - self.options.len()) {
                 return e.path.clone();
             }
-        }
         self.list_cwd.clone()
     }
 
@@ -178,7 +177,7 @@ impl Form {
 
     fn reset_hscroll_off_options(&mut self) {
         if self.cursor >= self.options.len() {
-            self.opt_hscroll.to_top();
+            self.opt_hscroll.go_top();
         }
     }
 }
@@ -864,7 +863,7 @@ impl Extension for CmdOp {
                         f.builder_scroll.retreat(1);
                     } else if f.cursor == 0 {
                         f.on_builder = true;
-                        f.builder_scroll.to_top();
+                        f.builder_scroll.go_top();
                     } else {
                         f.cursor -= 1;
                         f.reset_hscroll_off_options();
@@ -915,9 +914,9 @@ impl Extension for CmdOp {
         // (also rejects a deep-search completion that arrives after the user
         // has since browsed elsewhere — `awaiting_deep` for the old dir is
         // already false by then, reset by `Form::reset_deep`).
-        if let Content::Dir { entries } = result {
-            if let Some(form) = self.form.borrow_mut().as_mut() {
-                if form.list_cwd == path {
+        if let Content::Dir { entries } = result
+            && let Some(form) = self.form.borrow_mut().as_mut()
+                && form.list_cwd == path {
                     form.entries = entries.clone();
                     // A deep search (Intent::LoadSearch) completes through
                     // this same generic content Read — see SEARCH_RENEW.md
@@ -936,8 +935,6 @@ impl Extension for CmdOp {
                         form.cursor = max;
                     }
                 }
-            }
-        }
     }
 
     fn render_form(&self, frame: &mut Frame, inner: Rect, ctx: &FunctionRenderCtx) -> Option<String> {
@@ -1158,7 +1155,7 @@ mod tests {
             size: 0,
             mode: 0,
             uid: 0,
-            gid: 0,
+            gid: 0, owner: "".into(), group: "".into(),
             modified: None,
             created: None,
             accessed: None,

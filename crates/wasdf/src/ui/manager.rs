@@ -57,6 +57,22 @@ impl UiManager {
         self.scroll.list_geom()
     }
 
+    /// When the live notice expires, if one is showing — a deadline the
+    /// loop's wait must not sleep past.
+    pub fn notice_deadline(&self) -> Option<Instant> {
+        self.notice.as_ref().map(|(_, at)| *at + NOTICE_TTL).filter(|d| *d > Instant::now())
+    }
+
+    /// The scroll the last draw used to reveal the current search match.
+    pub fn take_revealed(&mut self) -> Option<usize> {
+        self.scroll.take_revealed()
+    }
+
+    /// Whether the last frame laid `panel` out.
+    pub fn shows(&self, panel: &str) -> bool {
+        self.scroll.shows(panel)
+    }
+
     /// The current live notice, if any (expired notices are hidden).
     pub fn live_notice(&self) -> Option<&Notice> {
         self.notice.as_ref().and_then(|(n, at)| {
@@ -70,14 +86,12 @@ impl UiManager {
         frame: &mut Frame,
         state: &AppState,
         extensions: &ExtensionRegistry,
-        vfs: &crate::vfs::Vfs,
-        opts: &crate::ui::top::TopOptions,
         view: &crate::ui::render::View,
         theme: &crate::core::Theme,
     ) {
         let notice = self.notice.as_ref().and_then(|(n, at)| {
             (at.elapsed() < NOTICE_TTL).then_some(n)
         });
-        crate::ui::render::render(frame, state, extensions, &mut self.scroll, notice, vfs, opts, view, theme);
+        crate::ui::render::render(frame, state, extensions, &mut self.scroll, notice, view, theme);
     }
 }

@@ -458,7 +458,7 @@ mod tests {
             size: 0,
             mode: 0o644,
             uid: 0,
-            gid: 0,
+            gid: 0, owner: "".into(), group: "".into(),
             modified: None,
             created: None,
             accessed: None,

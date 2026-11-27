@@ -109,15 +109,11 @@ pub trait MatcherBackend: Send + Sync {
     fn score(&self, haystack: &str, needle: &str) -> Option<i64>;
 }
 
+#[derive(Default)]
 pub struct SkimMatcher {
     inner: SkimMatcherV2,
 }
 
-impl Default for SkimMatcher {
-    fn default() -> Self {
-        SkimMatcher { inner: SkimMatcherV2::default() }
-    }
-}
 
 impl MatcherBackend for SkimMatcher {
     fn score(&self, haystack: &str, needle: &str) -> Option<i64> {
@@ -193,12 +189,11 @@ pub(crate) fn affinity(
 
     // Noise directory penalty (first hit only).
     for component in Path::new(rel).components() {
-        if let Some(s) = component.as_os_str().to_str() {
-            if cfg.noise_dirs.iter().any(|d| d == s) {
+        if let Some(s) = component.as_os_str().to_str()
+            && cfg.noise_dirs.iter().any(|d| d == s) {
                 score -= NOISE_DIR_PEN;
                 break;
             }
-        }
     }
 
     score
@@ -243,7 +238,7 @@ pub fn rank_paths(
         .into_iter()
         .map(|(base, is_tail, p)| {
             let meta = std::fs::symlink_metadata(&p).ok();
-            let kind = meta.as_ref().map(|m| FileKind::from_meta(m)).unwrap_or(FileKind::Other);
+            let kind = meta.as_ref().map(FileKind::from_meta).unwrap_or(FileKind::Other);
             let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy();
             let name = p
                 .file_name()

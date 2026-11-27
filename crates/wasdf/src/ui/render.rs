@@ -28,11 +28,10 @@ pub fn render(
     extensions: &ExtensionRegistry,
     scroll: &mut ScrollMemory,
     notice: Option<&Notice>,
-    vfs: &crate::vfs::Vfs,
-    opts: &crate::ui::top::TopOptions,
     view: &View,
     theme: &Theme,
 ) {
+    let opts = view.opts;
     let area = frame.area();
     if area.width < 4 || area.height < 4 {
         return;
@@ -44,13 +43,12 @@ pub fn render(
     // follows composes on top of it.
     frame.buffer_mut().set_style(area, theme.style(Role::Base));
 
-    let (layout_id, hint) = match state.mode() {
-        Mode::Select(spec) => ("select", spec.function_hint.clone()),
-        _ => ("file", None),
-    };
+    let layout_id = if matches!(state.mode(), Mode::Select(_)) { "select" } else { "file" };
     let Some(tree) = view.layouts.get(layout_id) else { return };
     let env = crate::ui::layout::Env { state, options: view.options, conds: view.conds };
     let placed = crate::ui::layout::solve(tree, area, &env);
+    scroll.set_shown(placed.iter().map(|(id, _)| id.clone()).collect());
+    scroll.set_generation(view.options.generation());
     let panel = |id: &str| placed.iter().find(|(p, _)| p == id).map(|(_, r)| panel_area(*r, area, &placed));
 
     // Default to "no clamp"; the function-panel render records real bounds only
@@ -65,20 +63,20 @@ pub fn render(
             "file" => crate::ui::middle::render_file_list(frame, pa, state, extensions, scroll, &mut panels, theme, opts.file_row_size_graph),
             "select-input" => crate::ui::middle::render_select_input(frame, pa, state, &mut panels, theme),
             "select-candidates" => crate::ui::middle::render_select_candidates(frame, pa, state, extensions, scroll, &mut panels, theme),
-            "function" => crate::ui::middle::render_function(frame, pa, state, extensions, hint.clone(), scroll, &mut panels, theme),
+            "function" => crate::ui::middle::render_function(frame, pa, state, extensions, scroll, &mut panels, theme),
             _ => {}
         }
     }
     for (id, _) in &placed {
         let Some(pa) = panel(id) else { continue };
         match id.as_str() {
-            "nav" => crate::ui::top::render_nav(frame, pa, state, vfs, &mut panels, theme),
-            "prop" => crate::ui::top::render_prop(frame, pa, state, &mut panels, theme),
-            "monitor" => crate::ui::top::render_monitor(frame, pa, state, &mut panels, &opts.border_style, &opts.monitor, theme),
+            "nav" => crate::ui::top::render_nav(frame, pa, state, &mut panels, theme),
+            "prop" => crate::ui::top::render_prop(frame, pa, state, view.monitor.load, &opts.border_style, &mut panels, theme),
+            "monitor" => crate::ui::top::render_monitor(frame, pa, view.monitor, &mut panels, &opts.monitor, theme),
             _ => {}
         }
     }
-    let anchor = ["file", "select-input", "select-candidates"].into_iter().find_map(|id| panel(id));
+    let anchor = ["file", "select-input", "select-candidates"].into_iter().find_map(&panel);
     let labels = match anchor {
         Some(a) => crate::ui::top::border_labels(
             state,
@@ -101,20 +99,21 @@ pub fn render(
     if let Mode::Policy(pending) = state.mode() {
         render_policy(frame, area, pending, theme);
     }
-    if let Mode::InputForm(spec) = state.mode() {
-        if let Some(form) = &state.input_form {
+    if let Mode::InputForm(spec) = state.mode()
+        && let Some(form) = &state.input_form {
             render_input_form(frame, area, spec, form, theme);
         }
-    }
 }
 
 /// What render reads besides AppState: the layouts, and the projections a
 /// layout's attributes and conditions consult.
 pub struct View<'a> {
+    pub opts: &'a crate::ui::top::TopOptions,
     pub layouts: &'a crate::ui::layout::Layouts,
     pub options: &'a crate::core::OptionStore,
     pub keymap: &'a crate::script::keymap::KeymapRegistry,
     pub conds: &'a crate::script::condition::Conditions,
+    pub monitor: &'a crate::services::monitor::Snapshot,
 }
 
 /// A solved panel with its open edges (doc/UI.md, Screen chrome): no left

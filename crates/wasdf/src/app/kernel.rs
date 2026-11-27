@@ -56,6 +56,8 @@ pub struct App {
     /// The layouts render lays the frame out by: the core ones, replaced by
     /// the user's.
     pub layouts: crate::ui::layout::Layouts,
+    /// System metrics, sampled off the main thread for the top panels.
+    pub monitor: crate::services::monitor::Monitor,
     pub vfs: Arc<crate::vfs::Vfs>,
     pub rx: Receiver<AppEvent>,
     pub tx: Sender<AppEvent>,
@@ -336,6 +338,7 @@ impl App {
             registered,
             ext_infos,
             layouts: crate::ui::layout::Layouts::new(defaults::layouts()),
+            monitor: crate::services::monitor::Monitor::spawn((!cfg!(test)).then(|| tx.clone())),
             vfs,
             rx,
             tx,
@@ -443,8 +446,8 @@ impl App {
         // Content reads are handed to the owning extension (which decodes +
         // stashes); they do not flow through the pure reducer.
         if result.purpose == Purpose::Content {
-            if result.status == AsyncStatus::Ok {
-                if let Payload::Read { owner, path, result: read } = result.payload {
+            if result.status == AsyncStatus::Ok
+                && let Payload::Read { owner, path, result: read } = result.payload {
                     // A form owner's explicit read (e.g. the CmdOp listing dir) is
                     // not cursor-follow: it bypasses the cursor-staleness gate and
                     // self-gates in accept_content, and does not reset the view.
@@ -464,7 +467,6 @@ impl App {
                         self.dispatch(Intent::ResetContentView);
                     }
                 }
-            }
             return;
         }
         if result.purpose == Purpose::Search {
@@ -538,6 +540,23 @@ impl App {
         for p in problems {
             crate::services::messages::log(p, true);
         }
+    }
+
+    /// Fold what the draw measured back into the state and services: render is
+    /// the single source of geometry, and the pure reducer cannot see it.
+    pub fn after_draw(&mut self) {
+        // The reducer advances function scroll/hscroll blindly; bind folds in
+        // the measured bound and clamps the offset, so over-scroll is discarded
+        // and reversing direction moves immediately.
+        self.state.function.scroll.bind(self.ui.function_max_scroll());
+        self.state.function.hscroll.bind(self.ui.function_hmax_scroll());
+        if let Some(row) = self.ui.take_revealed() {
+            self.state.function.scroll.set(row);
+            self.state.function.search.reveal = false;
+        }
+        // The file-list geometry, so 2-D cursor movement matches the screen.
+        self.state.list_geom = self.ui.list_geom();
+        self.monitor.set_active(self.ui.shows("monitor"));
     }
 
     /// Project the store's display orders: extension priority (the registry,
@@ -698,12 +717,11 @@ impl App {
         // Confirmation gate: a destructive resolver op (e.g. delete), or one
         // that would silently overwrite an existing path (cp/mv's `-i`
         // condition) → Policy.
-        if let Intent::RunResolver(req) = &intent {
-            if self.needs_confirmation(req) && !confirmed {
+        if let Intent::RunResolver(req) = &intent
+            && self.needs_confirmation(req) && !confirmed {
                 self.state.push_mode(Mode::Policy(Box::new(intent)));
                 return;
             }
-        }
 
         // KillProcess stops the streaming Execute child (the reducer then marks
         // the Exec frame finished).
@@ -1035,7 +1053,7 @@ impl App {
 
     /// The active content provider's logical row count, if it produced a view.
     pub fn function_content_rows(&self) -> Option<usize> {
-        self.provider_view().map(|v| match v {
+        self.provider_view().map(|v| match &*v {
             crate::core::PanelView::Document(blocks) => blocks.len(),
             crate::core::PanelView::Image { .. } => 1,
         })
@@ -1049,7 +1067,7 @@ impl App {
         })
     }
 
-    fn provider_view(&self) -> Option<crate::core::PanelView> {
+    fn provider_view(&self) -> Option<Arc<crate::core::PanelView>> {
         let theme = crate::core::Theme::default();
         let sources = self.state.targets();
         let ctx = crate::extension::FunctionRenderCtx {
@@ -1822,7 +1840,7 @@ mod frame_dump {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
-    pub fn dump(app: &mut App, w: u16, h: u16) -> String {
+    pub fn draw(app: &mut App, w: u16, h: u16) -> (String, ratatui::buffer::Buffer) {
         let s = &app.store;
         let top = crate::ui::top::TopOptions {
             border_style: s.get_str("border-style"),
@@ -1836,14 +1854,72 @@ mod frame_dump {
         };
         let theme = app.theme_registry.read().unwrap().resolve_active();
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        let view = crate::ui::render::View { layouts: &app.layouts, options: &app.store, keymap: &app.keymap, conds: &app.conditions };
-        term.draw(|f| app.ui.render(f, &app.state, &app.extensions, &app.vfs, &top, &view, &theme)).unwrap();
+        let snapshot = app.monitor.snapshot();
+        let view = crate::ui::render::View {
+            opts: &top,
+            layouts: &app.layouts,
+            options: &app.store,
+            keymap: &app.keymap,
+            conds: &app.conditions,
+            monitor: &snapshot,
+        };
+        term.draw(|f| app.ui.render(f, &app.state, &app.extensions, &view, &theme)).unwrap();
         let buf = term.backend().buffer().clone();
-        (0..h).map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "\n").collect()
+        app.after_draw();
+        let text = (0..h).map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "\n").collect();
+        (text, buf)
+    }
+
+    pub fn dump(app: &mut App, w: u16, h: u16) -> String {
+        draw(app, w, h).0
     }
 
     fn rows(frame: &str) -> Vec<&str> {
         frame.lines().collect()
+    }
+
+    #[test]
+    fn a_long_document_draws_only_its_visible_rows_with_their_own_numbers() {
+        use crate::core::{Block, PanelView, TextSpan};
+        let mut app = App::boot(super::tests::temp_dir_with_files());
+        app.pump_one();
+        let blocks = (1..=5000).map(|n| Block::Line(vec![TextSpan::plain(format!("row-{n}"))])).collect();
+        app.dispatch_for_test(Intent::ShowFunctionContent { owner: "test".into(), view: PanelView::Document(blocks) });
+        app.state.function.show_line_numbers = true;
+        dump(&mut app, 100, 20); // measures the scroll bound
+        app.state.function.scroll.bind(app.ui.function_max_scroll());
+        app.state.function.scroll.set(2500);
+        let f = dump(&mut app, 100, 20);
+        assert!(f.contains("2501 row-2501"), "the first visible row carries its own number:\n{f}");
+        assert!(!f.contains("row-1\n") && !f.contains("row-2500 "), "rows above the window are not drawn:\n{f}");
+    }
+
+    #[test]
+    fn a_logical_match_is_revealed_and_highlighted_on_the_row_its_block_landed_on() {
+        use crate::core::{Block, PanelView, Role, TextSpan};
+        let mut app = App::boot(super::tests::temp_dir_with_files());
+        app.pump_one();
+        // An image, then enough lines that the field needs scrolling to.
+        let mut blocks = vec![
+            Block::Line(vec![TextSpan::plain("top")]),
+            Block::Image { width: 40, height: 40, rgb: vec![9; 40 * 40 * 3] },
+            Block::Field { label: "key".into(), value: vec![TextSpan::plain("a needle")] },
+        ];
+        blocks.extend((0..60).map(|i| Block::Line(vec![TextSpan::plain(format!("after {i}"))])));
+        app.dispatch_for_test(Intent::ShowFunctionContent { owner: "t".into(), view: PanelView::Document(blocks) });
+        // (block 2, bytes 2..8) — "needle" inside the field's value.
+        app.dispatch_for_test(Intent::SetSearchMatches(vec![(2, 2, 8)]));
+        let (f, buf) = draw(&mut app, 100, 30);
+        assert!(app.state.function.scroll.offset() > 1, "scrolled past the image to its block: {} {:?}\n{f}", app.state.function.scroll.offset(), app.state.function.search);
+        assert!(!app.state.function.search.reveal, "the reveal was consumed");
+        let (y, row) = f.lines().enumerate().find(|(_, l)| l.contains("a needle")).expect(&f);
+        assert_eq!(y, 7, "the match's row is the first content row:\n{f}");
+        // The highlight sits on "needle", past the label column and "a ".
+        let x = row.chars().collect::<Vec<_>>();
+        let col = (0..x.len()).find(|&i| x[i..].starts_with(&['n', 'e', 'e', 'd', 'l', 'e'])).unwrap() as u16;
+        let theme = app.theme_registry.read().unwrap().resolve_active();
+        assert_eq!(buf[(col, y as u16)].bg, theme.role(Role::MatchCurrentBg), "current match highlighted:\n{f}");
+        assert_ne!(buf[(col - 2, y as u16)].bg, theme.role(Role::MatchCurrentBg), "'a ' is not");
     }
 
     #[test]
@@ -1859,6 +1935,7 @@ mod frame_dump {
         assert!(r[4].starts_with("└─[ ") && r[4].contains(&cwd[..20]), "{f}");
         assert!(r[5].starts_with("  "), "the file panel has no left border:\n{f}");
         assert!(r[13].contains("quit"), "{f}");
+        assert!(app.ui.shows("monitor"), "the monitor is on screen, so it is sampled");
 
         // With the function panel, its border crosses the shared line.
         app.state.function.visible = true;

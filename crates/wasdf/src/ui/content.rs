@@ -53,44 +53,38 @@ pub fn prompt_line(search: &PanelSearch, theme: &Theme) -> Option<Line<'static>>
 /// Paint one text line: an optional line number, then the text from `hscroll`
 /// columns on, colored by its pre-resolved style `segs` (`(byte-len, Style)`,
 /// tiling the line left-to-right; a gap past the last seg is unstyled) and
-/// overlaid with search-match highlighting for `line_idx`. The `PanelView` layout
+/// overlaid with the search matches on this row (`highlights`: byte ranges
+/// in `text`, flagged when current). The `PanelView` layout
 /// lowers each logical block into `(text, segs)` and calls this. Widths are
 /// counted per char to match `line_width`, so the h-scroll bound lines up.
 pub fn build_line(
     text: &str,
     segs: &[(usize, Style)],
     hscroll: usize,
-    line_idx: usize,
-    search: &PanelSearch,
+    line_no: usize,
+    highlights: &[(usize, usize, bool)],
     show_line_numbers: bool,
     theme: &Theme,
 ) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     if show_line_numbers {
         spans.push(Span::styled(
-            format!("{:>w$} ", line_idx + 1, w = LINE_NUMBER_WIDTH as usize - 1),
+            format!("{:>w$} ", line_no + 1, w = LINE_NUMBER_WIDTH as usize - 1),
             theme.style(Role::Muted),
         ));
     }
     // Match byte ranges on this line, flagged when current.
-    let line_matches: Vec<(usize, usize, bool)> = search
-        .matches
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &(l, s, e))| (l == line_idx).then_some((s, e, i == search.current)))
-        .collect();
 
     let mut seg_idx = 0usize;
     let mut seg_base = 0usize; // first byte covered by segs[seg_idx]
-    let mut col = 0usize;
     let mut cur_style = Style::default();
     let mut cur_text = String::new();
-    for (b, ch) in text.char_indices() {
+    for (col, (b, ch)) in text.char_indices().enumerate() {
         while seg_idx < segs.len() && seg_base + segs[seg_idx].0 <= b {
             seg_base += segs[seg_idx].0;
             seg_idx += 1;
         }
-        let m = line_matches.iter().find(|(s, e, _)| b >= *s && b < *e);
+        let m = highlights.iter().find(|(s, e, _)| b >= *s && b < *e);
         let style = match m {
             // Search highlight overrides the segment's own colors.
             Some((_, _, true)) => theme.style(Role::MatchCurrentFg).bg(theme.role(Role::MatchCurrentBg)),
@@ -104,7 +98,6 @@ pub fn build_line(
             cur_style = style;
             cur_text.push(ch);
         }
-        col += 1;
     }
     if !cur_text.is_empty() {
         spans.push(Span::styled(cur_text, cur_style));

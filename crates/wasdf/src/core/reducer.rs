@@ -172,14 +172,13 @@ pub fn apply_intent(state: &mut AppState, intent: Intent, ctx: &dyn CommandLooku
                     if !state.selection.remove(&p) {
                         state.selection.insert(p);
                     }
-                } else if let Some(sel) = &mut state.select {
-                    if let Some(c) = sel.results.get(sel.selected) {
+                } else if let Some(sel) = &mut state.select
+                    && let Some(c) = sel.results.get(sel.selected) {
                         let label = c.label.clone();
                         if !sel.marks.remove(&label) {
                             sel.marks.insert(label);
                         }
                     }
-                }
             } else if let Some(e) = state.current_entry() {
                 let p = e.path.clone();
                 if !state.selection.remove(&p) {
@@ -321,10 +320,10 @@ pub fn apply_intent(state: &mut AppState, intent: Intent, ctx: &dyn CommandLooku
             // reset the transient view state (scroll positions, any search).
             state.function.visible = true;
             state.function.sublayout = SubLayout::Content;
-            state.function.scroll.to_top();
-            state.function.hscroll.to_top();
+            state.function.scroll.go_top();
+            state.function.hscroll.go_top();
             state.function.search = crate::core::PanelSearch::default();
-            state.function.content = Some(view);
+            state.function.content = Some(std::sync::Arc::new(view.clone()));
             state.function.content_owner = Some(owner);
             state.focused_panel = PANEL_FUNCTION.into();
             Effects::none()
@@ -390,11 +389,11 @@ pub fn apply_intent(state: &mut AppState, intent: Intent, ctx: &dyn CommandLooku
             Effects::none()
         }
         Intent::ScrollTop => {
-            scroll_target(state, |s| s.to_top());
+            scroll_target(state, |s| s.go_top());
             Effects::none()
         }
         Intent::ScrollBottom => {
-            scroll_target(state, |s| s.to_bottom());
+            scroll_target(state, |s| s.go_bottom());
             Effects::none()
         }
         Intent::PageUp => {
@@ -408,20 +407,18 @@ pub fn apply_intent(state: &mut AppState, intent: Intent, ctx: &dyn CommandLooku
 
         // --- InputForm `List` row management (browsing only) -------------
         Intent::AddItem => {
-            if let Some(InputFormState::List { editing, .. }) = &mut state.input_form {
-                if editing.is_none() {
+            if let Some(InputFormState::List { editing, .. }) = &mut state.input_form
+                && editing.is_none() {
                     *editing = Some((usize::MAX, String::new(), 0));
                 }
-            }
             Effects::none()
         }
         Intent::RemoveItem => {
-            if let Some(InputFormState::List { items, selected, editing }) = &mut state.input_form {
-                if editing.is_none() && *selected < items.len() {
+            if let Some(InputFormState::List { items, selected, editing }) = &mut state.input_form
+                && editing.is_none() && *selected < items.len() {
                     items.remove(*selected);
                     *selected = (*selected).min(list_confirm_row(items));
                 }
-            }
             Effects::none()
         }
         Intent::SetScroll(n) => {
@@ -462,6 +459,11 @@ pub fn apply_intent(state: &mut AppState, intent: Intent, ctx: &dyn CommandLooku
         }
         Intent::SetSearchMatches(matches) => {
             state.function.search.current = 0;
+            // Kept sorted by (block, start): render finds a block's matches by
+            // binary search instead of scanning them all.
+            let mut matches = matches.clone();
+            matches.sort_unstable();
+            state.function.search.reveal = !matches.is_empty();
             state.function.search.matches = matches;
             Effects::none()
         }
@@ -479,8 +481,8 @@ pub fn apply_intent(state: &mut AppState, intent: Intent, ctx: &dyn CommandLooku
             Effects::none()
         }
         Intent::ResetContentView => {
-            state.function.scroll.to_top();
-            state.function.hscroll.to_top();
+            state.function.scroll.go_top();
+            state.function.hscroll.go_top();
             state.function.search = crate::core::PanelSearch::default();
             Effects::none()
         }
@@ -569,11 +571,10 @@ pub fn apply_intent(state: &mut AppState, intent: Intent, ctx: &dyn CommandLooku
 
         // --- Extension --------------------------------------------------
         Intent::UpdateExtensionState(value) => {
-            if let Some(frame) = state.modes.last_mut() {
-                if let Mode::Extension { state: s, .. } = &mut frame.mode {
+            if let Some(frame) = state.modes.last_mut()
+                && let Mode::Extension { state: s, .. } = &mut frame.mode {
                     *s = value;
                 }
-            }
             Effects::none()
         }
         Intent::Extension(_) => Effects::none(),
@@ -610,8 +611,8 @@ fn step_index(n: usize, rows: usize, cursor: usize, dir: Dir) -> Option<usize> {
     let idx = cursor.min(n - 1);
     // `then` (lazy) — the subtractions must not be evaluated when the guard is false.
     match dir {
-        Dir::Down => ((idx + 1) % rows != 0 && idx + 1 < n).then(|| idx + 1),
-        Dir::Up => (idx % rows != 0).then(|| idx - 1),
+        Dir::Down => (!(idx + 1).is_multiple_of(rows) && idx + 1 < n).then(|| idx + 1),
+        Dir::Up => (!idx.is_multiple_of(rows)).then(|| idx - 1),
         Dir::Left => (idx >= rows).then(|| idx - rows),
         Dir::Right => (idx + rows < n).then(|| idx + rows),
     }
@@ -906,13 +907,11 @@ fn push_mode(state: &mut AppState, mode: Mode, ctx: &dyn CommandLookup) -> Effec
     };
     // Fill the command Select's command-line skeleton from the resolver chain, so
     // the Command panel shows the actual external command (e.g. `mv …`, `cp -R …`).
-    if let Mode::Select(spec) = &mut mode {
-        if spec.id == "command" && spec.command_line.is_empty() {
-            if let crate::core::OnConfirm::Resolve { template, .. } = &spec.on_confirm {
+    if let Mode::Select(spec) = &mut mode
+        && spec.id == "command" && spec.command_line.is_empty()
+            && let crate::core::OnConfirm::Resolve { template, .. } = &spec.on_confirm {
                 spec.command_line = ctx.resolver_command(&template.op);
             }
-        }
-    }
     let is_select = matches!(mode, Mode::Select(_));
     // A Select replaces a topmost Select; otherwise push.
     let replacing_select = is_select && matches!(state.mode(), Mode::Select(_));
@@ -1133,7 +1132,8 @@ fn scroll_target(state: &mut AppState, f: impl FnOnce(&mut crate::core::Scroll))
 /// Columns the text/hex content scrolls horizontally per FuncLeft/FuncRight.
 const HSCROLL_STEP: usize = 8;
 
-/// Move to the next/previous match (wrapping) and bring its line into view.
+/// Move to the next/previous match (wrapping) and ask the layout to bring it
+/// into view.
 fn search_step(state: &mut AppState, forward: bool) {
     let n = state.function.search.matches.len();
     if n == 0 {
@@ -1141,8 +1141,7 @@ fn search_step(state: &mut AppState, forward: bool) {
     }
     let cur = &mut state.function.search.current;
     *cur = if forward { (*cur + 1) % n } else { (*cur + n - 1) % n };
-    let line = state.function.search.matches[state.function.search.current].0;
-    state.function.scroll.set(line);
+    state.function.search.reveal = true;
 }
 
 
@@ -1179,8 +1178,8 @@ fn read_dir_effect(state: &AppState) -> Effects {
 /// the cursor off the file and back. Generic: any content owner, the cursor path.
 fn refresh(state: &AppState) -> Effects {
     let mut fx = read_dir_effect(state);
-    if state.function.visible && state.function.sublayout == SubLayout::Content {
-        if let (Some(owner), Some(entry)) =
+    if state.function.visible && state.function.sublayout == SubLayout::Content
+        && let (Some(owner), Some(entry)) =
             (state.function.content_owner.clone(), state.current_entry())
         {
             fx.intents.push(Intent::LoadContent {
@@ -1189,7 +1188,6 @@ fn refresh(state: &AppState) -> Effects {
                 offset: 0,
             });
         }
-    }
     fx
 }
 
@@ -1636,11 +1634,10 @@ fn subseq_score(hay: &str, needle: &[char]) -> Option<i64> {
         while hi < hay.len() {
             if hay[hi] == nc {
                 // Reward adjacency and earlier matches.
-                if let Some(l) = last_match {
-                    if hi == l + 1 {
+                if let Some(l) = last_match
+                    && hi == l + 1 {
                         score += 5;
                     }
-                }
                 score += 10 - (hi as i64).min(9);
                 last_match = Some(hi);
                 hi += 1;
@@ -1665,9 +1662,10 @@ pub fn apply_result(state: &mut AppState, result: AsyncResult) -> Effects {
         return Effects::none(); // Cancelled / StaleDiscarded: silent.
     }
     match (result.purpose, result.payload) {
-        (Purpose::Refresh, Payload::Entries { path, entries }) => {
+        (Purpose::Refresh, Payload::Entries { path, entries, trail }) => {
             if path == state.cwd {
                 load_entries(state, entries);
+                state.trail = trail;
             }
             Effects::none()
         }
@@ -1731,11 +1729,10 @@ fn load_entries(state: &mut AppState, entries: Vec<crate::core::state::Entry>) {
     state.filter_query = None;
     state.selection.retain(|p| state.entries.iter().any(|e| &e.path == p));
     let focus = pending.or(prev_path);
-    if let Some(p) = focus {
-        if let Some(i) = state.entries.iter().position(|e| e.path == p) {
+    if let Some(p) = focus
+        && let Some(i) = state.entries.iter().position(|e| e.path == p) {
             state.cursor = i;
         }
-    }
     state.clamp_cursor();
 }
 
@@ -1996,7 +1993,7 @@ mod tests {
                 size: 0,
                 mode: 0,
                 uid: 0,
-                gid: 0,
+                gid: 0, owner: "".into(), group: "".into(),
                 modified: None,
                 created: None,
                 accessed: None,
@@ -2011,7 +2008,7 @@ mod tests {
                 size: 0,
                 mode: 0,
                 uid: 0,
-                gid: 0,
+                gid: 0, owner: "".into(), group: "".into(),
                 modified: None,
                 created: None,
                 accessed: None,
@@ -2316,16 +2313,15 @@ mod tests {
             other => panic!("expected List, got {other:?}"),
         }
         apply_intent(&mut s, Intent::Confirm, &NoCommands); // starts editing a new item
-        for c in ['c'] {
+        {
+            let c = 'c';
             apply_intent(&mut s, Intent::RawKeyEvent(Key::plain(KeyCode::Char(c))), &NoCommands);
         }
         apply_intent(&mut s, Intent::Confirm, &NoCommands); // commits "c", returns to browsing
         // Move down to the Confirm row and confirm the whole form.
-        loop {
-            let Some(crate::core::InputFormState::List { selected, items, .. }) = &s.input_form else { break };
-            if *selected == items.len() + 1 {
-                break;
-            }
+        while let Some(crate::core::InputFormState::List { selected, items, .. }) = &s.input_form
+            && *selected != items.len() + 1
+        {
             apply_intent(&mut s, Intent::CursorDown, &NoCommands);
         }
         let fx = apply_intent(&mut s, Intent::Confirm, &NoCommands);
@@ -2345,7 +2341,8 @@ mod tests {
 
         // AddItem starts a nested edit regardless of which row is selected.
         apply_intent(&mut s, Intent::AddItem, &NoCommands);
-        for c in ['c'] {
+        {
+            let c = 'c';
             apply_intent(&mut s, Intent::RawKeyEvent(Key::plain(KeyCode::Char(c))), &NoCommands);
         }
         apply_intent(&mut s, Intent::Confirm, &NoCommands); // commits "c"
@@ -2410,16 +2407,18 @@ mod tests {
     #[test]
     fn store_matches_then_navigate() {
         // The extension's matches are stored (SetSearchMatches); n/p navigate the
-        // stored list (core, reading AppState) and jump the scroll.
+        // stored list and ask the layout to reveal the current one.
         let mut s = AppState::new(std::env::temp_dir());
         apply_intent(&mut s, Intent::SetSearchMatches(vec![(0, 0, 1), (2, 0, 1), (5, 0, 1)]), &NoCommands);
         assert_eq!(s.function.search.matches.len(), 3);
         assert_eq!(s.function.search.current, 0);
+        assert!(s.function.search.reveal, "the first match is brought into view");
+        s.function.search.reveal = false; // what the layout does once it has
         apply_intent(&mut s, Intent::FunctionSearchNext, &NoCommands);
-        assert_eq!((s.function.search.current, s.function.scroll.offset()), (1, 2));
+        assert_eq!((s.function.search.current, s.function.search.reveal), (1, true));
         apply_intent(&mut s, Intent::FunctionSearchPrev, &NoCommands);
         apply_intent(&mut s, Intent::FunctionSearchPrev, &NoCommands);
-        assert_eq!((s.function.search.current, s.function.scroll.offset()), (2, 5), "prev wraps");
+        assert_eq!(s.function.search.current, 2, "prev wraps");
         apply_intent(&mut s, Intent::SetScroll(9), &NoCommands);
         assert_eq!(s.function.scroll.offset(), 9);
     }
@@ -2531,7 +2530,7 @@ mod tests {
                 size: 0,
                 mode: 0,
                 uid: 0,
-                gid: 0,
+                gid: 0, owner: "".into(), group: "".into(),
                 modified: None,
                 created: None,
                 accessed: None,
@@ -2782,7 +2781,7 @@ mod tests {
             size: 0,
             mode: 0,
             uid: 0,
-            gid: 0,
+            gid: 0, owner: "".into(), group: "".into(),
             modified: None,
             created: None,
             accessed: None,

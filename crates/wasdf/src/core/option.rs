@@ -403,11 +403,10 @@ impl OptionStore {
     pub fn owners(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for d in self.def_order.iter().filter_map(|k| self.defs.get(k)) {
-            if let Some(o) = &d.owner {
-                if !out.contains(o) {
+            if let Some(o) = &d.owner
+                && !out.contains(o) {
                     out.push(o.clone());
                 }
-            }
         }
         out
     }

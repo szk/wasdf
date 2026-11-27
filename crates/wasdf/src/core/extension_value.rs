@@ -10,7 +10,9 @@ pub const KEY_ITEM: &str = "item";
 pub const KEY_RESOLVER: &str = "resolver";
 
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum ExtensionValue {
+    #[default]
     Nil,
     Bool(bool),
     Int(i64),
@@ -20,11 +22,6 @@ pub enum ExtensionValue {
     Map(BTreeMap<String, ExtensionValue>),
 }
 
-impl Default for ExtensionValue {
-    fn default() -> Self {
-        ExtensionValue::Nil
-    }
-}
 
 impl ExtensionValue {
     pub fn as_bool(&self) -> Option<bool> {

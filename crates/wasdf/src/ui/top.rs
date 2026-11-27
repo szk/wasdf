@@ -105,6 +105,12 @@ impl MonitorOptions {
         MonitorOptions { cpu: cfg("cpu"), mem: cfg("mem"), dsk: cfg("dsk"), net: cfg("net") }
     }
 
+    /// What the Monitor service needs to know: when to sample each metric.
+    pub fn cadence(&self) -> crate::services::monitor::Config {
+        let c = |m: &MetricCfg| crate::services::monitor::Cadence { visible: m.visible, refresh: m.refresh, window: m.graph_window };
+        crate::services::monitor::Config { cpu: c(&self.cpu), mem: c(&self.mem), dsk: c(&self.dsk), net: c(&self.net) }
+    }
+
     fn get(&self, id: &str) -> &MetricCfg {
         match id {
             "cpu" => &self.cpu,
@@ -313,7 +319,6 @@ pub fn render_nav(
     frame: &mut Frame,
     pa: PanelArea,
     state: &AppState,
-    vfs: &crate::vfs::Vfs,
     panels: &mut Vec<PanelFrame>,
     theme: &Theme,
 ) {
@@ -325,11 +330,13 @@ pub fn render_nav(
         return;
     }
 
-    let mut cols = if crate::vfs::is_virtual(&state.cwd) {
-        build_virtual_cols(&state.cwd, vfs)
-    } else {
-        build_real_cols(&state.cwd)
-    };
+    let last = state.trail.len().saturating_sub(1);
+    let mut cols: Vec<NavColumn> = state
+        .trail
+        .iter()
+        .enumerate()
+        .map(|(i, t)| NavColumn { sibs: t.names.clone(), idx: t.index, is_cwd: i == last, is_contents: false })
+        .collect();
 
     if !state.entries.is_empty() {
         cols.push(NavColumn {
@@ -418,70 +425,6 @@ pub fn render_nav(
     panels.push(pf);
 }
 
-fn build_real_cols(cwd: &std::path::Path) -> Vec<NavColumn> {
-    let mut names: Vec<String> = vec!["/".into()];
-    for c in cwd.components() {
-        if let std::path::Component::Normal(s) = c {
-            names.push(s.to_string_lossy().into_owned());
-        }
-    }
-    let mut cols: Vec<NavColumn> =
-        vec![NavColumn { sibs: vec!["/".into()], idx: 0, is_cwd: names.len() == 1, is_contents: false }];
-    let mut parent = std::path::PathBuf::from("/");
-    for i in 1..names.len() {
-        let sel = names[i].clone();
-        let mut sibs: Vec<String> = std::fs::read_dir(&parent)
-            .map(|rd| {
-                rd.flatten()
-                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|n| !n.starts_with('.') || *n == sel)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        sibs.sort();
-        let idx = sibs.iter().position(|s| *s == sel).unwrap_or_else(|| {
-            sibs.push(sel.clone());
-            sibs.len() - 1
-        });
-        cols.push(NavColumn { sibs, idx, is_cwd: i == names.len() - 1, is_contents: false });
-        parent.push(sel);
-    }
-    cols
-}
-
-fn build_virtual_cols(cwd: &std::path::Path, vfs: &crate::vfs::Vfs) -> Vec<NavColumn> {
-    use crate::vfs::vfs_root;
-    let mut levels: Vec<std::path::PathBuf> = vec![vfs_root()];
-    let mut cur = vfs_root();
-    for c in cwd.components() {
-        if let std::path::Component::Normal(s) = c {
-            if s == std::ffi::OsStr::new("@") { continue; }
-            cur = cur.join(s);
-            levels.push(cur.clone());
-        }
-    }
-    let n = levels.len();
-    let mut cols: Vec<NavColumn> = Vec::new();
-    for (i, level) in levels.iter().enumerate() {
-        let is_cwd = i == n - 1;
-        if level == &vfs_root() {
-            cols.push(NavColumn { sibs: vec!["@".into()], idx: 0, is_cwd, is_contents: false });
-        } else {
-            let parent = level.parent().map(|p| p.to_path_buf()).unwrap_or_else(vfs_root);
-            let all_entries = vfs.list(&parent, false).unwrap_or_default();
-            let siblings: Vec<String> = all_entries.iter().map(|e| e.name.clone()).collect();
-            let path_name = level.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-            let idx = all_entries
-                .iter()
-                .position(|e| e.path.file_name().map(|f| f.to_string_lossy() == path_name.as_str()).unwrap_or(false))
-                .unwrap_or(0);
-            cols.push(NavColumn { sibs: siblings, idx, is_cwd, is_contents: false });
-        }
-    }
-    cols
-}
-
 fn trunc(s: &str) -> String {
     if s.chars().count() > NAME_CAP {
         format!("{}…", s.chars().take(NAME_CAP - 1).collect::<String>())
@@ -491,18 +434,25 @@ fn trunc(s: &str) -> String {
 }
 
 fn nav_put(buf: &mut Buffer, inner: Rect, x: u16, y: u16, ch: char, style: Style) {
-    if x >= inner.x && y >= inner.y && x < inner.x + inner.width && y < inner.y + inner.height {
-        if let Some(cell) = buf.cell_mut((x, y)) {
+    if x >= inner.x && y >= inner.y && x < inner.x + inner.width && y < inner.y + inner.height
+        && let Some(cell) = buf.cell_mut((x, y)) {
             cell.set_char(ch);
             cell.set_style(style);
         }
-    }
 }
 
 // ── Prop panel ────────────────────────────────────────────────────────────────
 
 /// The prop panel: SIZE / OWNR / PERM / TIME / INFO.
-pub fn render_prop(frame: &mut Frame, pa: PanelArea, state: &AppState, panels: &mut Vec<PanelFrame>, theme: &Theme) {
+pub fn render_prop(
+    frame: &mut Frame,
+    pa: PanelArea,
+    state: &AppState,
+    load: Option<[f64; 3]>,
+    border_style: &str,
+    panels: &mut Vec<PanelFrame>,
+    theme: &Theme,
+) {
     let inner = pa.inner();
     let w = inner.width as usize;
 
@@ -515,7 +465,7 @@ pub fn render_prop(frame: &mut Frame, pa: PanelArea, state: &AppState, panels: &
             ),
             prop_line(
                 "OWNR",
-                &format!("{}  {}", uid_name(e.uid), gid_name(e.gid)),
+                &format!("{}  {}", named_id(&e.owner, e.uid), named_id(&e.group, e.gid)),
                 w, Role::PropOwnerLabel, Role::PropOwnerValue, theme,
             ),
             prop_line("PERM", &wasdf_sdk::format_permissions(e.mode), w,
@@ -528,7 +478,27 @@ pub fn render_prop(frame: &mut Frame, pa: PanelArea, state: &AppState, panels: &
         None => vec![Line::from("(empty)")],
     };
     frame.render_widget(Paragraph::new(lines), inner);
-    panels.push(pa.frame());
+    let avail = pa.rect.width.saturating_sub(4) as usize;
+    let readout = prop_readout(load, SystemTime::now(), h_rule(border_style), avail);
+    panels.push(match readout {
+        Some(r) => pa.frame().info(r),
+        None => pa.frame(),
+    });
+}
+
+/// The prop panel's live readout (doc/UI.md): `[l1, l5, l15]─[YY-MM-DD HH:MM:SS]─`,
+/// giving up detail — the date, then the load, then the seconds — until it
+/// fits in `avail` columns. Every form keeps a trailing rule, so the bracket
+/// never sits flush against the corner.
+fn prop_readout(load: Option<[f64; 3]>, now: SystemTime, rule: char, avail: usize) -> Option<String> {
+    let full = fmt_time(Some(now), true); // "YYYY-MM-DD HH:MM:SS"
+    let (date_time, time_ss, time_mm) = (&full[2..], &full[11..], &full[11..16]);
+    let load = load.map(|[a, b, c]| format!("[{a:.2}, {b:.2}, {c:.2}]{rule}"));
+    let with_load = |clock: &str| load.as_ref().map(|l| format!("{l}[{clock}]{rule}"));
+    [with_load(date_time), with_load(time_ss), Some(format!("[{time_ss}]{rule}")), Some(format!("[{time_mm}]{rule}"))]
+        .into_iter()
+        .flatten()
+        .find(|s| s.chars().count() <= avail)
 }
 
 // ── Monitor panel ─────────────────────────────────────────────────────────────
@@ -539,13 +509,11 @@ pub fn render_prop(frame: &mut Frame, pa: PanelArea, state: &AppState, panels: &
 pub fn render_monitor(
     frame: &mut Frame,
     pa: PanelArea,
-    state: &AppState,
+    snap: &crate::services::monitor::Snapshot,
     panels: &mut Vec<PanelFrame>,
-    border_style: &str,
     mon: &MonitorOptions,
     theme: &Theme,
 ) {
-    let area = pa.rect;
     let inner = pa.inner();
     let w = inner.width as usize;
 
@@ -564,43 +532,25 @@ pub fn render_monitor(
         }
         // Disk is special: it shows read/write operation rates as two gauges.
         if id == "dsk" {
-            let ds = disk_runtime(cfg.refresh, cfg.graph_window);
-            lines.push(disk_row(&cfg, &ds, w, lbl_role, bar_role, val_role, theme));
+            lines.push(disk_row(cfg, &snap.disk, w, lbl_role, bar_role, val_role, theme));
             continue;
         }
-        let line = match metric_runtime(id, cfg.refresh, cfg.graph_window, &state.cwd) {
-            Some((ratio, value, history)) => {
-                metric_row(name, &cfg, ratio, &value, &history, w, lbl_role, bar_role, val_role, theme)
-            }
+        let sample = match id {
+            "cpu" => &snap.cpu,
+            "mem" => &snap.mem,
+            _ => &snap.net,
+        };
+        let line = match sample {
+            Some(m) => metric_row(name, cfg, m.ratio, &m.value, &m.history, w, lbl_role, bar_role, val_role, theme),
             // No data yet (startup or unsupported platform): muted placeholder.
-            None => muted_metric_row(name, &cfg, w, lbl_role, theme),
+            None => muted_metric_row(name, cfg, w, lbl_role, theme),
         };
         lines.push(line);
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
 
-    // Border: clock in the right-aligned info slot.
-    let clock_full = fmt_time(Some(SystemTime::now()), true); // "YYYY-MM-DD HH:MM:SS"
-    let h_sep = h_rule(border_style);
-    // Pick the richest clock form that fits in the info slot (area.width − 4).
-    let avail = area.width.saturating_sub(4) as usize;
-    let time_ss = &clock_full[11..]; // "HH:MM:SS"
-    let time_mm = &clock_full[11..16]; // "HH:MM"
-    // Every candidate keeps at least one trailing rule char so the info
-    // bracket never sits flush against the panel's right corner — `]┐` reads
-    // as a rendering glitch, not a border seam.
-    let candidates = [
-        format!("[ {clock_full} ]{h_sep}{h_sep}"),
-        format!("[ {clock_full} ]{h_sep}"),
-        format!("[ {time_ss} ]{h_sep}"),
-        format!("[ {time_mm} ]{h_sep}"),
-    ];
-    if let Some(info) = candidates.iter().find(|s| s.chars().count() <= avail) {
-        panels.push(pa.frame().info(info.clone()));
-    } else {
-        panels.push(pa.frame());
-    }
+    panels.push(pa.frame());
 }
 
 // ── Monitor helpers ───────────────────────────────────────────────────────────
@@ -637,8 +587,7 @@ fn braille_sparkline(history: &[f64], width: usize) -> String {
     let needed = width * 2;
     let recent = &history[history.len().saturating_sub(needed)..];
     // Left-pad the sample window so the latest sample sits at the right edge.
-    let mut samples: Vec<f64> = std::iter::repeat(0.0)
-        .take(needed.saturating_sub(recent.len()))
+    let mut samples: Vec<f64> = std::iter::repeat_n(0.0, needed.saturating_sub(recent.len()))
         .chain(recent.iter().copied())
         .collect();
     samples.truncate(needed);
@@ -761,81 +710,8 @@ fn fit_left(s: &str, w: usize) -> String {
     format!("{t:<w$}")
 }
 
-/// Sample one metric: its current gauge ratio (0..1) and value text. CPU/MEM may
-/// be `None` on unsupported platforms; NET always yields a value. (Disk is
-/// handled separately by `disk_runtime` — it shows read/write op rates.)
-fn sample_metric(id: &str, _cwd: &std::path::Path) -> Option<(f64, String)> {
-    match id {
-        "cpu" => loadavg().map(|[la1, _, _]| ((la1 / 4.0).clamp(0.0, 1.0), format!("{la1:.2}"))),
-        "mem" => mem_info().map(|(total, used)| {
-            // Show available memory only (Linux MemAvailable; the free-memory
-            // equivalent on macOS) — the total/max is intentionally not shown.
-            // The gauge still tracks used pressure.
-            let ratio = if total > 0 { used as f64 / total as f64 } else { 0.0 };
-            let available = total.saturating_sub(used);
-            (ratio, wasdf_sdk::format_size(available))
-        }),
-        "net" => {
-            let (avg5, avg60) = net_stats();
-            let ratio = if avg60 > 0 { (avg5 as f64 / avg60 as f64).clamp(0.0, 1.0) } else { 0.0 };
-            Some((ratio, format!("{}/s", wasdf_sdk::format_size(avg5))))
-        }
-        _ => None,
-    }
-}
 
-/// The number of samples spanning `window` seconds at the `refresh` cadence — the
-/// rolling history length, so the graph's full-scale peak is the max over the
-/// configured window.
-fn window_samples(refresh: u64, window: u64) -> usize {
-    (window / refresh.max(1)).max(1) as usize
-}
 
-/// Per-metric runtime: throttles resampling to the configured `refresh` cadence
-/// and keeps a `graph_window`-long rolling ratio history for the sparkline gauges.
-/// Returns the cached `(ratio, value, history)` or `None` if the metric has never
-/// produced a sample.
-fn metric_runtime(id: &'static str, refresh: u64, graph_window: u64, cwd: &std::path::Path)
-    -> Option<(f64, String, Vec<f64>)>
-{
-    use std::collections::{HashMap, VecDeque};
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Instant;
-
-    #[derive(Default)]
-    struct MetricState {
-        last: Option<Instant>,
-        ratio: f64,
-        value: String,
-        history: VecDeque<f64>,
-        have: bool,
-    }
-    static RT: OnceLock<Mutex<HashMap<&'static str, MetricState>>> = OnceLock::new();
-
-    let cap = window_samples(refresh, graph_window);
-    let now = Instant::now();
-    let mut map = RT.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
-    let st = map.entry(id).or_default();
-    let due = st.last.map(|t| now.duration_since(t).as_secs() >= refresh).unwrap_or(true);
-    if due {
-        if let Some((ratio, value)) = sample_metric(id, cwd) {
-            st.ratio = ratio;
-            st.value = value;
-            st.history.push_back(ratio);
-            st.last = Some(now);
-            st.have = true;
-        } else if !st.have {
-            return None;
-        }
-    }
-    while st.history.len() > cap {
-        st.history.pop_front();
-    }
-    if !st.have {
-        return None;
-    }
-    Some((st.ratio, st.value.clone(), st.history.iter().copied().collect()))
-}
 
 /// `Fg`-cascade: if the specific role resolves to Reset, fall back to the
 /// global `Fg` role, which itself defaults to Reset (terminal default).
@@ -845,180 +721,10 @@ fn cascade_fg(theme: &Theme, role: Role) -> ratatui::style::Color {
     if c == ratatui::style::Color::Reset { theme.role(Role::Base) } else { c }
 }
 
-/// Total and used physical memory in bytes.
-fn mem_info() -> Option<(u64, u64)> {
-    #[cfg(target_os = "macos")]
-    {
-        use std::ffi::CStr;
-        let mut total = 0u64;
-        let mut sz = std::mem::size_of::<u64>();
-        let name = CStr::from_bytes_with_nul(b"hw.memsize\0").unwrap();
-        unsafe {
-            libc::sysctlbyname(
-                name.as_ptr(), &mut total as *mut u64 as *mut libc::c_void,
-                &mut sz, std::ptr::null_mut(), 0,
-            );
-        }
-        if total == 0 { return None; }
 
-        let mut free_pages = 0u32;
-        let mut fp_sz = std::mem::size_of::<u32>();
-        let fp_name = CStr::from_bytes_with_nul(b"vm.page_free_count\0").unwrap();
-        unsafe {
-            libc::sysctlbyname(
-                fp_name.as_ptr(), &mut free_pages as *mut u32 as *mut libc::c_void,
-                &mut fp_sz, std::ptr::null_mut(), 0,
-            );
-        }
 
-        let mut page_size = 4096u64;
-        let mut ps_sz = std::mem::size_of::<u64>();
-        let ps_name = CStr::from_bytes_with_nul(b"hw.pagesize\0").unwrap();
-        unsafe {
-            libc::sysctlbyname(
-                ps_name.as_ptr(), &mut page_size as *mut u64 as *mut libc::c_void,
-                &mut ps_sz, std::ptr::null_mut(), 0,
-            );
-        }
 
-        let available = free_pages as u64 * page_size;
-        Some((total, total.saturating_sub(available)))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let content = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let mut total = 0u64;
-        let mut available = 0u64;
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                total = rest.trim().split_whitespace().next()?.parse::<u64>().ok()? * 1024;
-            } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                available = rest.trim().split_whitespace().next()?.parse::<u64>().ok()? * 1024;
-            }
-        }
-        if total == 0 { None } else { Some((total, total.saturating_sub(available))) }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    { None }
-}
 
-/// Cumulative (reads, writes) operation counts across all connected block
-/// devices, via IOKit's `IOBlockStorageDriver` statistics.
-#[cfg(target_os = "macos")]
-fn disk_ops_total() -> (u64, u64) {
-    use std::ffi::c_void;
-    type CFRef = *const c_void;
-    type IoObject = u32;
-    const KERN_SUCCESS: i32 = 0;
-    const UTF8: u32 = 0x0800_0100;
-    const SINT64: i32 = 4;
-
-    #[link(name = "IOKit", kind = "framework")]
-    #[link(name = "CoreFoundation", kind = "framework")]
-    unsafe extern "C" {
-        fn IOServiceMatching(name: *const libc::c_char) -> CFRef;
-        fn IOServiceGetMatchingServices(port: u32, matching: CFRef, iter: *mut IoObject) -> i32;
-        fn IOIteratorNext(iter: IoObject) -> IoObject;
-        fn IOObjectRelease(obj: IoObject) -> i32;
-        fn IORegistryEntryCreateCFProperties(
-            entry: IoObject, props: *mut CFRef, allocator: CFRef, options: u32,
-        ) -> i32;
-        fn CFStringCreateWithCString(alloc: CFRef, s: *const libc::c_char, enc: u32) -> CFRef;
-        fn CFDictionaryGetValue(dict: CFRef, key: CFRef) -> CFRef;
-        fn CFNumberGetValue(num: CFRef, ty: i32, value: *mut c_void) -> u8;
-        fn CFRelease(cf: CFRef);
-    }
-
-    let (mut reads, mut writes) = (0u64, 0u64);
-    unsafe {
-        let matching = IOServiceMatching(c"IOBlockStorageDriver".as_ptr());
-        if matching.is_null() {
-            return (0, 0);
-        }
-        let mut iter: IoObject = 0;
-        if IOServiceGetMatchingServices(0, matching, &mut iter) != KERN_SUCCESS {
-            return (0, 0);
-        }
-        let null: CFRef = std::ptr::null();
-        let k_stats = CFStringCreateWithCString(null, c"Statistics".as_ptr(), UTF8);
-        let k_read = CFStringCreateWithCString(null, c"Operations (Read)".as_ptr(), UTF8);
-        let k_write = CFStringCreateWithCString(null, c"Operations (Write)".as_ptr(), UTF8);
-        loop {
-            let entry = IOIteratorNext(iter);
-            if entry == 0 {
-                break;
-            }
-            let mut props: CFRef = std::ptr::null();
-            if IORegistryEntryCreateCFProperties(entry, &mut props, null, 0) == KERN_SUCCESS
-                && !props.is_null()
-            {
-                let stats = CFDictionaryGetValue(props, k_stats);
-                if !stats.is_null() {
-                    let mut v: i64 = 0;
-                    let r = CFDictionaryGetValue(stats, k_read);
-                    if !r.is_null() && CFNumberGetValue(r, SINT64, &mut v as *mut i64 as *mut c_void) != 0 {
-                        reads += v as u64;
-                    }
-                    v = 0;
-                    let wv = CFDictionaryGetValue(stats, k_write);
-                    if !wv.is_null() && CFNumberGetValue(wv, SINT64, &mut v as *mut i64 as *mut c_void) != 0 {
-                        writes += v as u64;
-                    }
-                }
-                CFRelease(props);
-            }
-            IOObjectRelease(entry);
-        }
-        CFRelease(k_stats);
-        CFRelease(k_read);
-        CFRelease(k_write);
-        IOObjectRelease(iter);
-    }
-    (reads, writes)
-}
-
-/// Cumulative (reads, writes) completed across all whole block devices, from
-/// `/proc/diskstats` (field 4 = reads completed, field 8 = writes completed).
-#[cfg(target_os = "linux")]
-fn disk_ops_total() -> (u64, u64) {
-    let (mut reads, mut writes) = (0u64, 0u64);
-    if let Ok(content) = std::fs::read_to_string("/proc/diskstats") {
-        for line in content.lines() {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() < 8 {
-                continue;
-            }
-            let name = f[2];
-            if name.starts_with("loop") || name.starts_with("ram") || is_partition(name) {
-                continue;
-            }
-            reads += f[3].parse::<u64>().unwrap_or(0);
-            writes += f[7].parse::<u64>().unwrap_or(0);
-        }
-    }
-    (reads, writes)
-}
-
-/// Heuristic: is this `/proc/diskstats` device name a partition (skip, to avoid
-/// double-counting its whole disk)? e.g. `sda1`, `nvme0n1p2`, `mmcblk0p1`.
-#[cfg(target_os = "linux")]
-fn is_partition(name: &str) -> bool {
-    let ends_digit = name.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false);
-    if !ends_digit {
-        return false;
-    }
-    // nvme/mmcblk whole disks end in a digit (nvme0n1); their partitions carry a `p`.
-    if name.starts_with("nvme") || name.starts_with("mmcblk") {
-        return name.contains('p');
-    }
-    // sd*/hd*/vd*/xvd*: a trailing digit marks a partition (sda1).
-    true
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn disk_ops_total() -> (u64, u64) {
-    (0, 0)
-}
 
 /// Compact count formatter for op rates: `999`, `1K`, `12M`.
 fn fmt_count(n: u64) -> String {
@@ -1031,70 +737,7 @@ fn fmt_count(n: u64) -> String {
     }
 }
 
-/// Disk read/write op-rate sample: current per-second rates and their rolling
-/// rate histories (for the sparkline gauges).
-struct DiskSample {
-    r_rate: f64,
-    w_rate: f64,
-    r_hist: Vec<f64>,
-    w_hist: Vec<f64>,
-}
 
-/// Per-disk runtime: throttles op-counter sampling to `refresh`, diffs the
-/// cumulative counters into read/write rates (ops/sec), and keeps rolling
-/// histories for the gauges.
-fn disk_runtime(refresh: u64, graph_window: u64) -> DiskSample {
-    use std::collections::VecDeque;
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Instant;
-
-    #[derive(Default)]
-    struct DiskState {
-        last: Option<Instant>,
-        prev: Option<(u64, u64)>,
-        r_rate: f64,
-        w_rate: f64,
-        r_hist: VecDeque<f64>,
-        w_hist: VecDeque<f64>,
-    }
-    static RT: OnceLock<Mutex<DiskState>> = OnceLock::new();
-
-    let now = Instant::now();
-    let st_mutex = RT.get_or_init(|| Mutex::new(DiskState::default()));
-    let Ok(mut st) = st_mutex.lock() else {
-        return DiskSample { r_rate: 0.0, w_rate: 0.0, r_hist: vec![], w_hist: vec![] };
-    };
-    let due = st.last.map(|t| now.duration_since(t).as_secs() >= refresh).unwrap_or(true);
-    if due {
-        let (reads, writes) = disk_ops_total();
-        if let Some((pr, pw)) = st.prev {
-            let dt = st.last.map(|t| now.duration_since(t).as_secs_f64()).unwrap_or(0.0);
-            if dt > 0.0 {
-                let r = reads.saturating_sub(pr) as f64 / dt;
-                let w = writes.saturating_sub(pw) as f64 / dt;
-                st.r_rate = r;
-                st.w_rate = w;
-                st.r_hist.push_back(r);
-                st.w_hist.push_back(w);
-            }
-        }
-        st.prev = Some((reads, writes));
-        st.last = Some(now);
-    }
-    let cap = window_samples(refresh, graph_window);
-    while st.r_hist.len() > cap {
-        st.r_hist.pop_front();
-    }
-    while st.w_hist.len() > cap {
-        st.w_hist.pop_front();
-    }
-    DiskSample {
-        r_rate: st.r_rate,
-        w_rate: st.w_rate,
-        r_hist: st.r_hist.iter().copied().collect(),
-        w_hist: st.w_hist.iter().copied().collect(),
-    }
-}
 
 /// Render one gauge of `width` chars per the `bar_kind`. `cur` is the current
 /// ratio (for the fill bar); `hist` is the normalized history (for sparklines).
@@ -1140,7 +783,7 @@ fn lerp_minmax(v: f64, mn: f64, mx: f64) -> f64 {
 #[allow(clippy::too_many_arguments)]
 fn disk_row(
     cfg: &MetricCfg,
-    ds: &DiskSample,
+    ds: &crate::services::monitor::DiskSample,
     width: usize,
     label_role: Role,
     bar_role: Role,
@@ -1213,112 +856,10 @@ fn disk_value(reads: u64, writes: u64, width: usize) -> String {
     format!("{}:{}", fit_right(&fmt_count(reads), left), fit_left(&fmt_count(writes), right))
 }
 
-/// Cumulative bytes (rx + tx) across all UP non-loopback interfaces.
-#[cfg(target_os = "macos")]
-fn net_total_bytes() -> u64 {
-    let mut total: u64 = 0;
-    unsafe {
-        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut ifap) != 0 || ifap.is_null() {
-            return 0;
-        }
-        let mut ifa = ifap;
-        while !ifa.is_null() {
-            let flags = (*ifa).ifa_flags as u32;
-            let up = flags & (libc::IFF_UP as u32) != 0;
-            let loopback = flags & (libc::IFF_LOOPBACK as u32) != 0;
-            let addr = (*ifa).ifa_addr;
-            // Link-level rows (AF_LINK) carry the per-interface byte counters in
-            // their ifa_data as a `struct if_data`.
-            if up && !loopback && !addr.is_null()
-                && (*addr).sa_family as i32 == libc::AF_LINK
-                && !(*ifa).ifa_data.is_null()
-            {
-                let data = (*ifa).ifa_data as *const libc::if_data;
-                total += (*data).ifi_ibytes as u64 + (*data).ifi_obytes as u64;
-            }
-            ifa = (*ifa).ifa_next;
-        }
-        libc::freeifaddrs(ifap);
-    }
-    total
-}
 
-/// Cumulative bytes (rx + tx) across all non-loopback interfaces, from
-/// `/proc/net/dev`.
-#[cfg(target_os = "linux")]
-fn net_total_bytes() -> u64 {
-    let mut total: u64 = 0;
-    if let Ok(content) = std::fs::read_to_string("/proc/net/dev") {
-        for line in content.lines() {
-            let Some((name, rest)) = line.split_once(':') else { continue };
-            if name.trim() == "lo" { continue; }
-            let cols: Vec<&str> = rest.split_whitespace().collect();
-            // rx bytes = column 0, tx bytes = column 8.
-            let rx = cols.first().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            let tx = cols.get(8).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            total += rx + tx;
-        }
-    }
-    total
-}
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn net_total_bytes() -> u64 {
-    0
-}
 
-/// Network throughput stats, summed over all non-loopback devices: the average
-/// byte/second rate over the last ~5 seconds and over the last ~60 seconds.
-/// Keeps a rolling 60-second history of cumulative-byte samples, one per frame.
-fn net_stats() -> (u64, u64) {
-    use std::collections::VecDeque;
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Instant;
-    static HIST: OnceLock<Mutex<VecDeque<(Instant, u64)>>> = OnceLock::new();
 
-    let total = net_total_bytes();
-    let now = Instant::now();
-    let Ok(mut hist) = HIST.get_or_init(|| Mutex::new(VecDeque::new())).lock() else {
-        return (0, 0);
-    };
-    hist.push_back((now, total));
-    // Drop samples older than the 60-second window.
-    while let Some(&(t, _)) = hist.front() {
-        if now.duration_since(t).as_secs_f64() > 60.0 {
-            hist.pop_front();
-        } else {
-            break;
-        }
-    }
-    (window_rate(&hist, now, total, 5.0), window_rate(&hist, now, total, 60.0))
-}
-
-/// Average byte/second rate over roughly the last `min_age` seconds: diff the
-/// current cumulative byte count against the newest sample at least `min_age`
-/// old (or the oldest available if the history is shorter than the window).
-fn window_rate(
-    hist: &std::collections::VecDeque<(std::time::Instant, u64)>,
-    now: std::time::Instant,
-    total: u64,
-    min_age: f64,
-) -> u64 {
-    let mut base: Option<&(std::time::Instant, u64)> = None;
-    for s in hist.iter() {
-        if now.duration_since(s.0).as_secs_f64() >= min_age {
-            base = Some(s);
-        } else {
-            break;
-        }
-    }
-    match base.or_else(|| hist.front()) {
-        Some(&(t0, b0)) => {
-            let dt = now.duration_since(t0).as_secs_f64();
-            if dt > 0.0 { (total.saturating_sub(b0) as f64 / dt) as u64 } else { 0 }
-        }
-        None => 0,
-    }
-}
 
 // ── Prop helpers ──────────────────────────────────────────────────────────────
 
@@ -1368,38 +909,9 @@ fn prop_line(
     ])
 }
 
-/// The plain username for a uid via `getpwuid`, or `None` if unresolvable —
-/// the lookup `uid_name` (this module's `name (uid)` prop-panel format) and
-/// `ui::middle`'s compact Rows-layout OWNR column both build on.
-pub(crate) fn username(uid: u32) -> Option<String> {
-    unsafe {
-        let pw = libc::getpwuid(uid as libc::uid_t);
-        if pw.is_null() {
-            return None;
-        }
-        let s = std::ffi::CStr::from_ptr((*pw).pw_name).to_str().ok()?;
-        (!s.is_empty()).then(|| s.to_string())
-    }
-}
-
-/// Resolve a uid to `name (uid)`, or just `uid` if the name is unavailable.
-fn uid_name(uid: u32) -> String {
-    username(uid).map(|s| format!("{s} ({uid})")).unwrap_or_else(|| uid.to_string())
-}
-
-/// Resolve a gid to `name (gid)`, or just `gid` if the name is unavailable.
-fn gid_name(gid: u32) -> String {
-    unsafe {
-        let gr = libc::getgrgid(gid as libc::gid_t);
-        if !gr.is_null() {
-            if let Ok(s) = std::ffi::CStr::from_ptr((*gr).gr_name).to_str() {
-                if !s.is_empty() {
-                    return format!("{s} ({gid})");
-                }
-            }
-        }
-    }
-    gid.to_string()
+/// `name (id)`, or just the id when it has no name.
+fn named_id(name: &str, id: u32) -> String {
+    if name.is_empty() { id.to_string() } else { format!("{name} ({id})") }
 }
 
 /// Format a `SystemTime` in local time.
@@ -1422,8 +934,22 @@ pub(crate) fn fmt_time(t: Option<SystemTime>, full: bool) -> String {
     }
 }
 
-/// 1/5/15-minute load averages, if available.
-fn loadavg() -> Option<[f64; 3]> {
-    let mut a = [0f64; 3];
-    if unsafe { libc::getloadavg(a.as_mut_ptr(), 3) } == 3 { Some(a) } else { None }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_prop_readout_gives_up_detail_until_it_fits() {
+        let now = SystemTime::now();
+        let load = Some([1.9, 2.26, 2.734]);
+        let full = prop_readout(load, now, '─', 80).unwrap();
+        assert!(full.starts_with("[1.90, 2.26, 2.73]─[") && full.ends_with("]─"), "{full}");
+        assert_eq!(full.chars().count(), 39, "YY-MM-DD HH:MM:SS: {full}");
+        let no_date = prop_readout(load, now, '─', 38).unwrap();
+        assert_eq!(no_date.chars().count(), 30, "{no_date}");
+        assert_eq!(prop_readout(load, now, '─', 12).unwrap().chars().count(), 11, "time only");
+        assert_eq!(prop_readout(None, now, '─', 80).unwrap().chars().count(), 11, "no load: time only");
+        assert_eq!(prop_readout(load, now, '─', 8).unwrap().chars().count(), 8, "HH:MM");
+        assert_eq!(prop_readout(load, now, '─', 5), None);
+    }
 }

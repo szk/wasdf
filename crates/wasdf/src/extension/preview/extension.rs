@@ -13,18 +13,18 @@
 //! function-panel geometry + (for key gating) the search match list it stores on
 //! this extension's behalf.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use crate::core::{AppState, Block, ExtensionIntent, Intent, Mode, OptionStore, PanelView, Content, SelectSource, SpanStyle, TextSpan, LINE_NUMBER_WIDTH};
+use crate::core::{AppState, Block, ExtensionIntent, Intent, Mode, OptionStore, PanelView, Content, SelectSource, SpanStyle, TextSpan};
 use crate::extension::{Extension, FunctionRenderCtx};
 use crate::script::condition::Conditions;
 
 // The detail submodules (decode / highlight / markdown / search) are declared by
 // the `preview.rs` facade; from here they are siblings under `preview`.
 use super::decode::{self, Decoded, Kind};
-use super::{markdown, search};
+use super::search;
 
 /// Lines below the viewport to keep loaded: once the scroll is within this many
 /// lines of the loaded end, the next file chunk is fetched (so scrolling never
@@ -50,10 +50,9 @@ pub struct PreviewExtension {
     load: RefCell<Load>,
     /// Set once from boot via `bind_store`; read in `accept_content` for tab width.
     store: OnceLock<Arc<OptionStore>>,
-    /// The panel's `(width, height)` as of the last render. Only the search
-    /// matcher needs it — to size an inline image's row footprint the same way
-    /// core's layout will.
-    viewport: Cell<(u16, u16)>,
+    /// The view built from the stash, until the stash changes: its pointer
+    /// identity is the content revision core caches its layout by.
+    view: RefCell<Option<Arc<PanelView>>>,
 }
 
 /// The current window's chunk-load state: which file it covers, how it streams
@@ -75,6 +74,7 @@ impl PreviewExtension {
     /// for the same path append `tail ++ bytes`, decoding the completed units and
     /// keeping the new tail.
     fn accept_chunk(&self, path: &Path, offset: u64, bytes: &[u8], eof: bool, tab_width: usize) {
+        self.view.borrow_mut().take();
         let mut load = self.load.borrow_mut();
         let mut content = self.content.borrow_mut();
         if offset == 0 {
@@ -134,30 +134,11 @@ impl PreviewExtension {
         }
     }
 
-    /// Flatten a block document into the panel rows core will lay it out as:
-    /// one entry per row, holding that row's text. An image contributes its
-    /// (textless) row footprint so every later block's row index still lines up
-    /// with what the search highlighter will paint.
-    fn block_rows(&self, blocks: &[Block], state: &AppState) -> Vec<String> {
-        let (width, height) = self.viewport.get();
-        let gutter = if state.function.show_line_numbers { LINE_NUMBER_WIDTH } else { 0 };
-        let cols = width.saturating_sub(gutter);
-        let mut rows = Vec::with_capacity(blocks.len());
-        for b in blocks {
-            match b {
-                Block::Image { .. } => {
-                    rows.extend(std::iter::repeat_n(String::new(), b.rows(cols, height.max(1)) as usize))
-                }
-                other => rows.push(markdown::block_text(other).unwrap_or_default()),
-            }
-        }
-        rows
-    }
-
     /// Drop the stashed content so the panel renders nothing. Called when the
     /// cursor moves onto "no target" (empty directory) so the previous file's
     /// preview does not linger.
     fn clear(&self) {
+        self.view.borrow_mut().take();
         *self.content.borrow_mut() = None;
         *self.target.borrow_mut() = None;
         *self.load.borrow_mut() = Load::default();
@@ -209,6 +190,7 @@ impl Extension for PreviewExtension {
             .max(1);
         match result {
             Content::Dir { entries } => {
+                self.view.borrow_mut().take();
                 *self.content.borrow_mut() = Some(Decoded::Dir { entries: entries.clone() });
                 *self.load.borrow_mut() =
                     Load { path: Some(path.to_path_buf()), eof: true, ..Default::default() };
@@ -225,8 +207,10 @@ impl Extension for PreviewExtension {
     /// (h-scroll, line numbers, search highlight, theming) and draws chrome. Text
     /// carries per-line syntax spans; hex/dir are plain/role-styled lines; a
     /// "… truncated" marker line is appended while more remains to stream.
-    fn view(&self, ctx: &FunctionRenderCtx) -> Option<PanelView> {
-        self.viewport.set((ctx.width, ctx.height));
+    fn view(&self, _ctx: &FunctionRenderCtx) -> Option<Arc<PanelView>> {
+        if let Some(v) = self.view.borrow().as_ref() {
+            return Some(v.clone());
+        }
         let stash = self.content.borrow();
         let decoded = stash.as_ref()?;
         let more = !self.load.borrow().eof;
@@ -275,36 +259,33 @@ impl Extension for PreviewExtension {
                 PanelView::Document(blocks)
             }
         };
+        let view = Arc::new(view);
+        *self.view.borrow_mut() = Some(view.clone());
         Some(view)
     }
 
     /// `search` runs the matcher over the stashed content and returns the match
     /// set (+ a jump to the first) as generic intents the reducer stores. Match
     /// state lives in core because `:when` gates `n`/`p` on it.
-    fn handle_intent(&self, intent: &ExtensionIntent, state: &AppState) -> Vec<Intent> {
+    fn handle_intent(&self, intent: &ExtensionIntent, _state: &AppState) -> Vec<Intent> {
         if intent.intent != "search" {
             return Vec::new();
         }
         let query = intent.data.as_str().unwrap_or("");
         let stash = self.content.borrow();
-        // Match line numbers are *panel rows*, so markdown has to be flattened
-        // through the same geometry core lays it out with.
-        let rows: Vec<String>;
+        // Matches are logical — (block, byte range in its text) — so no panel
+        // geometry is needed: text and hex have one block per line, markdown
+        // one per block (an image has no text).
+        let texts: Vec<String>;
         let lines: &[String] = match stash.as_ref() {
             Some(Decoded::Text { lines, .. }) | Some(Decoded::Binary { lines }) => lines,
             Some(Decoded::Markdown { blocks, .. }) => {
-                rows = self.block_rows(blocks, state);
-                &rows
+                texts = blocks.iter().map(|b| b.text().unwrap_or_default()).collect();
+                &texts
             }
             _ => return Vec::new(),
         };
-        let matches = search::find_matches(lines, query);
-        let first = matches.first().map(|&(l, _, _)| l);
-        let mut out = vec![Intent::SetSearchMatches(matches)];
-        if let Some(line) = first {
-            out.push(Intent::SetScroll(line));
-        }
-        out
+        vec![Intent::SetSearchMatches(search::find_matches(lines, query))]
     }
 
     /// Follow the cursor: when the function panel is visible in File mode, or the
@@ -395,7 +376,6 @@ mod tests {
         );
         let out = search(&ext, &state(), "col a");
         assert_eq!(matches(&out), vec![(1, 0, 5)]);
-        assert!(out.contains(&Intent::SetScroll(1)));
     }
 
     #[test]
@@ -413,27 +393,28 @@ mod tests {
     }
 
     #[test]
-    fn markdown_match_lines_skip_over_an_inline_images_rows() {
-        let dir = std::env::temp_dir().join("wasdf-preview-search-test");
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        // 40x40 at 80 columns occupies 40 rows, so a naive one-row-per-block
-        // count would put the match 39 lines too high.
-        image::RgbImage::from_pixel(40, 40, image::Rgb([9, 9, 9]))
-            .save(dir.join("i.png"))
-            .expect("write png");
+    fn markdown_matches_name_their_block_whatever_an_image_occupies() {
         let ext = PreviewExtension::default();
-        ext.viewport.set((80, 200));
         ext.accept_content(
-            &dir.join("a.md"),
-            &Content::Bytes {
-                offset: 0,
-                bytes: b"top\n\n![i](i.png)\n\nneedle\n".to_vec(),
-                eof: true,
-            },
+            Path::new("/tmp/a.md"),
+            &Content::Bytes { offset: 0, bytes: b"top\n\n![i](i.png)\n\nneedle\n".to_vec(), eof: true },
         );
-        // rows: 0 "top", 1 "", 2..42 the image, 42 "", 43 "needle".
-        let found = matches(&search(&ext, &state(), "needle"));
-        assert_eq!(found, vec![(43, 0, 6)]);
-        let _ = std::fs::remove_dir_all(&dir);
+        // blocks: 0 "top", 1 "", 2 the image, 3 "", 4 "needle" — the row it
+        // lands on is core's to work out from the panel width.
+        assert_eq!(matches(&search(&ext, &state(), "needle")), vec![(4, 0, 6)]);
+    }
+
+    #[test]
+    fn the_view_is_shared_until_the_content_changes() {
+        let p = PreviewExtension::default();
+        let func = crate::core::state::FunctionPanelState::default();
+        let theme = crate::core::Theme::default();
+        let ctx = FunctionRenderCtx { width: 40, height: 10, focused: false, func: &func, sources: &[], theme: &theme };
+        let path = std::path::Path::new("/tmp/a.txt");
+        p.accept_content(path, &Content::Bytes { offset: 0, bytes: b"hello\n".to_vec(), eof: true });
+        let a = p.view(&ctx).unwrap();
+        assert!(Arc::ptr_eq(&a, &p.view(&ctx).unwrap()), "the same revision");
+        p.accept_content(path, &Content::Bytes { offset: 0, bytes: b"world\n".to_vec(), eof: true });
+        assert!(!Arc::ptr_eq(&a, &p.view(&ctx).unwrap()), "new content, new revision");
     }
 }

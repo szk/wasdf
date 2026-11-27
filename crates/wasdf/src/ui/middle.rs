@@ -54,6 +54,16 @@ pub struct ScrollMemory {
     /// `AppState` records *who* owns the panel, never what they chose to call
     /// it. `None` when nothing is drawing a titled function panel.
     function_title: Option<String>,
+    /// The panels the last frame laid out — how the kernel learns whether a
+    /// panel with a data source of its own (the monitor) is on screen.
+    shown: Vec<String>,
+    /// The options generation this frame renders at (the theme follows it).
+    generation: u64,
+    /// The function panel's lowered content (see `function::Lowered`).
+    lowered: Option<function::Lowered>,
+    /// The scroll this draw used to reveal the current search match, for the
+    /// kernel to keep (the reducer cannot place a block on a row).
+    revealed: Option<usize>,
 }
 
 impl Default for ScrollMemory {
@@ -66,6 +76,10 @@ impl Default for ScrollMemory {
             list_cols: 1,
             list_rows: 0,
             function_title: None,
+            shown: Vec::new(),
+            generation: 0,
+            lowered: None,
+            revealed: None,
         }
     }
 }
@@ -104,6 +118,22 @@ impl ScrollMemory {
 
     pub fn function_title(&self) -> Option<&str> {
         self.function_title.as_deref()
+    }
+
+    pub fn take_revealed(&mut self) -> Option<usize> {
+        self.revealed.take()
+    }
+
+    pub fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
+    }
+
+    pub fn set_shown(&mut self, panels: Vec<String>) {
+        self.shown = panels;
+    }
+
+    pub fn shows(&self, panel: &str) -> bool {
+        self.shown.iter().any(|p| p == panel)
     }
 }
 
@@ -281,22 +311,36 @@ fn entry_cell_style(
     style
 }
 
+/// What a list row shows about the entries' state: where the cursor is, which
+/// entries are marked, and whether the list has focus.
+#[derive(Clone, Copy)]
+struct Marks<'a> {
+    cursor: usize,
+    selection: &'a std::collections::HashSet<std::path::PathBuf>,
+    focused: bool,
+}
+
+/// A column-major grid: `cols` columns of `rows` rows, each `widths[c]` wide.
+struct Grid<'a> {
+    cols: usize,
+    rows: usize,
+    widths: &'a [usize],
+}
+
 /// Build the visual rows (column-major) as styled lines: cell `idx = c*rows + r`,
 /// each fit to its column width, joined by the gap; the cursor cell is highlighted.
 fn build_list_lines(
     entries: &[crate::core::Entry],
-    cursor: usize,
-    selection: &std::collections::HashSet<std::path::PathBuf>,
-    focused: bool,
-    cols: usize,
-    rows: usize,
-    widths: &[usize],
+    window: std::ops::Range<usize>,
+    marks: &Marks,
+    grid: &Grid,
     extensions: &ExtensionRegistry,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     let n = entries.len();
-    let mut lines = Vec::with_capacity(rows);
-    for r in 0..rows {
+    let (cols, rows, widths) = (grid.cols, grid.rows, grid.widths);
+    let mut lines = Vec::with_capacity(window.len());
+    for r in window {
         let mut spans: Vec<Span<'static>> = Vec::new();
         for c in 0..cols {
             let idx = c * rows + r;
@@ -308,8 +352,8 @@ fn build_list_lines(
             }
             let e = &entries[idx];
             let cw = widths.get(c).copied().unwrap_or(0);
-            let style = entry_cell_style(e, idx, cursor, focused, extensions, theme);
-            spans.push(Span::styled(fit(&cell_text(e, selection), cw), style));
+            let style = entry_cell_style(e, idx, marks.cursor, marks.focused, extensions, theme);
+            spans.push(Span::styled(fit(&cell_text(e, marks.selection), cw), style));
         }
         lines.push(Line::from(spans));
     }
@@ -354,7 +398,7 @@ struct PropWidths {
 
 impl PropWidths {
     fn measure(entries: &[crate::core::Entry]) -> Self {
-        let ownr = entries.iter().map(|e| owner_short(e.uid).chars().count()).max().unwrap_or(0);
+        let ownr = entries.iter().map(|e| owner_short(e).chars().count()).max().unwrap_or(0);
         let size = entries.iter().map(|e| wasdf_sdk::format_size(e.size).chars().count()).max().unwrap_or(0);
         PropWidths { ownr, size }
     }
@@ -391,11 +435,10 @@ impl PropWidths {
     }
 }
 
-/// The compact OWNR value for the Rows prop column: the plain username, or
-/// the numeric uid if unresolvable — unlike the prop panel's `name (uid)`
-/// (doc/UI.md), there is no room here to show both.
-fn owner_short(uid: u32) -> String {
-    crate::ui::top::username(uid).unwrap_or_else(|| uid.to_string())
+/// The compact OWNR value for the Rows prop column: the owner's name, or the
+/// uid when it has none.
+fn owner_short(e: &crate::core::Entry) -> String {
+    if e.owner.is_empty() { e.uid.to_string() } else { e.owner.to_string() }
 }
 
 /// Right-align (left-pad) `s` to exactly `width` columns; truncate from the
@@ -423,7 +466,7 @@ fn prop_values(e: &crate::core::Entry, level: PropLevel) -> Vec<(String, Role)> 
         out.push((wasdf_sdk::format_permissions(e.mode), Role::FileRowProps));
     }
     if level == PropLevel::Max {
-        out.push((owner_short(e.uid), Role::FileRowProps));
+        out.push((owner_short(e), Role::FileRowProps));
     }
     if matches!(level, PropLevel::Medium | PropLevel::Large | PropLevel::Max) {
         out.push((wasdf_sdk::format_size(e.size), Role::FileRowProps));
@@ -531,14 +574,14 @@ fn push_gradient_aware(
 /// `Role::FileRowSizeGraph`'s fg/bg are set; directories never do.
 fn build_rows_lines_with_props(
     entries: &[crate::core::Entry],
-    cursor: usize,
-    selection: &std::collections::HashSet<std::path::PathBuf>,
-    focused: bool,
+    window: std::ops::Range<usize>,
+    marks: &Marks,
     width: usize,
     extensions: &ExtensionRegistry,
     theme: &Theme,
     file_row_size_graph: bool,
 ) -> Vec<Line<'static>> {
+    let Marks { cursor, selection, focused } = *marks;
     let name_w = entries.iter().map(|e| cell_text(e, selection).chars().count()).max().unwrap_or(0);
     let prop_widths = PropWidths::measure(entries);
     let clearance = width.saturating_sub(name_w + PROP_GAP);
@@ -557,6 +600,8 @@ fn build_rows_lines_with_props(
     entries
         .iter()
         .enumerate()
+        .skip(window.start)
+        .take(window.len())
         .map(|(idx, e)| {
             let style = entry_cell_style(e, idx, cursor, focused, extensions, theme);
             let name_w_here = if level == PropLevel::None { width } else { name_w };
@@ -665,13 +710,8 @@ fn render_entry_grid(
     // PANEL_FILE's Rows layout gets right-aligned PERM/OWNR/SIZE/TIME columns;
     // Columns/Grid and the file-search Select grid (is_file = false) keep the
     // plain name-fit cells.
-    let lines = if layout == crate::core::ListLayout::Rows && is_file {
-        build_rows_lines_with_props(entries, cursor, selection, focused, inner.width as usize, extensions, theme, file_row_size_graph)
-    } else {
-        build_list_lines(entries, cursor, selection, focused, cols, rows, &widths, extensions, theme)
-    };
-
-    // Window over visual rows: the cursor's row drives the persistent offset.
+    // Window over visual rows: the cursor's row drives the persistent offset,
+    // and only the rows in the window are built.
     let off = if is_file { &mut scroll.file } else { &mut scroll.candidates };
     if rows > 0 && n > 0 {
         let cursor_row = cursor.min(n - 1) % rows;
@@ -680,7 +720,13 @@ fn render_entry_grid(
         *off = 0;
     }
     let position = *off;
-    let visible: Vec<Line> = lines.into_iter().skip(position).take(h).collect();
+    let window = position..(position + h).min(rows);
+    let marks = Marks { cursor, selection, focused };
+    let visible = if layout == crate::core::ListLayout::Rows && is_file {
+        build_rows_lines_with_props(entries, window, &marks, inner.width as usize, extensions, theme, file_row_size_graph)
+    } else {
+        build_list_lines(entries, window, &marks, &Grid { cols, rows, widths: &widths }, extensions, theme)
+    };
     frame.render_widget(Paragraph::new(visible), inner);
 
     // Scrollbar reflects the visible window (offset), in visual-row units.
@@ -833,7 +879,7 @@ mod tests {
             size,
             mode: 0o644,
             uid: 0,
-            gid: 0,
+            gid: 0, owner: "".into(), group: "".into(),
             modified: Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)),
             created: None,
             accessed: None,
@@ -891,7 +937,7 @@ mod tests {
         let selection = HashSet::new();
         let extensions = ExtensionRegistry::new();
         let theme = Theme::default();
-        let lines = build_rows_lines_with_props(&entries, 0, &selection, true, 120, &extensions, &theme, true);
+        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: 0, selection: &selection, focused: true }, 120, &extensions, &theme, true);
         assert_eq!(lines.len(), 2);
         let text = line_text(&lines[0]);
         assert!(text.contains("rw-r--r--"), "PERM shown at ample width: {text:?}");
@@ -906,7 +952,7 @@ mod tests {
         let theme = Theme::default();
         // Width barely wider than the name itself — no room for PROP_GAP + TIME.
         let name_w = "a-very-long-filename-that-eats-the-whole-row.txt".len() + 2;
-        let lines = build_rows_lines_with_props(&entries, 0, &selection, true, name_w, &extensions, &theme, true);
+        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: 0, selection: &selection, focused: true }, name_w, &extensions, &theme, true);
         assert_eq!(lines.len(), 1);
         let text = line_text(&lines[0]);
         assert!(!text.contains("rw-r"), "no room for props: {text:?}");
@@ -918,7 +964,7 @@ mod tests {
         let selection = HashSet::new();
         let extensions = ExtensionRegistry::new();
         let theme = Theme::default();
-        let lines = build_rows_lines_with_props(&entries, 0, &selection, true, 120, &extensions, &theme, true);
+        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: 0, selection: &selection, focused: true }, 120, &extensions, &theme, true);
         // Both rows' prop segments must start at the same column (padded to
         // the longest name), so the TIME field lands in the same place.
         let t0 = line_text(&lines[0]);
@@ -1009,7 +1055,7 @@ mod tests {
         let selection = HashSet::new();
         let extensions = ExtensionRegistry::new();
         let theme = Theme::default();
-        let lines = build_rows_lines_with_props(&entries, entries.len(), &selection, true, 120, &extensions, &theme, true);
+        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: entries.len(), selection: &selection, focused: true }, 120, &extensions, &theme, true);
         let last = lines[0].spans.last().expect("prop segment has at least one span");
         let right = crate::core::color_to_rgb(theme.bg(Role::FileRowSizeGraph));
         assert_eq!(last.style.bg, Some(Color::Rgb(right.0, right.1, right.2)));
@@ -1027,7 +1073,7 @@ mod tests {
         let selection = HashSet::new();
         let extensions = ExtensionRegistry::new();
         let theme = Theme::default();
-        let lines = build_rows_lines_with_props(&entries, entries.len(), &selection, true, 120, &extensions, &theme, true);
+        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: entries.len(), selection: &selection, focused: true }, 120, &extensions, &theme, true);
         let left = crate::core::color_to_rgb(theme.role(Role::FileRowSizeGraph));
         let first_gradient_span = lines[0].spans.iter().find(|s| has_gradient_bg(s)).expect("tiny.txt still draws some bar");
         assert_eq!(first_gradient_span.style.bg, Some(Color::Rgb(left.0, left.1, left.2)));
@@ -1042,7 +1088,7 @@ mod tests {
         // No entry under the cursor (out of range): the cursor highlight also
         // sets a non-reset bg on the name span, which would otherwise be
         // indistinguishable from the gradient in these `has_gradient_bg` checks.
-        let lines = build_rows_lines_with_props(&entries, entries.len(), &selection, true, 120, &extensions, &theme, true);
+        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: entries.len(), selection: &selection, focused: true }, 120, &extensions, &theme, true);
         let bar_chars = |l: &Line| -> usize {
             l.spans.iter().filter(|s| has_gradient_bg(s)).map(|s| s.content.chars().count()).sum()
         };
@@ -1057,7 +1103,7 @@ mod tests {
         let selection = HashSet::new();
         let extensions = ExtensionRegistry::new();
         let theme = Theme::default();
-        let lines = build_rows_lines_with_props(&entries, entries.len(), &selection, true, 120, &extensions, &theme, true);
+        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: entries.len(), selection: &selection, focused: true }, 120, &extensions, &theme, true);
         assert!(!lines[0].spans.iter().any(has_gradient_bg), "directories are excluded from the size-bar scale entirely");
     }
 
@@ -1067,7 +1113,7 @@ mod tests {
         let selection = HashSet::new();
         let extensions = ExtensionRegistry::new();
         let theme = Theme::default();
-        let lines = build_rows_lines_with_props(&entries, entries.len(), &selection, true, 120, &extensions, &theme, false);
+        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: entries.len(), selection: &selection, focused: true }, 120, &extensions, &theme, false);
         assert!(!lines[0].spans.iter().any(has_gradient_bg), "file-row-size-graph off draws no bar even for a huge file");
     }
 
@@ -1078,7 +1124,19 @@ mod tests {
         let extensions = ExtensionRegistry::new();
         let mut theme = Theme::default();
         theme.set_bg(Role::FileRowSizeGraph, Color::Reset); // right endpoint left nil
-        let lines = build_rows_lines_with_props(&entries, entries.len(), &selection, true, 120, &extensions, &theme, true);
+        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: entries.len(), selection: &selection, focused: true }, 120, &extensions, &theme, true);
         assert!(!lines[0].spans.iter().any(has_gradient_bg), "a nil gradient endpoint has nothing sensible to interpolate to/from");
+    }
+
+    #[test]
+    fn only_the_window_is_built_and_keeps_the_listing_wide_column_widths() {
+        let entries: Vec<_> = (0..100).map(|i| entry(&format!("file-{i:03}"), i)).collect();
+        let selection = HashSet::new();
+        let extensions = ExtensionRegistry::new();
+        let theme = Theme::default();
+        let all = build_rows_lines_with_props(&entries, 0..100, &Marks { cursor: 0, selection: &selection, focused: true }, 120, &extensions, &theme, false);
+        let window = build_rows_lines_with_props(&entries, 40..45, &Marks { cursor: 0, selection: &selection, focused: true }, 120, &extensions, &theme, false);
+        assert_eq!(window.len(), 5);
+        assert_eq!(window, all[40..45], "a windowed row is the same row");
     }
 }

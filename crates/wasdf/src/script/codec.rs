@@ -239,7 +239,8 @@ pub fn intent_from_datum(d: &Datum) -> Option<Intent> {
 ///   - `(line (SPAN…))`          — one logical line of rich text,
 ///   - `(heading (SPAN…))`       — an emphasized section heading,
 ///   - `(rule)`                  — a full-width separator,
-/// and each SPAN is `(span "text")` (default color), `(span "text" (role "name"))`
+///
+/// Each SPAN is `(span "text")` (default color), `(span "text" (role "name"))`
 /// (themed), or `(span "text" (rgb R G B))` / `(rgb R G B BR BG BB)` (literal).
 /// Returns None on any malformed element.
 fn panel_view_from_datum(d: &Datum) -> Option<PanelView> {
@@ -421,6 +422,7 @@ fn extension_intent_from_ext_form(items: &[Datum]) -> Option<ExtensionIntent> {
 ///   - `(leaf "display-name" "path-segment" (ext "id" "intent" [data]))` — an
 ///     activatable leaf, its `activation` decoded via the same `(ext …)` shape
 ///     `intent_from_datum` uses.
+///
 /// Malformed or unknown forms are skipped silently (a dynamic extension fault
 /// disables that entry, not the caller).
 pub fn entries_from_datum_list(d: &Datum, base: &std::path::Path) -> Vec<crate::core::Entry> {

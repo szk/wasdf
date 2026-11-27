@@ -141,19 +141,17 @@ pub fn parse_ls_colors(raw: &str) -> LsColorsTable {
 /// preferred over a `*.gz` one when both exist.
 fn ext_candidates(name: &str) -> Vec<&str> {
     let mut out = Vec::new();
-    if let Some(first) = name.find('.') {
-        if first > 0 {
+    if let Some(first) = name.find('.')
+        && first > 0 {
             out.push(&name[first + 1..]);
         }
-    }
-    if let Some(last) = name.rfind('.') {
-        if last > 0 {
+    if let Some(last) = name.rfind('.')
+        && last > 0 {
             let e = &name[last + 1..];
             if !out.contains(&e) {
                 out.push(e);
             }
         }
-    }
     out
 }
 
@@ -162,21 +160,18 @@ fn ext_candidates(name: &str) -> Vec<&str> {
 /// `fi` fallback. `None` means the table has no opinion — the caller falls
 /// back to the theme's own dir/symlink/default coloring.
 pub fn style_for(table: &LsColorsTable, entry: &Entry) -> Option<Style> {
-    if entry.is_symlink {
-        if let Some(s) = table.symlink {
+    if entry.is_symlink
+        && let Some(s) = table.symlink {
             return Some(s);
         }
-    }
-    if entry.is_dir {
-        if let Some(s) = table.dir {
+    if entry.is_dir
+        && let Some(s) = table.dir {
             return Some(s);
         }
-    }
-    if entry.mode & 0o111 != 0 {
-        if let Some(s) = table.exec {
+    if entry.mode & 0o111 != 0
+        && let Some(s) = table.exec {
             return Some(s);
         }
-    }
     for ext in ext_candidates(&entry.name) {
         if let Some(s) = table.by_ext.get(ext) {
             return Some(*s);
@@ -223,7 +218,7 @@ mod tests {
             size: 0,
             mode,
             uid: 0,
-            gid: 0,
+            gid: 0, owner: "".into(), group: "".into(),
             modified: None,
             created: None,
             accessed: None,

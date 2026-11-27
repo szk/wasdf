@@ -142,7 +142,10 @@ fn run_plan(
     match plan {
         Plan::ReadDir { path, show_hidden } => {
             match vfs.list(path, *show_hidden) {
-                Ok(entries) => (AsyncStatus::Ok, Payload::Entries { path: path.clone(), entries }),
+                Ok(entries) => {
+                    let trail = vfs.trail(path);
+                    (AsyncStatus::Ok, Payload::Entries { path: path.clone(), entries, trail })
+                }
                 Err(e) => (AsyncStatus::Failed(format!("read {}: {e}", path.display())), Payload::None),
             }
         }
@@ -169,7 +172,7 @@ fn run_plan(
             // so the kernel routes it to `owner`'s `accept_content` with no
             // new plumbing.
             match owner {
-                None => (AsyncStatus::Ok, Payload::Entries { path: root.clone(), entries }),
+                None => (AsyncStatus::Ok, Payload::Entries { path: root.clone(), entries, trail: Vec::new() }),
                 Some(owner) => (
                     AsyncStatus::Ok,
                     Payload::Read { owner: owner.clone(), path: root.clone(), result: Content::Dir { entries } },
@@ -341,7 +344,7 @@ mod tests {
         let (status, payload) = run(&plan, &dir);
         assert_eq!(status, AsyncStatus::Ok);
         match payload {
-            Payload::Entries { path, entries } => {
+            Payload::Entries { path, entries, .. } => {
                 assert_eq!(path, dir);
                 assert!(entries.iter().any(|e| e.name == "needle.txt"));
             }

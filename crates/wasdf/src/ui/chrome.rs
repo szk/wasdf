@@ -196,12 +196,12 @@ fn glyph(mask: u8, style: &str) -> char {
     match style {
         "rounded" => match mask {
             6 => '╭', 10 => '╮', 5 => '╰', 9 => '╯',
-            3 | 1 | 2 => '│', 12 | 4 | 8 => '─',
+            1..=3 => '│', 12 | 4 | 8 => '─',
             7 => '├', 11 => '┤', 14 => '┬', 13 => '┴', 15 => '┼',
             _ => ' ',
         },
         "double" => match mask {
-            3 | 1 | 2 => '║', 12 | 4 | 8 => '═',
+            1..=3 => '║', 12 | 4 | 8 => '═',
             6 => '╔', 10 => '╗', 5 => '╚', 9 => '╝',
             7 => '╠', 11 => '╣', 14 => '╦', 13 => '╩', 15 => '╬',
             _ => ' ',
@@ -213,7 +213,7 @@ fn glyph(mask: u8, style: &str) -> char {
             _ => ' ',
         },
         _ => match mask { // "single" and any unrecognised value
-            3 | 1 | 2 => '│', 12 | 4 | 8 => '─',
+            1..=3 => '│', 12 | 4 | 8 => '─',
             6 => '┌', 10 => '┐', 5 => '└', 9 => '┘',
             7 => '├', 11 => '┤', 14 => '┬', 13 => '┴', 15 => '┼',
             _ => ' ',
@@ -331,9 +331,9 @@ pub fn render(
             let full_len = label.chars().count();
             let max = p.rect.width.saturating_sub(4) as usize;
             let label: String = label.chars().take(max).collect();
-            let mut x = p.rect.x + 2;
             let y = p.rect.y;
             for (i, ch) in label.chars().enumerate() {
+                let x = p.rect.x + 2 + i as u16;
                 // The first two (`[ `) and last two (` ]`) chars are brackets.
                 let is_bracket = p.bracket && (i < 2 || i >= full_len.saturating_sub(2));
                 let style = if is_bracket { bracket_style } else { text_style };
@@ -343,21 +343,20 @@ pub fn render(
                 // divider from an adjacent panel above terminating here) is safe
                 // to overwrite — the title should remain readable.
                 let junction = cx < w && cy < h && mask[cy * w + cx] & S != 0;
-                if !junction {
-                    if let Some(cell) = buf.cell_mut((x, y)) {
+                if !junction
+                    && let Some(cell) = buf.cell_mut((x, y)) {
                         cell.set_char(ch);
                         cell.set_style(style);
                     }
-                }
-                x += 1;
             }
         }
 
-        // Info embedded in the top border, right-aligned (e.g. the clock). It is a
-        // bracketed label `[ … ]` possibly trailed by border rule (`──`): the
-        // brackets take the title-bracket role, the inner text the title role, and
-        // the trailing rule the border color. (Position-based so a `-` inside the
-        // clock text is never mistaken for an ascii rule.)
+        // Info embedded in the top border, right-aligned (e.g. the prop panel's
+        // load and clock readout). It is one or more bracketed labels `[…]`
+        // joined and trailed by border rule (`─`): the brackets take the
+        // title-bracket role, the text inside them the title role, and whatever
+        // lies outside them the border color. (By bracket depth, so a `-` inside
+        // a date is never mistaken for an ascii rule.)
         for p in panels {
             let Some(info) = &p.info else { continue };
             if p.rect.width < 6 {
@@ -377,26 +376,30 @@ pub fn render(
             let max = p.rect.width.saturating_sub(4) as usize;
             let chars: Vec<char> = info.chars().take(max).collect();
             let len = chars.len() as u16;
-            let close = chars.iter().rposition(|&c| c == ']').unwrap_or(chars.len());
             let y = p.rect.y;
-            let mut x = (p.rect.x + p.rect.width).saturating_sub(1 + len).max(p.rect.x + 2);
+            let start = (p.rect.x + p.rect.width).saturating_sub(1 + len).max(p.rect.x + 2);
+            let mut inside = false;
             for (i, &ch) in chars.iter().enumerate() {
-                let style = if ch == '[' || ch == ']' {
-                    bracket_style
-                } else if i > close {
-                    border_c
-                } else {
-                    title_style
+                let x = start + i as u16;
+                let style = match ch {
+                    '[' => {
+                        inside = true;
+                        bracket_style
+                    }
+                    ']' => {
+                        inside = false;
+                        bracket_style
+                    }
+                    _ if inside => title_style,
+                    _ => border_c,
                 };
                 let (cx, cy) = ((x - area.x) as usize, (y - area.y) as usize);
                 let junction = cx < w && cy < h && mask[cy * w + cx] & S != 0;
-                if !junction {
-                    if let Some(cell) = buf.cell_mut((x, y)) {
+                if !junction
+                    && let Some(cell) = buf.cell_mut((x, y)) {
                         cell.set_char(ch);
                         cell.set_style(style);
                     }
-                }
-                x += 1;
             }
         }
 

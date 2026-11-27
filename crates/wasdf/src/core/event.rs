@@ -136,6 +136,17 @@ pub enum Block {
 }
 
 impl Block {
+    /// The block's searchable text: its spans concatenated (a `Field`'s
+    /// value). Search matches are byte ranges within it. `None` for blocks
+    /// without text.
+    pub fn text(&self) -> Option<String> {
+        let spans = match self {
+            Block::Line(v) | Block::Heading(v) | Block::Field { value: v, .. } => v,
+            Block::Rule | Block::Image { .. } => return None,
+        };
+        Some(spans.iter().map(|s| s.text.as_str()).collect())
+    }
+
     /// Panel rows this block occupies once laid out `cols` columns wide (the
     /// text area — subtract [`LINE_NUMBER_WIDTH`] first when the gutter is on).
     /// Every block is a single row except an image, which is blitted to its
@@ -226,7 +237,9 @@ pub struct ExecOutput {
 /// The single AsyncResult payload union.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Payload {
-    Entries { path: PathBuf, entries: Vec<Entry> },
+    /// A listing. `trail` is the nav panel's ancestor columns for `path` (a
+    /// ReadDir fills it; a Search leaves it empty).
+    Entries { path: PathBuf, entries: Vec<Entry>, trail: Vec<crate::core::state::TrailColumn> },
     /// A content read completion: the owning extension and the path, plus the raw
     /// read result it should decode. The kernel routes this to the extension.
     Read { owner: String, path: PathBuf, result: Content },

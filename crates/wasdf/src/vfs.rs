@@ -78,15 +78,11 @@ pub trait VfsProvider: Send + Sync {
 /// The VFS router. Shaped like `ResolverChain`: built by `extend` (embedded
 /// defaults → extension providers → user), then held as an `Arc` by both the
 /// `TaskManager` (for listing) and the renderer (for the nav panel).
+#[derive(Default)]
 pub struct Vfs {
     providers: Vec<Box<dyn VfsProvider>>,
 }
 
-impl Default for Vfs {
-    fn default() -> Self {
-        Vfs { providers: Vec::new() }
-    }
-}
 
 impl Vfs {
     pub fn extend(&mut self, ps: impl IntoIterator<Item = Box<dyn VfsProvider>>) {
@@ -95,6 +91,29 @@ impl Vfs {
 
     fn find(&self, mount: &str) -> Option<&dyn VfsProvider> {
         self.providers.iter().find(|p| p.mount() == mount).map(|p| p.as_ref())
+    }
+
+    /// The nav panel's ancestor columns for `path`, root first: at each level
+    /// the directories beside it (hidden ones only when on the path) and which
+    /// one the path takes. Runs in the ReadDir task.
+    pub fn trail(&self, path: &Path) -> Vec<crate::core::TrailColumn> {
+        use crate::core::TrailColumn;
+        if !is_virtual(path) {
+            return crate::fs::ancestor_columns(path);
+        }
+        let mut cols = vec![TrailColumn { names: vec!["@".into()], index: 0 }];
+        let mut level = vfs_root();
+        for c in path.components() {
+            let std::path::Component::Normal(s) = c else { continue };
+            if s == std::ffi::OsStr::new("@") {
+                continue;
+            }
+            let siblings = self.list(&level, false).unwrap_or_default();
+            level = level.join(s);
+            let index = siblings.iter().position(|e| e.path.file_name() == Some(s)).unwrap_or(0);
+            cols.push(TrailColumn { names: siblings.into_iter().map(|e| e.name).collect(), index });
+        }
+        cols
     }
 
     /// The VFS root listing: one `is_dir = true` entry per registered provider.
@@ -251,7 +270,7 @@ mod tests {
         vfs.extend([Box::new(DummyProvider) as Box<dyn VfsProvider>]);
         let entries = vfs.list(&vfs_root(), false).unwrap();
         // filesystem entry: capitalized display name, real-root path.
-        let fs_entry = entries.iter().find(|e| e.path == PathBuf::from("/")).unwrap();
+        let fs_entry = entries.iter().find(|e| e.path == *"/").unwrap();
         assert_eq!(fs_entry.name, "FILESYSTEM");
         // any other provider's entry: capitalized, virtual path unchanged.
         let dummy_entry = entries.iter().find(|e| e.path == vfs_root().join("widgets")).unwrap();

@@ -13,6 +13,8 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::core::{AppState, Block, FunctionHint, Mode, PanelView, Role, SpanStyle, SubLayout, TextSpan, Theme, LINE_NUMBER_WIDTH};
 use crate::extension::{ExtensionRegistry, FunctionDraw, FunctionRenderCtx};
+use std::sync::Arc;
+
 use crate::ui::chrome::{PanelArea, PanelFrame, ScrollInfo};
 use crate::ui::content;
 
@@ -23,11 +25,16 @@ pub fn render_function(
     area: PanelArea,
     state: &AppState,
     extensions: &ExtensionRegistry,
-    hint: Option<FunctionHint>,
     mem: &mut ScrollMemory,
     panels: &mut Vec<PanelFrame>,
     theme: &Theme,
 ) {
+    // In a Select the picker says what the panel shows; in File mode the
+    // content provider decides.
+    let hint = match state.mode() {
+        Mode::Select(spec) => spec.function_hint.clone(),
+        _ => None,
+    };
     let inner = area.inner();
     let focused = super::focus(state).is_function();
     let scroll = state.function.scroll.offset();
@@ -35,14 +42,14 @@ pub fn render_function(
     // A form extension hosting the panel (form_owner) draws the whole inner rect
     // via its render_form hook; core wraps the border/title chrome. The generic
     // seam that lets an extension own the panel without core knowing what it is.
-    if let Some(owner) = &state.function.form_owner {
-        if let Some(ext) = extensions.find(owner) {
+    if let Some(owner) = &state.function.form_owner
+        && let Some(ext) = extensions.find(owner) {
             let sources = state.targets();
             let ctx = FunctionRenderCtx { width: inner.width, height: inner.height, focused, func: &state.function, sources: &sources, theme };
             if let Some(title) = ext.render_form(frame, inner, &ctx) {
                 match ext.form_scroll(&ctx) {
                     Some((total, position)) => {
-                        push_function(panels, area, &title, focused, total, inner.height, position, mem)
+                        push_function(panels, area, &title, focused, ScrollInfo { total, viewport: inner.height as usize, position }, mem)
                     }
                     None => {
                         mem.set_function_title(&title);
@@ -54,7 +61,6 @@ pub fn render_function(
             }
             return;
         }
-    }
 
     // Exec frame. The vertical scroll is shared with the Content frame and clamped
     // to the last row at the viewport bottom (no over-scroll); push_function records
@@ -75,14 +81,14 @@ pub fn render_function(
         // The exec frame does not h-scroll, so its horizontal bound is zero.
         mem.function_hmax = 0;
         frame.render_widget(scrolled(lines, scroll), inner);
-        push_function(panels, area, "exec", focused, total, inner.height, scroll, mem);
+        push_function(panels, area, "exec", focused, ScrollInfo { total, viewport: inner.height as usize, position: scroll }, mem);
         return;
     }
 
     // Content frame: dispatch by hint (Select) or by the content provider (File).
     match hint {
         Some(FunctionHint::CommandSummary) => render_command_summary(frame, area, inner, state, focused, panels, mem, theme),
-        Some(FunctionHint::DirListing) => render_dir_listing(frame, area, inner, state, extensions, focused, mem, panels, theme),
+        Some(FunctionHint::DirListing) => render_dir_listing(frame, area, state, extensions, mem, panels, theme),
         Some(FunctionHint::Extension(_)) | None => {
             let sources = state.targets();
             let ctx = FunctionRenderCtx { width: inner.width, height: inner.height, focused, func: &state.function, sources: &sources, theme };
@@ -91,7 +97,7 @@ pub fn render_function(
             let view = state.function.content.clone().or_else(|| extensions.provider().and_then(|p| p.view(&ctx)));
             if let Some(view) = view {
                 let title = content::title(content_target(state).as_deref(), &state.function.search);
-                let draw = layout_view(&view, state, inner, title, theme);
+                let draw = layout_view(&view, state, inner, title, theme, mem);
                 draw_function(frame, area, inner, draw, focused, mem, panels);
             } else {
                 // No content to draw. Distinguish "nothing under the cursor"
@@ -114,8 +120,7 @@ pub fn render_function(
                     inner,
                 );
                 mem.set_function_title("content");
-                mem.set_function_title("content");
-    panels.push(area.frame().title("content").focused(focused));
+                panels.push(area.frame().title("content").focused(focused));
             }
         }
     }
@@ -126,24 +131,22 @@ fn push_function(
     area: PanelArea,
     title: &str,
     focused: bool,
-    total: usize,
-    viewport: u16,
-    position: usize,
+    scroll: ScrollInfo,
     mem: &mut ScrollMemory,
 ) {
     // Record the scroll bound for the kernel's post-draw clamp (kernel-owned
     // scroll; the reducer can't see the viewport).
-    mem.function_max = max_scroll(total, viewport as usize);
+    mem.function_max = max_scroll(scroll.total, scroll.viewport);
     mem.set_function_title(title);
     let mut f = area.frame().title(title).focused(focused);
-    if total > viewport as usize {
-        f = f.scroll(ScrollInfo { total, viewport: viewport as usize, position });
+    if scroll.total > scroll.viewport {
+        f = f.scroll(scroll);
     }
     panels.push(f);
 }
 
-/// Blit a laid-out [`FunctionDraw`] into the function panel: scroll
-/// `lines` vertically, draw the optional bottom-row prompt, and push the panel
+/// Blit a laid-out [`FunctionDraw`] into the function panel: its visible
+/// `lines`, draw the optional bottom-row prompt, and push the panel
 /// frame (title + scrollbar). This is core's only content-drawing code; it has
 /// no notion of search / scroll / highlight — those are baked into what the
 /// extension returned.
@@ -159,28 +162,39 @@ fn draw_function(
     let has_prompt = draw.prompt.is_some();
     let content_h = inner.height.saturating_sub(if has_prompt { 1 } else { 0 });
     let content = Rect { height: content_h, ..inner };
-    // Clamp so the last row stops at the viewport bottom — no over-scroll into blank.
-    let scroll = draw.scroll.min(max_scroll(draw.total, content_h as usize));
-    // Record the horizontal bound (the extension already h-scrolled its lines and
-    // reported the content width); the kernel clamps the stored hscroll to it.
+    // `lines` is already the visible window starting at row `draw.scroll`.
+    let scroll = draw.scroll;
+    // Record the horizontal bound (the lines are already h-scrolled; `width`
+    // is the content width); the kernel clamps the stored hscroll to it.
     mem.function_hmax = max_scroll(draw.width, inner.width as usize);
-    frame.render_widget(Paragraph::new(draw.lines).scroll((scroll as u16, 0)), content);
+    frame.render_widget(Paragraph::new(draw.lines), content);
     if let Some(line) = draw.prompt {
         let row = Rect { x: inner.x, y: inner.y + content_h, width: inner.width, height: 1 };
         frame.render_widget(Paragraph::new(line), row);
     }
-    push_function(panels, area, &draw.title, focused, draw.total, content_h, scroll, mem);
+    push_function(panels, area, &draw.title, focused, ScrollInfo { total: draw.total, viewport: content_h as usize, position: scroll }, mem);
 }
 
-/// Lay out a logical [`PanelView`] into a drawable [`FunctionDraw`]. This is the
-/// single content layout path — used for both a pushed view (dynamic extensions)
-/// and a provider's pulled view (Preview). Core owns everything here: Field label
-/// alignment, span theming (role→color, literal rgb), heading emphasis, then per
-/// line the horizontal scroll, line numbers, and search-match highlight via
-/// [`content::build_line`]. The extension supplied only logical blocks + spans.
-fn layout_view(view: &PanelView, state: &AppState, inner: Rect, title: String, theme: &Theme) -> FunctionDraw {
-    let f = &state.function;
-    match view {
+/// The width-dependent part of laying out a view — its blocks lowered to
+/// rows and its content width — kept until the view, the panel size, line
+/// numbers, or the theme change (doc/ARCHITECTURE.md, Render Contract).
+pub(super) struct Lowered {
+    view: Arc<PanelView>,
+    size: (u16, u16),
+    line_numbers: bool,
+    generation: u64,
+    rows: Vec<Row>,
+    /// Per row, the block it shows and the bytes before that block's text on
+    /// the row (a field's label column) — how logical search matches are put
+    /// on rows. `None` for rows without text.
+    origins: Vec<Option<(usize, usize)>>,
+    /// Per block, the row it starts on.
+    first_row: Vec<usize>,
+    width: usize,
+}
+
+fn lower(view: &Arc<PanelView>, inner: Rect, line_numbers: bool, generation: u64, theme: &Theme) -> Lowered {
+    let (rows, origins, first_row, width) = match &**view {
         PanelView::Document(blocks) => {
             let label_w = blocks
                 .iter()
@@ -190,10 +204,18 @@ fn layout_view(view: &PanelView, state: &AppState, inner: Rect, title: String, t
                 })
                 .max()
                 .unwrap_or(0);
-            let rows: Vec<Row> = blocks
-                .iter()
-                .flat_map(|b| lower_block(b, label_w, inner, f.show_line_numbers, theme))
-                .collect();
+            let (mut rows, mut origins, mut first_row) = (Vec::new(), Vec::new(), Vec::with_capacity(blocks.len()));
+            for (i, b) in blocks.iter().enumerate() {
+                first_row.push(rows.len());
+                let text_len = b.text().map(|t| t.len());
+                for row in lower_block(b, label_w, inner, line_numbers, theme) {
+                    origins.push(match (&row, text_len) {
+                        (Row::Text(text, _), Some(n)) => Some((i, text.len() - n)),
+                        _ => None,
+                    });
+                    rows.push(row);
+                }
+            }
             let width = rows
                 .iter()
                 .filter_map(|r| match r {
@@ -204,41 +226,79 @@ fn layout_view(view: &PanelView, state: &AppState, inner: Rect, title: String, t
                 })
                 .max()
                 .unwrap_or(0);
-            // Clamp h-scroll to the content width (no over-scroll into blank).
-            let hscroll = f.hscroll.offset().min(width.saturating_sub(inner.width as usize));
-            let lines: Vec<Line> = rows
-                .iter()
-                .enumerate()
-                .map(|(i, row)| match row {
-                    Row::Text(text, segs) => {
-                        content::build_line(text, segs, hscroll, i, &f.search, f.show_line_numbers, theme)
-                    }
-                    Row::Image(line) => line.clone(),
-                })
-                .collect();
-            let total = lines.len();
-            FunctionDraw {
-                lines,
-                title,
-                scroll: f.scroll.offset(),
-                total,
-                width,
-                prompt: content::prompt_line(&f.search, theme),
-            }
+            (rows, origins, first_row, width)
         }
         PanelView::Image { width, height, rgb } => {
-            let img = content::image_cells(*width, *height, rgb, inner.width, inner.height);
-            let total = img.len();
-            FunctionDraw { lines: img, title, scroll: 0, total, width: 0, prompt: None }
+            let rows: Vec<Row> = content::image_cells(*width, *height, rgb, inner.width, inner.height).into_iter().map(Row::Image).collect();
+            let origins = vec![None; rows.len()];
+            (rows, origins, Vec::new(), 0)
         }
+    };
+    Lowered { view: view.clone(), size: (inner.width, inner.height), line_numbers, generation, rows, origins, first_row, width }
+}
+
+/// Lay out a logical [`PanelView`] into a drawable [`FunctionDraw`]. This is the
+/// single content layout path — used for both a pushed view (dynamic extensions)
+/// and a provider's pulled view (Preview). Core owns everything here: Field label
+/// alignment, span theming (role→color, literal rgb), heading emphasis, then per
+/// visible line the horizontal scroll, line numbers, and search-match highlight
+/// via [`content::build_line`]. The extension supplied only logical blocks + spans.
+fn layout_view(view: &Arc<PanelView>, state: &AppState, inner: Rect, title: String, theme: &Theme, mem: &mut ScrollMemory) -> FunctionDraw {
+    let f = &state.function;
+    let fresh = |l: &Lowered| {
+        Arc::ptr_eq(&l.view, view)
+            && l.size == (inner.width, inner.height)
+            && l.line_numbers == f.show_line_numbers
+            && l.generation == mem.generation
+    };
+    if !mem.lowered.as_ref().is_some_and(fresh) {
+        mem.lowered = Some(lower(view, inner, f.show_line_numbers, mem.generation, theme));
     }
+    let Some(lowered) = mem.lowered.as_ref() else { unreachable!("filled above") };
+    let document = matches!(&**view, PanelView::Document(_));
+    let prompt = if document { content::prompt_line(&f.search, theme) } else { None };
+    let content_h = inner.height.saturating_sub(prompt.is_some() as u16) as usize;
+    let total = lowered.rows.len();
+    // Clamp so the last row stops at the viewport bottom — no over-scroll into blank.
+    let mut scroll = if document { f.scroll.offset().min(max_scroll(total, content_h)) } else { 0 };
+    if document && f.search.reveal {
+        // The current match's block decides the row; the kernel keeps it as
+        // the scroll after this draw.
+        if let Some(&row) = f.search.matches.get(f.search.current).and_then(|m| lowered.first_row.get(m.0)) {
+            scroll = row.min(max_scroll(total, content_h));
+        }
+        mem.revealed = Some(scroll);
+    }
+    let matches = &f.search.matches;
+    // Clamp h-scroll to the content width (no over-scroll into blank).
+    let hscroll = f.hscroll.offset().min(lowered.width.saturating_sub(inner.width as usize));
+    let lines: Vec<Line> = lowered.rows[scroll..(scroll + content_h).min(total)]
+        .iter()
+        .enumerate()
+        .map(|(k, row)| match row {
+            Row::Text(text, segs) => {
+                // This row's matches: its block's, shifted past the label column.
+                let highlights: Vec<(usize, usize, bool)> = match lowered.origins[scroll + k] {
+                    Some((block, prefix)) => {
+                        let lo = matches.partition_point(|m| m.0 < block);
+                        let hi = matches.partition_point(|m| m.0 <= block);
+                        (lo..hi).map(|i| (matches[i].1 + prefix, matches[i].2 + prefix, i == f.search.current)).collect()
+                    }
+                    None => Vec::new(),
+                };
+                content::build_line(text, segs, hscroll, scroll + k, &highlights, f.show_line_numbers, theme)
+            }
+            Row::Image(line) => line.clone(),
+        })
+        .collect();
+    FunctionDraw { lines, title, scroll, total, width: lowered.width, prompt }
 }
 
 /// One laid-out panel row. Text rows still carry their logical `(byte-len,
 /// Style)` segments so [`content::build_line`] can apply h-scroll, line numbers
 /// and search highlight per row; image rows are already-painted cells that none
 /// of those apply to.
-enum Row {
+pub(super) enum Row {
     Text(String, Vec<(usize, Style)>),
     Image(Line<'static>),
 }
@@ -339,19 +399,19 @@ fn content_target(state: &AppState) -> Option<std::path::PathBuf> {
 fn render_dir_listing(
     frame: &mut Frame,
     area: PanelArea,
-    inner: Rect,
     state: &AppState,
     extensions: &ExtensionRegistry,
-    focused: bool,
     mem: &mut ScrollMemory,
     panels: &mut Vec<PanelFrame>,
     theme: &Theme,
 ) {
+    let inner = area.inner();
+    let focused = super::focus(state).is_function();
     let sources = state.targets();
     let ctx = FunctionRenderCtx { width: inner.width, height: inner.height, focused, func: &state.function, sources: &sources, theme };
     if let Some(view) = extensions.provider().and_then(|p| p.view(&ctx)) {
         let title = content::title(content_target(state).as_deref(), &state.function.search);
-        let draw = layout_view(&view, state, inner, title, theme);
+        let draw = layout_view(&view, state, inner, title, theme, mem);
         draw_function(frame, area, inner, draw, focused, mem, panels);
         return;
     }
@@ -372,8 +432,8 @@ pub(super) fn is_command_select(state: &AppState) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn render_command_summary(frame: &mut Frame, area: PanelArea, inner: Rect, state: &AppState, focused: bool, panels: &mut Vec<PanelFrame>, mem: &mut ScrollMemory, theme: &Theme) {
     let mut lines: Vec<Line> = Vec::new();
-    if let Mode::Select(spec) = state.mode() {
-        if let crate::core::OnConfirm::Resolve { template, fill } = &spec.on_confirm {
+    if let Mode::Select(spec) = state.mode()
+        && let crate::core::OnConfirm::Resolve { template, fill } = &spec.on_confirm {
             let sel = state.select.as_ref();
             let input = sel.map(|s| s.query.clone()).unwrap_or_default();
             // The chosen options are the marked candidates (toggled with Space).
@@ -434,7 +494,6 @@ fn render_command_summary(frame: &mut Frame, area: PanelArea, inner: Rect, state
             };
             lines.push(Line::from(Span::styled(hint, theme.style(Role::Muted))));
         }
-    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     mem.set_function_title("Command");
     panels.push(area.frame().title("Command").focused(focused));

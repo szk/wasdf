@@ -6,7 +6,8 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event};
 
@@ -34,11 +35,10 @@ pub fn run(cwd: PathBuf) -> io::Result<()> {
         match event::poll(Duration::from_millis(250)) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(k)) => {
-                    if let Some(key) = terminal::convert_key(k) {
-                        if tx.send(AppEvent::Key(key)).is_err() {
+                    if let Some(key) = terminal::convert_key(k)
+                        && tx.send(AppEvent::Key(key)).is_err() {
                             break;
                         }
-                    }
                 }
                 Ok(Event::Resize(w, h)) => {
                     let _ = tx.send(AppEvent::Resize(w, h));
@@ -46,61 +46,54 @@ pub fn run(cwd: PathBuf) -> io::Result<()> {
                 Ok(_) => {}
                 Err(_) => break,
             },
-            Ok(false) => {
-                if tx.send(AppEvent::Tick).is_err() {
-                    break;
-                }
-            }
+            // No idle ticks: the loop wakes on events and on its own deadlines.
+            Ok(false) => {}
             Err(_) => break,
         }
     });
 
+    // Render inputs derived from the options, rebuilt only when the options
+    // generation moves (doc/ARCHITECTURE.md, Render Contract).
+    let mut derived: Option<(u64, Derived)> = None;
     let result = loop {
         // Surface any diagnostic that reached the @/messages log without
         // going through a notice (boot config warnings, loader failures) —
         // before the draw, so it shows this frame, and on every pass
         // (including Tick), so boot diagnostics appear at launch.
         app.surface_new_messages();
-        let top_opts = {
-            let s = &app.store;
-            crate::ui::top::TopOptions {
-                border_style: s.get_str("border-style"),
-                monitor: crate::ui::top::MonitorOptions::from_store(s),
-                scrollbar: crate::ui::chrome::ScrollbarChars {
-                    thumb: s.get_str("scrollbar-thumb"),
-                    rail: s.get_str("scrollbar-rail"),
-                    disabled: s.get_str("scrollbar-disabled"),
-                },
-                file_row_size_graph: s.get_bool("file-row-size-graph"),
-            }
-        };
-        let theme = app.theme_registry.read().unwrap().resolve_active();
+        let generation = app.store.generation();
+        if derived.as_ref().is_none_or(|(g, _)| *g != generation) {
+            let d = Derived::build(&app);
+            app.monitor.set_config(d.top.monitor.cadence());
+            derived = Some((generation, d));
+        }
+        let Some((_, d)) = &derived else { unreachable!("built above") };
+        let snapshot = app.monitor.snapshot();
         let view = crate::ui::render::View {
+            opts: &d.top,
             layouts: &app.layouts,
             options: &app.store,
             keymap: &app.keymap,
             conds: &app.conditions,
+            monitor: &snapshot,
         };
-        if let Err(e) = term.draw(|f| app.ui.render(f, &app.state, &app.extensions, &app.vfs, &top_opts, &view, &theme)) {
+        let theme = &d.theme;
+        if let Err(e) = term.draw(|f| app.ui.render(f, &app.state, &app.extensions, &view, theme)) {
             break Err(e);
         }
-        // The reducer advances function scroll/hscroll blindly (it can't see the
-        // viewport); feed the render-measured bounds back into each kernel-owned
-        // Scroll: bind folds in the bound and clamps the offset, so over-scroll is
-        // discarded and reversing direction moves immediately.
-        app.state.function.scroll.bind(app.ui.function_max_scroll());
-        app.state.function.hscroll.bind(app.ui.function_hmax_scroll());
-        // Refresh the file-list geometry the renderer just measured, so the
-        // reducer's 2-D cursor movement matches what is on screen.
-        app.state.list_geom = app.ui.list_geom();
+        app.after_draw();
         if app.should_quit() {
             break Ok(());
         }
-        match app.rx.recv() {
+        // Sleep until an event or the nearest UI deadline: the live readout's
+        // refresh, or the notice expiring.
+        let refresh = Duration::from_millis(app.store.get_u32("prop.refresh-ms").max(100) as u64);
+        let deadline = app.ui.notice_deadline().map_or(refresh, |d| d.saturating_duration_since(Instant::now()).min(refresh));
+        match app.rx.recv_timeout(deadline) {
             Ok(AppEvent::Key(k)) => app.handle_key(k),
             Ok(AppEvent::Async(r)) => app.handle_async(r),
-            Ok(AppEvent::Resize(_, _)) | Ok(AppEvent::Tick) => {}
-            Err(_) => break Ok(()),
+            Ok(AppEvent::Resize(_, _)) | Ok(AppEvent::Tick) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break Ok(()),
         }
         // After the event, never before: an extension reacting to something
         // that finished on its own (a PTY child exiting) must see the state
@@ -125,4 +118,28 @@ pub fn run(cwd: PathBuf) -> io::Result<()> {
 
     terminal::restore();
     result
+}
+
+/// What render needs from the options, built once per options generation.
+struct Derived {
+    top: crate::ui::top::TopOptions,
+    theme: crate::core::Theme,
+}
+
+impl Derived {
+    fn build(app: &App) -> Self {
+        let s = &app.store;
+        let top = crate::ui::top::TopOptions {
+            border_style: s.get_str("border-style"),
+            monitor: crate::ui::top::MonitorOptions::from_store(s),
+            scrollbar: crate::ui::chrome::ScrollbarChars {
+                thumb: s.get_str("scrollbar-thumb"),
+                rail: s.get_str("scrollbar-rail"),
+                disabled: s.get_str("scrollbar-disabled"),
+            },
+            file_row_size_graph: s.get_bool("file-row-size-graph"),
+        };
+        let theme = app.theme_registry.read().map(|r| r.resolve_active()).unwrap_or_else(|_| crate::core::Theme::default());
+        Derived { top, theme }
+    }
 }

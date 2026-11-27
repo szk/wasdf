@@ -189,7 +189,14 @@ nothing, and takes no lock that a worker can hold for longer than a copy.
   the intrinsic content width, and per frame builds styled lines only for the
   visible slice. Image cells are cached per (revision, size). Search matches
   (logical coordinates, kept sorted) are mapped to rows through the block → row
-  map, never by scanning the whole match list per row.
+  map, never by scanning the whole match list per row. Bringing a match into
+  view is resolved there too: the reducer only marks `search.reveal`, the
+  layout puts the current match's block on a row, and the kernel keeps that
+  row as the scroll after the draw (the same render → state seam as the
+  scroll bound).
+- **The file list builds only its visible rows.** Column and field widths
+  are measured over the listing so rows line up; the styled rows themselves
+  (entry styles, size bars, times) are built for the window on screen only.
 - **Per-entry hooks are O(1).** Hooks called per visible entry per frame
   (`entry_style`) resolve their tables when their inputs change, not per call.
 

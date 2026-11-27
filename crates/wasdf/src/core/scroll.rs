@@ -52,13 +52,13 @@ impl Scroll {
     }
 
     /// Jump to the top.
-    pub fn to_top(&mut self) {
+    pub fn go_top(&mut self) {
         self.offset = 0;
     }
 
     /// Jump to the bottom: a large offset the next [`bind`](Self::bind) clamps to
     /// the real last page (the reducer cannot see the viewport height).
-    pub fn to_bottom(&mut self) {
+    pub fn go_bottom(&mut self) {
         self.offset = usize::MAX / 2;
     }
 

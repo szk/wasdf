@@ -206,9 +206,9 @@ mod tests {
             return (area, None, None);
         }
 
-        let nw = opts.nav_weight.max(1) as u32;
-        let pw = opts.prop_weight.max(1) as u32;
-        let mw = opts.monitor_weight.max(1) as u32;
+        let nw = opts.nav_weight.max(1);
+        let pw = opts.prop_weight.max(1);
+        let mw = opts.monitor_weight.max(1);
 
         if show_prop && show_mon {
             let tw = nw + pw + mw;

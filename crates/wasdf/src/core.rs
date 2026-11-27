@@ -26,7 +26,7 @@ pub use option::{ConfigWrite, OptionDef, OptionKind, OptionStore, OptionValue};
 pub use scroll::Scroll;
 pub use theme::{color_to_rgb, color_token, parse_color, Role, Theme};
 pub use reducer::{CommandLookup, Effects, Notice, apply_intent, apply_result};
-pub use state::{
+pub use state::{TrailColumn, 
     AppState, Entry, EntryList, FunctionInput, InputCapture, InputFormState, ListGeom, ListLayout,
     PanelSearch, SelectPhase, PANEL_FILE, PANEL_FUNCTION,
 };
