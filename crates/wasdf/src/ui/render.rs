@@ -145,9 +145,9 @@ fn panel_area(r: Rect, area: Rect, placed: &[(String, Rect)]) -> PanelArea {
 
 fn render_notice(frame: &mut Frame, area: Rect, notice: &Notice, theme: &Theme) {
     let style = if notice.error {
-        theme.style(Role::NoticeErrorFg).bg(theme.role(Role::NoticeErrorBg))
+        theme.style(Role::NoticeError)
     } else {
-        theme.style(Role::NoticeInfoFg).bg(theme.role(Role::NoticeInfoBg))
+        theme.style(Role::NoticeInfo)
     };
     let w = (notice.text.len() as u16 + 2).min(area.width);
     let rect = Rect { x: (area.width.saturating_sub(w)) / 2, y: 0, width: w, height: 1 };
@@ -186,7 +186,7 @@ fn render_policy(frame: &mut Frame, area: Rect, pending: &crate::core::Intent, t
         Line::from(""),
         Line::from(Span::styled(keys, Style::default().fg(Color::DarkGray))),
     ];
-    let overlay_style = theme.style(Role::OverlayDangerFg).bg(theme.role(Role::OverlayDangerBg));
+    let overlay_style = theme.style(Role::OverlayDanger);
     let p = Paragraph::new(lines).alignment(Alignment::Center).style(overlay_style).block(
         Block::default()
             .borders(Borders::ALL)
@@ -363,4 +363,28 @@ fn caret_line(buf: &str, cursor: usize) -> Line<'static> {
         Span::styled(under, Style::default().add_modifier(Modifier::REVERSED)),
         Span::raw(after),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::{Color, Modifier, Style};
+
+    /// A styled wide character (a markdown heading's `目`) replaced by narrow
+    /// cells must repaint its trailing column too: terminals keep the old
+    /// background / underline on the orphaned half, so a diff that skips it
+    /// leaves garbage. Guards the ratatui-core version that does this.
+    #[test]
+    fn replacing_a_styled_wide_char_repaints_its_trailing_cell() {
+        let area = Rect::new(0, 0, 4, 1);
+        for style in [Style::default().bg(Color::Cyan), Style::default().add_modifier(Modifier::UNDERLINED)] {
+            let mut prev = Buffer::empty(area);
+            prev.set_string(0, 0, "目", style);
+            let mut next = Buffer::empty(area);
+            next.set_string(0, 0, "a", Style::default());
+            let xs: Vec<u16> = prev.diff(&next).iter().map(|(x, _, _)| *x).collect();
+            assert!(xs.contains(&0) && xs.contains(&1), "{style:?}: {xs:?}");
+        }
+    }
 }

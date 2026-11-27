@@ -281,6 +281,21 @@ impl SelectSpec {
         }
     }
 
+    /// The key list (`?`): every binding in force where `?` was pressed, one
+    /// row each — a cheat sheet to scroll and close (its rows run nothing).
+    pub fn key_list(candidates: Vec<Candidate>) -> Self {
+        SelectSpec {
+            id: "key-list".into(),
+            source: SelectSource::Static(candidates),
+            input: SelectInput::None,
+            on_confirm: OnConfirm::RunCommand,
+            initial_query: None,
+            function_hint: None,
+            command_line: Vec::new(),
+            input_hint: None,
+        }
+    }
+
     /// The command palette (x): static candidates, fuzzy, run the command.
     pub fn command_palette(candidates: Vec<Candidate>) -> Self {
         SelectSpec {

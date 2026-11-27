@@ -189,7 +189,8 @@ pub trait Extension: Send {
     /// opinion" — the renderer falls back to its built-in dir/symlink/default
     /// coloring. `ExtensionRegistry::entry_style` takes the first `Some` in
     /// registration order (mirrors `provider()`'s first-wins contract).
-    fn entry_style(&self, _entry: &Entry) -> Option<Style> {
+    /// `theme` is the frame's palette, for an override that follows it.
+    fn entry_style(&self, _entry: &Entry, _theme: &crate::core::Theme) -> Option<Style> {
         None
     }
 
@@ -247,7 +248,7 @@ pub trait Extension: Send {
 
     /// Subtrees grafted under `@/settings/<category>`, or onto this
     /// extension's own screen at `@/settings/Extensions/<id>` (anchor the
-    /// node's "category" to `id()`, e.g. lscolors' Themes). The
+    /// node's "category" to `id()`, e.g. lscolors' Palette). The
     /// `SettingsProvider` appends one virtual dir per node under the matching
     /// listing and delegates any deeper path to the owning node. Default: none.
     fn settings_nodes(&self) -> Vec<Arc<dyn crate::extension::settings::SettingsNode>> {

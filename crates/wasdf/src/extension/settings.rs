@@ -32,7 +32,7 @@ use crate::vfs::{vfs_root, VfsProvider};
 /// the normal dispatch routes them back to the extension that owns the node.
 pub trait SettingsNode: Send + Sync {
     /// Where this node grafts: `(category, node-name)`, e.g. `("Display","Themes")`
-    /// for a core category, or `("lscolors","Themes")` to graft onto that
+    /// for a core category, or `("lscolors","Palette")` to graft onto that
     /// extension's own `@/settings/Extensions/lscolors` screen.
     fn anchor(&self) -> (&str, &str);
     /// List the children of `path`, which is at or below
@@ -127,7 +127,7 @@ fn node_name_for(path: &Path) -> Option<&str> {
 /// The 5th path component of a virtual settings path:
 /// `@/settings/Extensions/<id>/<node>[/…]` → `Some("node")`. Used to detect a
 /// path reaching below an extension's own screen into a node it grafted there
-/// (e.g. lscolors' Themes), the `Extensions/<id>` analogue of a core
+/// (e.g. lscolors' Palette), the `Extensions/<id>` analogue of a core
 /// category's node dirs.
 fn ext_subnode_name_for(path: &Path) -> Option<&str> {
     use std::path::Component;
@@ -200,7 +200,7 @@ impl VfsProvider for SettingsProvider {
                 .collect()),
             // @/settings/Extensions/<id> → the extension's option leaves + About,
             // plus one dir per node the extension grafted onto its own screen
-            // (e.g. lscolors' Themes). Any path reaching below such a node
+            // (e.g. lscolors' Palette). Any path reaching below such a node
             // delegates to it instead, mirroring how a core category delegates
             // to its own anchored nodes.
             (Some(cat), Some(id)) if cat.eq_ignore_ascii_case(EXTENSIONS_DIR) => {

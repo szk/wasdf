@@ -732,12 +732,7 @@ fn follow_cursor(prev: usize, cursor: usize, viewport: usize, total: usize) -> u
 
 /// The cursor cell style: bright while the panel is focused, subdued otherwise.
 fn cursor_style(theme: &crate::core::Theme, focused: bool) -> Style {
-    let (fg, bg) = if focused {
-        (Role::CursorActiveFg, Role::CursorActiveBg)
-    } else {
-        (Role::CursorFg, Role::CursorBg)
-    };
-    theme.style(fg).bg(theme.role(bg))
+    theme.style(if focused { Role::CursorActive } else { Role::Cursor })
 }
 
 fn h_rule(frame: &mut Frame, x: u16, y: u16, width: u16, theme: &crate::core::Theme) {

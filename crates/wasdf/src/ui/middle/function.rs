@@ -222,7 +222,7 @@ fn lower(view: &Arc<PanelView>, inner: Rect, line_numbers: bool, generation: u64
             let label_w = blocks
                 .iter()
                 .filter_map(|b| match b {
-                    Block::Field { label, .. } => Some(label.chars().count()),
+                    Block::Field { label, .. } => Some(crate::ui::text::width(label)),
                     _ => None,
                 })
                 .max()
@@ -402,7 +402,8 @@ fn lower_block(b: &Block, label_w: usize, inner: Rect, line_numbers: bool, theme
     let text_row = |(text, segs)| vec![Row::Text(text, segs)];
     match b {
         Block::Field { label, value } => {
-            let prefix = format!("{label:<label_w$}  ");
+            let pad = label_w.saturating_sub(crate::ui::text::width(label));
+            let prefix = format!("{label}{}  ", " ".repeat(pad));
             let mut segs = vec![(prefix.len(), theme.style_by_name("label"))];
             let mut text = prefix;
             for s in value {

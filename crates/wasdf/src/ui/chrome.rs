@@ -335,25 +335,29 @@ pub fn render(
             };
             let label = if p.bracket { format!("[ {title} ]") } else { title.clone() };
             let full_len = label.chars().count();
-            let max = p.rect.width.saturating_sub(4) as usize;
-            let label: String = label.chars().take(max).collect();
+            let max = p.rect.width.saturating_sub(4);
+            let label = crate::ui::text::take_width(&label, max as usize);
             let y = p.rect.y;
+            let end = p.rect.x + 2 + max;
+            let mut x = p.rect.x + 2;
             for (i, ch) in label.chars().enumerate() {
-                let x = p.rect.x + 2 + i as u16;
                 // The first two (`[ `) and last two (` ]`) chars are brackets.
                 let is_bracket = p.bracket && (i < 2 || i >= full_len.saturating_sub(2));
                 let style = if is_bracket { bracket_style } else { text_style };
-                let (cx, cy) = ((x - area.x) as usize, (y - area.y) as usize);
+                let cw = crate::ui::text::char_width(ch) as u16;
                 // Only skip cells where a vertical border continues southward
                 // into this panel's content (S bit set). An N-only junction (a
                 // divider from an adjacent panel above terminating here) is safe
-                // to overwrite — the title should remain readable.
-                let junction = cx < w && cy < h && mask[cy * w + cx] & S != 0;
-                if !junction
-                    && let Some(cell) = buf.cell_mut((x, y)) {
-                        cell.set_char(ch);
-                        cell.set_style(style);
-                    }
+                // to overwrite — the title should remain readable. A wide
+                // character is skipped whole if either of its cells is one.
+                let junction = (x..x + cw).any(|cx| {
+                    let (cx, cy) = ((cx - area.x) as usize, (y - area.y) as usize);
+                    cx < w && cy < h && mask[cy * w + cx] & S != 0
+                });
+                if !junction {
+                    crate::ui::text::put_char(buf, x, y, ch, style, end - x);
+                }
+                x += cw;
             }
         }
 
@@ -380,13 +384,15 @@ pub fn render(
             };
             let border_c = theme.style(Role::Border);
             let max = p.rect.width.saturating_sub(4) as usize;
-            let chars: Vec<char> = info.chars().take(max).collect();
-            let len = chars.len() as u16;
+            let info = crate::ui::text::take_width(info, max);
+            let len = crate::ui::text::width(&info) as u16;
             let y = p.rect.y;
             let start = (p.rect.x + p.rect.width).saturating_sub(1 + len).max(p.rect.x + 2);
+            let end = start + len;
             let mut inside = false;
-            for (i, &ch) in chars.iter().enumerate() {
-                let x = start + i as u16;
+            let mut x = start;
+            for ch in info.chars() {
+                let cw = crate::ui::text::char_width(ch) as u16;
                 let style = match ch {
                     '[' => {
                         inside = true;
@@ -399,13 +405,14 @@ pub fn render(
                     _ if inside => title_style,
                     _ => border_c,
                 };
-                let (cx, cy) = ((x - area.x) as usize, (y - area.y) as usize);
-                let junction = cx < w && cy < h && mask[cy * w + cx] & S != 0;
-                if !junction
-                    && let Some(cell) = buf.cell_mut((x, y)) {
-                        cell.set_char(ch);
-                        cell.set_style(style);
-                    }
+                let junction = (x..x + cw).any(|cx| {
+                    let (cx, cy) = ((cx - area.x) as usize, (y - area.y) as usize);
+                    cx < w && cy < h && mask[cy * w + cx] & S != 0
+                });
+                if !junction {
+                    crate::ui::text::put_char(buf, x, y, ch, style, end - x);
+                }
+                x += cw;
             }
         }
 
@@ -447,8 +454,9 @@ pub fn render(
             let border_style_fg = theme.style(Role::Border);
             let rule = rule_char(border_style);
             for ch in text.chars() {
-                if x >= frame_right {
-                    x += 1;
+                let cw = crate::ui::text::char_width(ch) as u16;
+                if x + cw > frame_right {
+                    x += cw;
                     continue;
                 }
                 let (cx, cy) = ((x - area.x) as usize, (y - area.y) as usize);
@@ -467,11 +475,10 @@ pub fn render(
                         cell.set_char(ch);
                         cell.set_style(bracket_style);
                     } else {
-                        cell.set_char(ch);
-                        cell.set_style(title_style);
+                        crate::ui::text::put_char(buf, x, y, ch, title_style, frame_right - x);
                     }
                 }
-                x += 1;
+                x += cw;
             }
         };
         for l in labels {

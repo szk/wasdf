@@ -170,7 +170,7 @@ The embedded sources and extension data use these shapes:
 | keymap group | key bindings | `(mode panel-or-#f (binding…))`; a binding is `("key" intent [when] ["label"])` |
 | command | a palette command | `(name "description" intent)` |
 | resolver | a resolver entry | `(key confirm ((kind argv-el…) …) [((token label) …)])`; `confirm` is `never`, `always`, or `overwrite`; argv elements are strings or the placeholder symbols src, dst, path, paths, opts ([ARCHITECTURE.md](ARCHITECTURE.md)) |
-| option | a configurable option | `(option "key" "Category" kind default "label")`; kind ∈ `bool`, `text`, `list`, `(int MIN MAX)`, `(choice "a" "b" …)`, `(record (field kind) …)`, `(map kind)`; the default is a literal of that kind |
+| option | a configurable option | `(option "key" "Category" kind default "label")`; kind ∈ `bool`, `text`, `list`, `(int MIN MAX)`, `(choice "a" "b" …)`, `(record (field kind) …)`, `(map kind)`; the default is a literal of that kind. A record holds any subset of its fields (an omitted one is its reader's default), kept in declaration order under symbol names; a map's keys are strings |
 | layout | a layout | `(id tree)` — see Role 3 |
 
 Key strings name a character, a special key (Enter, Esc, Tab, `Shift-Tab` /

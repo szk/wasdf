@@ -23,12 +23,13 @@
         ;; below by specificity), else clears the selection as always.
         ("Esc" clear-filter has-filter)
         ("Esc" clear-selection) ("r" refresh)
-        ("Backspace" delete-selected) ("Delete" delete-selected)
-        ("Tab" focus-next-panel) ("Shift-Tab" focus-prev-panel) ("q" quit "quit") ("Ctrl-c" quit)))
+        ("Backspace" delete-selected) ("Delete" delete-selected "delete") ("?" key-list "help")
+        ("Tab" focus-next-panel) ("Shift-Tab" focus-prev-panel) ("q" quit "quit") ("Q" quit-cd) ("Ctrl-c" quit)))
     (file function (
         ;; wasd always targets the file panel, so pressing it from the function
         ;; panel moves the file cursor and (via intent_focus) returns focus there.
         ("w" cursor-up "cursor") ("a" cursor-left "cursor") ("s" cursor-down "cursor") ("d" cursor-right "cursor")
+        ("?" key-list "help")
         ("j" scroll-down sublayout-content "scroll") ("Down" scroll-down sublayout-content)
         ("k" scroll-up sublayout-content "scroll")   ("Up" scroll-up sublayout-content)
         ("h" func-left sublayout-content "◂▸")   ("Left" func-left sublayout-content)
@@ -42,7 +43,7 @@
         ("q" hide-function-panel sublayout-content "hide")))
         ;; CmdOp's builder keys are at the end of this file (gated by cmdop-active).
     (select #f (
-        ("Enter" confirm "confirm/next") ("Esc" cancel "cancel")
+        ("Enter" confirm "confirm/next") ("Esc" cancel "cancel") ("?" key-list select-phase-navigate "help")
         ("Ctrl-n" cursor-down) ("Down" cursor-down) ("Ctrl-p" cursor-up) ("Up" cursor-up)
         ("w" cursor-up    select-phase-navigate "cursor") ("a" cursor-left  select-phase-navigate "cursor")
         ("s" cursor-down  select-phase-navigate "cursor") ("d" cursor-right select-phase-navigate "cursor")
@@ -52,10 +53,19 @@
         ;; an earlier filter/refine) further, in place. See doc/UI.md.
         ("f" select-refine (and select-phase-navigate select-has-view))
         ("Space" toggle-select select-phase-navigate "mark") ("q" cancel select-phase-navigate)))
+    ;; The key list (`?`): a sheet to scroll and close, nothing else. Keys the
+    ;; general Select scope binds are pinned to noop here so they do nothing.
+    (select:key-list #f (
+        ("w" cursor-up "scroll") ("a" cursor-left "scroll") ("s" cursor-down "scroll") ("d" cursor-right "scroll")
+        ("Up" cursor-up) ("Left" cursor-left) ("Down" cursor-down) ("Right" cursor-right)
+        ("Esc" cancel "close") ("q" cancel "close") ("Enter" cancel "close")
+        ("Space" noop) ("v" noop) ("f" noop) ("?" noop) ("W" noop) ("S" noop)
+        ("Ctrl-n" noop) ("Ctrl-p" noop)))
     (policy #f (
-        ("y" confirm "confirm") ("Enter" confirm "confirm") ("n" cancel "cancel") ("Esc" cancel "cancel")))
+        ("y" confirm "confirm") ("Enter" confirm "confirm") ("n" cancel "cancel") ("Esc" cancel "cancel")
+        ("?" key-list "help")))
     (input-form #f (
-        ("Enter" confirm "confirm") ("Esc" cancel "cancel")
+        ("Enter" confirm "confirm") ("Esc" cancel "cancel") ("?" key-list (not input-form-typing) "help")
         ;; Structured navigation (Bool/Choice/Int/Color, and List while
         ;; browsing rows) — gated off while typing (Text, or a List row's
         ;; nested edit) so those keys fall through to tui-input instead.

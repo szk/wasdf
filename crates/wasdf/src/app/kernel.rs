@@ -144,7 +144,7 @@ impl App {
 
 
         // Collect SettingsNode contributions from theme_ext and every bundled
-        // extension (e.g. lscolors' Themes, grafted onto its own screen) before
+        // extension (e.g. lscolors' Palette, grafted onto its own screen) before
         // building settings_ext (plan §11 choice (b): no interior mutability
         // needed). `&bundled_exts` since the vec is still needed below to
         // register the extensions themselves.
@@ -744,6 +744,8 @@ impl App {
                 commands: &self.commands,
                 resolver: self.resolver.as_ref(),
                 options: &self.option_cache,
+                keymap: &self.keymap,
+                conditions: &self.conditions,
             };
             core::apply_intent(&mut self.state, intent, &ctx)
         };
@@ -810,6 +812,8 @@ struct CmdCtx<'a> {
     commands: &'a CommandRegistry,
     resolver: &'a ResolverChain,
     options: &'a OptionCache,
+    keymap: &'a KeymapRegistry,
+    conditions: &'a Conditions,
 }
 
 impl core::CommandLookup for CmdCtx<'_> {
@@ -818,6 +822,32 @@ impl core::CommandLookup for CmdCtx<'_> {
     }
     fn command_candidates(&self) -> Vec<core::Candidate> {
         self.commands.candidates()
+    }
+    fn key_candidates(&self, state: &core::AppState) -> Vec<core::Candidate> {
+        let mut rows: Vec<(String, String)> = self
+            .keymap
+            .bindings_in_force(self.conditions, state, &state.focused_panel)
+            .into_iter()
+            .map(|b| (codec::key_name(b.key), b))
+            // Left out on request: Q and Ctrl-c are bound only in the file
+            // panel's scope, so the list would promise them where they do nothing.
+            .filter(|(name, _)| name != "Q" && name != "Ctrl-c")
+            .map(|(name, b)| {
+                let what = codec::intent_text(&b.intent);
+                let text = match &b.help {
+                    Some(label) => format!("{label} ({what})"),
+                    None => what,
+                };
+                (name, text)
+            })
+            .collect();
+        // Special keys (named, or a modifier chord) first, then single keys,
+        // each alphabetically.
+        rows.sort_by_key(|(name, _)| (name.chars().count() == 1, name.to_lowercase(), name.clone()));
+        let key_w = rows.iter().map(|(name, _)| name.chars().count()).max().unwrap_or(0);
+        rows.into_iter()
+            .map(|(name, text)| core::Candidate::new(format!("{name:<key_w$}  {text}"), core::ExtensionValue::Nil))
+            .collect()
     }
     fn resolver_options(&self, op: &str) -> Vec<(String, String)> {
         let declared: Vec<(String, String)> =
@@ -1183,6 +1213,44 @@ mod tests {
     }
 
     #[test]
+    fn the_help_row_leads_with_the_fixed_order_and_question_mark_lists_the_keys() {
+        let mut app = App::boot(temp_dir_with_files());
+        app.pump_one();
+        let labels: Vec<String> = app
+            .keymap
+            .help_hints(&app.conditions, &app.state, "file")
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        let lead = ["cursor", "select", "edit", "find", "move", "delete", "shell", "quit", "help"];
+        let present: Vec<&str> = lead.iter().copied().filter(|l| labels.iter().any(|x| x == l)).collect();
+        assert_eq!(&labels[..present.len()], present.as_slice(), "{labels:?}");
+        let rest: Vec<String> = labels[present.len()..].iter().map(|l| l.to_lowercase()).collect();
+        assert!(rest.windows(2).all(|w| w[0] <= w[1]), "the rest is alphabetical: {rest:?}");
+
+        app.handle_key(Key::plain(KeyCode::Char('?')));
+        let Mode::Select(spec) = app.state.mode() else { panic!("? opens the key list") };
+        assert_eq!(spec.id, "key-list");
+        let rows: Vec<String> = app.state.select.as_ref().unwrap().results.iter().map(|c| c.label.clone()).collect();
+        assert!(rows.iter().any(|r| r.starts_with("w ") && r.contains("cursor-up")), "{rows:?}");
+        assert!(rows.iter().all(|r| !r.starts_with("Q ") && !r.starts_with("Ctrl-c ")), "{rows:?}");
+        let first_single = rows.iter().position(|r| r.chars().nth(1) == Some(' ')).unwrap();
+        assert!(rows[..first_single].iter().all(|r| r.chars().nth(1) != Some(' ')), "special keys lead: {rows:?}");
+        // Held under the Kitty protocol, `s` arrives as repeats: they scroll
+        // like presses and never fall through to the (absent) text input.
+        let held = Key { kind: KeyKind::Repeat, ..Key::plain(KeyCode::Char('s')) };
+        app.handle_key(Key::plain(KeyCode::Char('s')));
+        app.handle_key(held);
+        app.handle_key(held);
+        let sel = app.state.select.as_ref().unwrap();
+        assert_eq!((sel.selected, sel.phase, sel.query.as_str()), (3, crate::core::SelectPhase::Navigate, ""));
+        app.handle_key(Key::plain(KeyCode::Char('x')));
+        assert!(app.state.select.as_ref().unwrap().query.is_empty(), "nothing to type into");
+        app.handle_key(Key::plain(KeyCode::Char('q')));
+        assert!(matches!(app.state.mode(), Mode::File));
+    }
+
+    #[test]
     fn the_arrows_drive_the_file_cursor_like_wasd_and_keep_focus() {
         let mut app = App::boot(temp_dir_with_files());
         app.pump_one();
@@ -1486,7 +1554,7 @@ mod frame_dump {
         app.state.function.visible = false;
         app.dispatch_for_test(Intent::PushMode(Box::new(Mode::Select(crate::core::SelectSpec::file_search()))));
         let f = dump(&mut app, 100, 14);
-        assert!(rows(&f)[5].starts_with(" ›"), "{f}");
+        assert!(rows(&f)[5].starts_with(" >"), "{f}");
         assert!(rows(&f)[6].starts_with("────"), "{f}");
         app.dispatch_for_test(Intent::PopMode);
 

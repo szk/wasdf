@@ -825,6 +825,36 @@ mod tests {
     /// generation, and the frame reads the theme at once and caches it under
     /// that generation before any tick has synced the registry — so the frame
     /// must resolve the theme from the options, not the raw registry.
+    /// One role form everywhere: `define-theme` takes presets.scm's
+    /// `(role (fg C) (bg C) …)` with any field omitted, and custom.scm keeps
+    /// the same fields under the role's name, fg before bg.
+    #[test]
+    fn a_partial_role_form_round_trips_through_the_store_in_field_order() {
+        use crate::script::store::{Layer, Store, CORE_VOCABULARY};
+        let session = crate::script::SchemeSession::spawn();
+        assert!(session.wait_ready(std::time::Duration::from_secs(30)));
+        let store = Store::new(session);
+        let options = theme_options();
+        let defs: Vec<_> = options.keys().iter().filter_map(|k| options.def(k).cloned()).collect();
+        store.declare_options(&defs).unwrap();
+        let mut taken = CORE_VOCABULARY.iter().map(|s| s.to_string()).collect();
+        assert!(store.load_prelude(ID, PRELUDE_SCHEME, &mut taken).is_empty());
+        let (changes, errors) = store.eval_program(
+            Layer::Custom,
+            "(define-theme \"x\" (cursor (bg \"#88c0d0\") (fg \"#2e3440\")) (title (bold #t)))",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(crate::script::projection::apply_options(&changes, &options).is_empty());
+        let customs = registry::customs_from_value(&options.value("theme.custom").unwrap());
+        let style = |r| customs[0].overrides.iter().find(|(role, _)| *role == r).map(|(_, s)| *s).unwrap();
+        assert_eq!((style(Role::Cursor).fg, style(Role::Cursor).bg), (Color::Rgb(0x2e, 0x34, 0x40), Color::Rgb(0x88, 0xc0, 0xd0)));
+        let title = style(Role::Title);
+        assert!(title.bold && title.fg == Color::Reset && title.bg == Color::Reset, "omitted fields are nil / off");
+        let dump = store.dump_custom().unwrap();
+        assert!(dump.contains(r##"("cursor" ((fg "#2e3440") (bg "#88c0d0")))"##), "{dump}");
+        assert!(dump.contains(r##"("title" ((bold #t)))"##), "{dump}");
+    }
+
     #[test]
     fn the_frame_sees_a_theme_set_after_bind_store_without_a_tick() {
         let registry = Arc::new(RwLock::new(ThemeRegistry::bundled()));

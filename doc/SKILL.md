@@ -130,7 +130,7 @@ f) VFS. An extension may contribute a mount, conventionally `@/<id>`,
 |                   | resolver, theme, config, extensions  |                                          |
 | Settings subtree  | may graft a SettingsNode (rich       | not available                           |
 |                   | screens under @/settings/…, e.g.     |                                          |
-|                   | lscolors' Themes)                    |                                          |
+|                   | lscolors' Palette)                   |                                          |
 | Registration      | one line in `extension::bundled()`   | zero edits: drop files in the dir       |
 | Versioning        | compiled together                    | `wasdf_abi_version()` must equal        |
 |                   |                                      | wasdf_sdk::API_VERSION exactly, else    |

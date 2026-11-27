@@ -20,6 +20,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::core::{AppState, Mode, Role, SubLayout, Theme};
 use crate::ui::chrome::{self, PanelArea, PanelFrame};
+use crate::ui::text;
 
 // ── TopOptions ────────────────────────────────────────────────────────────────
 
@@ -195,7 +196,7 @@ pub fn border_labels(
 /// is drawn, so the function panel's own title is left intact. The name segment is
 /// padded with trailing border rule out to the frame edge so any function title
 /// bled onto this shared row is erased (chrome's bottom painter restores the
-/// crossed junctions). Widths are display columns (`chars().count()`).
+/// crossed junctions). Widths are display columns (`ui::text::width`).
 fn plan_bottom_labels(
     cwd: &str,
     name: Option<&str>,
@@ -212,7 +213,7 @@ fn plan_bottom_labels(
     let rule = h_rule(border_style);
 
     let path_label = format!("[ {cwd} ]");
-    let pl = path_label.chars().count();
+    let pl = text::width(&path_label);
 
     // Case 5: the path alone overflows the border — truncate it, show no filename,
     // regardless of the function panel.
@@ -230,7 +231,7 @@ fn plan_bottom_labels(
     // restores the crossed junction glyphs from the rule cells).
     let pad_to_edge = |label: String, x: u16| -> String {
         let span = frame_right.saturating_sub(x) as usize;
-        let len = label.chars().count();
+        let len = text::width(&label);
         if len >= span {
             label
         } else {
@@ -253,7 +254,7 @@ fn plan_bottom_labels(
     };
 
     let name_label = format!("[ {name} ]");
-    let nl = name_label.chars().count();
+    let nl = text::width(&name_label);
     let junc_off = (fx as usize).saturating_sub(start as usize);
 
     // The right-zone start column, and a closure to finish the segment (pad it to
@@ -294,14 +295,14 @@ fn h_rule(border_style: &str) -> char {
 }
 
 /// Format `[ {text} ]` truncated to `max_width` columns with a trailing `…`.
-fn bracket_truncated(text: &str, max_width: usize) -> String {
-    let full = format!("[ {text} ]");
-    if full.chars().count() <= max_width {
+fn bracket_truncated(label: &str, max_width: usize) -> String {
+    let full = format!("[ {label} ]");
+    if text::width(&full) <= max_width {
         return full;
     }
     let overhead = 5; // "[ " + "…" + " ]"
     let avail = max_width.saturating_sub(overhead);
-    format!("[ {}… ]", text.chars().take(avail).collect::<String>())
+    format!("[ {}… ]", text::take_width(label, avail))
 }
 
 // ── Nav panel ─────────────────────────────────────────────────────────────────
@@ -362,7 +363,7 @@ pub fn render_nav(
             .collect()
     };
     let col_w = |c: &NavColumn| -> u16 {
-        window(c).into_iter().flatten().map(|s| s.chars().count()).max().unwrap_or(1) as u16
+        window(c).into_iter().flatten().map(|s| text::width(&s)).max().unwrap_or(1) as u16
     };
     let widths: Vec<u16> = cols.iter().map(col_w).collect();
 
@@ -377,7 +378,7 @@ pub fn render_nav(
     let scroll_x: u16 = total_w.saturating_sub(avail);
 
     let path_style = theme.style(Role::PathActive);
-    let cwd_style = theme.style(Role::NavCursorFg).bg(theme.role(Role::NavCursorBg));
+    let cwd_style = theme.style(Role::NavCursor);
     let sib_style = theme.style(Role::PathMuted);
     let link_style = theme.style(Role::PathMuted);
 
@@ -411,14 +412,16 @@ pub fn render_nav(
             } else {
                 sib_style
             };
-            let pad = (cw as usize).saturating_sub(name.chars().count()) / 2;
-            let name_lx = lx0 + pad as u16;
+            let pad = (cw as usize).saturating_sub(text::width(&name)) / 2;
             let screen_y = inner.y + r as u16;
-            for (ci, ch) in name.chars().enumerate() {
-                let lx = name_lx + ci as u16;
-                if lx < scroll_x || lx >= scroll_x + avail { continue; }
-                let sx = inner.x + 1 + (lx - scroll_x);
-                nav_put(buf, inner, sx, screen_y, ch, style);
+            let mut lx = lx0 + pad as u16;
+            for ch in name.chars() {
+                let w = text::char_width(ch) as u16;
+                if lx >= scroll_x && lx + w <= scroll_x + avail {
+                    let sx = inner.x + 1 + (lx - scroll_x);
+                    nav_put(buf, inner, sx, screen_y, ch, style);
+                }
+                lx += w;
             }
         }
     }
@@ -426,19 +429,13 @@ pub fn render_nav(
 }
 
 fn trunc(s: &str) -> String {
-    if s.chars().count() > NAME_CAP {
-        format!("{}…", s.chars().take(NAME_CAP - 1).collect::<String>())
-    } else {
-        s.to_string()
-    }
+    text::ellipsize(s, NAME_CAP)
 }
 
 fn nav_put(buf: &mut Buffer, inner: Rect, x: u16, y: u16, ch: char, style: Style) {
-    if x >= inner.x && y >= inner.y && x < inner.x + inner.width && y < inner.y + inner.height
-        && let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_style(style);
-        }
+    if x >= inner.x && y >= inner.y && x < inner.right() && y < inner.bottom() {
+        text::put_char(buf, x, y, ch, style, inner.right() - x);
+    }
 }
 
 // ── Prop panel ────────────────────────────────────────────────────────────────
@@ -902,12 +899,8 @@ fn prop_line(
     theme: &Theme,
 ) -> Line<'static> {
     let prefix = format!("{label} ");
-    let avail = width.saturating_sub(prefix.chars().count());
-    let value: String = if value.chars().count() > avail && avail > 1 {
-        format!("{}…", value.chars().take(avail - 1).collect::<String>())
-    } else {
-        value.to_string()
-    };
+    let avail = width.saturating_sub(text::width(&prefix));
+    let value = if avail > 1 { text::ellipsize(value, avail) } else { value.to_string() };
     Line::from(vec![
         Span::styled(prefix, theme.style(label_role)),
         Span::styled(value, Style::default().fg(cascade_fg(theme, value_role))),

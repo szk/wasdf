@@ -271,16 +271,12 @@ fn cell_text(e: &crate::core::Entry, selection: &std::collections::HashSet<std::
     format!("{mark}{}{icon}", e.name)
 }
 
-/// Truncate (by chars) or right-pad `s` to exactly `width` columns.
+/// Truncate or right-pad `s` to exactly `width` columns.
 fn fit(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    if count > width {
-        s.chars().take(width).collect()
-    } else {
-        let mut t = s.to_string();
-        t.extend(std::iter::repeat_n(' ', width - count));
-        t
-    }
+    let mut t = crate::ui::text::take_width(s, width);
+    let w = crate::ui::text::width(&t);
+    t.extend(std::iter::repeat_n(' ', width - w));
+    t
 }
 
 /// Compute the file-list geometry for the active layout: the column count, the
@@ -297,7 +293,7 @@ fn list_geometry(
     if n == 0 || w == 0 {
         return (1, 0, vec![w.max(1)]);
     }
-    let cell_w = |idx: usize| entries.get(idx).map(|e| cell_text(e, selection).chars().count()).unwrap_or(0);
+    let cell_w = |idx: usize| entries.get(idx).map(|e| crate::ui::text::width(&cell_text(e, selection))).unwrap_or(0);
     match layout {
         crate::core::ListLayout::Rows => (1, n, vec![w]),
         crate::core::ListLayout::Columns => {
@@ -346,7 +342,7 @@ fn entry_cell_style(
     theme: &Theme,
 ) -> Style {
     let mut style = Style::default();
-    if let Some(ext_style) = extensions.entry_style(e) {
+    if let Some(ext_style) = extensions.entry_style(e, theme) {
         style = ext_style;
     } else if e.is_dir {
         style = theme.style(Role::EntryDir);
@@ -358,13 +354,12 @@ fn entry_cell_style(
         // subdued otherwise (doc/UI.md). Bold from the entry kind above
         // (e.g. a bold directory) is kept; the cursor role can add bold
         // of its own without clearing it.
-        let (fg, bg) = if focused {
-            (Role::CursorActiveFg, Role::CursorActiveBg)
-        } else {
-            (Role::CursorFg, Role::CursorBg)
-        };
-        style = style.fg(theme.role(fg)).bg(theme.role(bg));
-        if theme.bold(fg) {
+        let role = if focused { Role::CursorActive } else { Role::Cursor };
+        let cursor = theme.style(role);
+        if let (Some(fg), Some(bg)) = (cursor.fg, cursor.bg) {
+            style = style.fg(fg).bg(bg);
+        }
+        if theme.bold(role) {
             style = style.add_modifier(Modifier::BOLD);
         }
     }
@@ -458,7 +453,7 @@ struct PropWidths {
 
 impl PropWidths {
     fn measure(entries: &[crate::core::Entry]) -> Self {
-        let ownr = entries.iter().map(|e| owner_short(e).chars().count()).max().unwrap_or(0);
+        let ownr = entries.iter().map(|e| crate::ui::text::width(&owner_short(e))).max().unwrap_or(0);
         let size = entries.iter().map(|e| wasdf_sdk::format_size(e.size).chars().count()).max().unwrap_or(0);
         PropWidths { ownr, size }
     }
@@ -505,11 +500,20 @@ fn owner_short(e: &crate::core::Entry) -> String {
 /// left if it somehow overflows (widths are pre-measured against the same
 /// listing, so this should never trigger in practice).
 fn pad_left(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    if count >= width {
-        s.chars().skip(count - width).collect()
+    let w = crate::ui::text::width(s);
+    if w >= width {
+        let mut used = 0;
+        let tail: Vec<char> = s
+            .chars()
+            .rev()
+            .take_while(|&c| {
+                used += crate::ui::text::char_width(c);
+                used <= width
+            })
+            .collect();
+        tail.into_iter().rev().collect()
     } else {
-        let mut t = " ".repeat(width - count);
+        let mut t = " ".repeat(width - w);
         t.push_str(s);
         t
     }
@@ -642,7 +646,7 @@ fn build_rows_lines_with_props(
     file_row_size_graph: bool,
 ) -> Vec<Line<'static>> {
     let Marks { cursor, selection, focused } = *marks;
-    let name_w = entries.iter().map(|e| cell_text(e, selection).chars().count()).max().unwrap_or(0);
+    let name_w = entries.iter().map(|e| crate::ui::text::width(&cell_text(e, selection))).max().unwrap_or(0);
     let prop_widths = PropWidths::measure(entries);
     let clearance = width.saturating_sub(name_w + PROP_GAP);
     let level = prop_widths.pick_level(clearance);
@@ -813,7 +817,7 @@ pub fn render_select_input(frame: &mut Frame, area: PanelArea, state: &AppState,
     };
     let inner = area.inner();
     let marker = match phase {
-        SelectPhase::Input => "› ",
+        SelectPhase::Input => "> ",
         SelectPhase::Navigate => "  ",
     };
     // While the form is focused (Input phase), draw a reverse-video block at the
@@ -842,6 +846,47 @@ pub fn render_select_input(frame: &mut Frame, area: PanelArea, state: &AppState,
     panels.push(
         area.frame().title(title).focused(phase == SelectPhase::Input),
     );
+}
+
+/// The candidates column-major in as many columns as the panel's width holds
+/// (each as wide as the longest label), scrolled by row to keep the cursor in
+/// view. The geometry goes back to the reducer for 2-D moves.
+fn render_candidate_sheet(
+    frame: &mut Frame,
+    area: PanelArea,
+    sel: &crate::core::state::SelectState,
+    navigate: bool,
+    scroll: &mut ScrollMemory,
+    panels: &mut Vec<PanelFrame>,
+) {
+    const GAP: usize = 3;
+    let inner = area.inner();
+    let n = sel.results.len();
+    let cell_w = sel.results.iter().map(|c| crate::ui::text::width(&c.label)).max().unwrap_or(1).max(1);
+    let cols = ((inner.width as usize + GAP) / (cell_w + GAP)).max(1).min(n.max(1));
+    let rows = n.div_ceil(cols).max(1);
+    scroll.list_cols = cols;
+    scroll.list_rows = rows;
+    let h = inner.height as usize;
+    let cursor = sel.selected.min(n.saturating_sub(1));
+    scroll.candidates = if n == 0 { 0 } else { follow_cursor(scroll.candidates, cursor % rows, h, rows) };
+    let cursor_style = Style::default().add_modifier(if navigate { Modifier::REVERSED } else { Modifier::UNDERLINED });
+    let lines: Vec<Line> = (scroll.candidates..(scroll.candidates + h).min(rows))
+        .map(|r| {
+            let mut spans = Vec::new();
+            for c in 0..cols {
+                let Some(cand) = sel.results.get(c * rows + r) else { break };
+                if c > 0 {
+                    spans.push(Span::raw(" ".repeat(GAP)));
+                }
+                let style = if c * rows + r == cursor { cursor_style } else { Style::default() };
+                spans.push(Span::styled(fit(&cand.label, cell_w), style));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+    panels.push(area.frame().focused(navigate).scroll(ScrollInfo { total: rows, viewport: h, position: scroll.candidates }));
 }
 
 pub fn render_select_candidates(
@@ -878,6 +923,16 @@ pub fn render_select_candidates(
         return;
     }
     let inner = area.inner();
+    // A picker with no input (the key list) is a sheet, not a search: it fills
+    // the panel's width in columns.
+    let sheet = matches!(state.mode(), crate::core::Mode::Select(s) if matches!(s.input, crate::core::SelectInput::None));
+    if sheet {
+        render_candidate_sheet(frame, area, sel, navigate, scroll, panels);
+        return;
+    }
+    // One column: the reducer steps it with the grid rule like any other.
+    scroll.list_cols = 1;
+    scroll.list_rows = sel.results.len();
     let items: Vec<ListItem> = sel
         .results
         .iter()

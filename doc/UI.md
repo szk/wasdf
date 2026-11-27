@@ -230,8 +230,8 @@ row.
 
 The row cursor of the two navigable panels — the **file list** (PANEL_FILE) and
 the **function** rows (PANEL_FUNCTION) — is drawn with explicit theme
-colours that follow the panel's focus: `cursor-active-fg` / `cursor-active-bg`
-while that panel is focused, and the subdued `cursor-fg` / `cursor-bg` while it is
+colours that follow the panel's focus: the `cursor-active` role (its fg / bg)
+while that panel is focused, and the subdued `cursor` role while it is
 not. The cursor is therefore always visible, brightening on focus rather than
 appearing/disappearing. (The Select candidate list and the text-input carets —
 the Select `search`/`Argument` field, the `/` content search — use a
@@ -339,8 +339,9 @@ shows `N/A` (file metadata lives in the prop panel) — distinct from `(empty)`
 ### Images: `image-protocol`
 
 `@/settings/Display/image-protocol` picks how image previews (a picture file,
-a Markdown image) reach the display: `off` (default) draws them as symbol
-cells, which works everywhere; `sixel` / `kitty` use that graphics protocol.
+a Markdown image) reach the display: `off` draws them as symbol cells, which
+works everywhere; `sixel` / `kitty` (default) use that graphics protocol. A
+terminal without kitty graphics shows the symbol cells under the note below.
 The picture is scaled — up or down, aspect kept — until its longer side meets
 the image area. It is placed only when it is wholly visible and no overlay
 covers the panels; otherwise its symbol cells show.
@@ -457,6 +458,7 @@ knows what the selection is for.
 | file-search | FileWalk (deep) | Fuzzy | Commit | dir-listing | f on a **real** cwd (unavailable once `filter-maxed` — see below). Hits are kept as an `EntryList` (not flattened to candidates) and rendered + navigated as the file panel's entry grid — same layouts, cursor, 2-D moves, `v`. Confirm commits the matches directly into **File mode** (see "Filtering the file panel" below) |
 | filter-list | Entries (shallow) | Fuzzy | Commit | dir-listing | f on a **virtual** cwd (`@/...` — nothing for a walk to read), or f again once already inside a file-search/filter-list result view (`select-has-view`, replacing the Select in place — see "Deep search vs. shallow filter"). Otherwise identical to file-search: same `EntryList` rendering, same commit path |
 | command-palette | Commands | Fuzzy | RunCommand | none | z |
+| key-list | Static (one row per binding in force where `?` was pressed: key, label, intent — special keys first, then single keys, each alphabetically; Q and Ctrl-c left out) | None | RunCommand (rows carry no command) | none | `?` in every mode outside a text input — a cheat sheet of the mode it was opened from, laid out column-major in as many columns as the width holds. Its own scope (`select:key-list`) accepts only w/a/s/d and the arrows (2-D scroll) and Esc / q / Enter (close); every other key does nothing. An input-less Select ignores typed characters |
 | command | Static (option checkboxes from the command's `--help`/`man`) | Path | Resolve (fill Dst / Path) | command:summary | No core binding; pushed by an extension that wants this shape (initial_query prefills the input). The **Argument** input is the destination/name (free text, never filters); the **Options** list is the command's options, toggled with Space; the function panel shows the live **Command** line — the **actual external command** resolved from the chain (e.g. `cp -R …`, `mv …`), not the op key, with the marked options and target spliced in |
 
 ### Phases
@@ -809,6 +811,7 @@ Core layer (`app/keymap.scm`):
 | z | push `command-palette` | command palette |
 | E | StartEdit | edit in the user's editor (Suspended form) |
 | Backspace, Delete | DeleteSelected | delete the targets with the resolver's `delete` entry (`rm`), Policy-confirmed |
+| ? | push `key-list` | the key list of this mode and panel (also from the function panel) |
 | c, m, R, M | start copy / move / rename / create | the built-in CmdOp builder ([CMDOP.md](CMDOP.md)) |
 | , | CycleFunctionPanel | hidden → 2:1 → 1:1 → 1:2 → hidden |
 | . | ToggleDotFiles | toggle hidden files |
@@ -818,12 +821,14 @@ Core layer (`app/keymap.scm`):
 | r | Refresh | reload |
 | Tab, Shift-Tab | FocusNextPanel, FocusPrevPanel | panel focus |
 | q, Ctrl-c | Quit | quit |
+| Q | QuitCd | quit, leaving the calling shell in the directory on screen (with `--cwd-file` and the shell function in the README) |
 
 Extension layer, bundled extensions (user-overridable):
 
 | Key | Binding | Extension |
 |-----|---------|-----------|
 | x, X | resume a shell / open a new one | pty ([PTY.md](PTY.md)) |
+| d | delete the released session on screen (function panel, `:when pty-released`; takes `d` from the file cursor there) | pty |
 | e | the editor in a PTY (`:when (option "pty.edit-host")`), overriding Activate | pty |
 | / ; n, p | start content search (`:when (and function-visible sublayout-content)`); next / previous match (`:when function-has-matches`) | preview |
 | B | bookmark the current path | bookmarks |
@@ -893,6 +898,7 @@ match lands on the row it was wrapped onto.
 |-----|--------|-----------|
 | Enter | Confirm (Input phase: switch to Navigate; Navigate: confirm) | |
 | Esc | Cancel | |
+| ? | push `key-list` | Navigate phase (in the Input phase `?` is typed) |
 | Ctrl-n, Down; Ctrl-p, Up | CursorDown, CursorUp (move the results) | |
 | w, s | CursorUp, CursorDown | Navigate phase |
 | a, d; W, S | CursorLeft, CursorRight; CursorTop, CursorBottom (2-D grid moves over a path-valued result list) | Navigate phase |
@@ -930,6 +936,7 @@ caret's line is empty, in which case Enter submits.
 |-----|--------|
 | y, Enter | Confirm (allow; resume the pending intent) |
 | n, Esc | Cancel (deny) |
+| ? | push `key-list` |
 
 ## Input Form Mode
 
@@ -937,6 +944,7 @@ caret's line is empty, in which case Enter submits.
 |-----|--------|-----------|
 | Enter | Confirm (pop, re-inject `template` with the encoded value under `KEY_ITEM` — except `List`, where Enter edits/adds a row unless the cursor is on the trailing "* Confirm" row) | |
 | Esc | Cancel (pop, emit nothing, regardless of kind or any nested row-edit state) | |
+| ? | push `key-list` | not input-form-typing |
 | w, Up; s, Down | CursorUp, CursorDown | not input-form-typing |
 | Left; Right | CursorLeft, CursorRight | not input-form-typing |
 | a | CursorLeft | not input-form-typing, not input-form-list-browsing |
@@ -1015,5 +1023,7 @@ A `Key` is a code, modifiers, and an event kind:
 wasdf asks its own terminal for the Kitty keyboard protocol at startup
 (disambiguated escapes, event types, alternate keys, all keys as escapes) and
 pops it on exit and around a Suspended child; a terminal without support stays
-on legacy keys. Only Press events resolve through the keymap. An input capture
+on legacy keys. Press and Repeat events resolve through the keymap (a held key
+repeats its binding, as a legacy terminal's repeated presses do); a Release
+never does, and outside an input capture it is dropped. An input capture
 receives every event, losslessly encoded ([EXTENSION.md](EXTENSION.md)).

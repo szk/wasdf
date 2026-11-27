@@ -9,7 +9,7 @@
   ;; How image previews reach the terminal: off = symbol cells (works
   ;; everywhere), sixel / kitty = that graphics protocol (needs the terminal
   ;; to support it and to report its cell size in pixels).
-  (option "image-protocol"      "Display" (choice "off" "sixel" "kitty") "off" "image-protocol")
+  (option "image-protocol"      "Display" (choice "off" "sixel" "kitty") "kitty" "image-protocol")
   ;; Scrollbar glyphs: thumb (the moving block), rail (the track when scrollable),
   ;; and the char shown when scrolling is unnecessary (the panel fully fits).
   (option "scrollbar-thumb"     "Display" text "▋" "scrollbar-thumb")

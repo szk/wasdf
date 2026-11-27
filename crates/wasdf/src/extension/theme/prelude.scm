@@ -8,16 +8,10 @@
         ((equal? (car (car pairs)) key) (cons (list key value) (cdr pairs)))
         (else (cons (car pairs) (theme--put key value (cdr pairs))))))
 
-(define (theme--color c) (if (symbol? c) (symbol->string c) c))
-
-;; (role fg bg bold italic underline) -> ("role" (("fg" …) ("bg" …) …))
+;; (role (fg C) (bg C) (bold B) ...) -> ("role" ((fg C) (bg C) (bold B) ...)):
+;; the store keeps the fields, any subset, in declaration order.
 (define (theme--style r)
-  (list (symbol->string (car r))
-        (list (list "fg" (theme--color (list-ref r 1)))
-              (list "bg" (theme--color (list-ref r 2)))
-              (list "bold" (list-ref r 3))
-              (list "italic" (list-ref r 4))
-              (list "underline" (list-ref r 5)))))
+  (list (symbol->string (car r)) (cdr r)))
 
 (define (theme--styles roles)
   (if (null? roles)
@@ -30,9 +24,10 @@
 ;; (set-theme "name") — make a theme active.
 (define (set-theme name) (opt-set! 'theme.active name))
 
-;; (define-theme "name" (role fg bg bold italic underline) ...) — set a custom
-;; theme's overrides; fg / bg are a color token string ("#83a598", an ANSI
-;; name) or the bare symbol nil for no color.
+;; (define-theme "name" (role (fg C) (bg C) (bold B) (italic B) (underline B)) ...)
+;; — set a custom theme's overrides, written like presets.scm: every field is
+;; optional (an omitted color is nil, an omitted modifier off); a color is a
+;; token string ("#83a598", an ANSI name).
 (define-syntax define-theme
   (syntax-rules ()
     ((_ name role ...) (theme--define name '(role ...)))))

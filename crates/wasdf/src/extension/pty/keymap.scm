@@ -19,4 +19,7 @@
         ("h" (ext "pty" "prev") pty-released "session")
         ("Left" (ext "pty" "prev") pty-released)
         ("l" (ext "pty" "next") pty-released "session")
-        ("Right" (ext "pty" "next") pty-released)))))
+        ("Right" (ext "pty" "next") pty-released)
+        ;; Delete the released session's slot (its child is stopped). This
+        ;; takes `d` from the file cursor while a session is released.
+        ("d" (ext "pty" "delete") pty-released "delete")))))

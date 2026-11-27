@@ -33,8 +33,8 @@ pub fn render_bottom(
 ) {
     let hints = hints_for(state, keymap, conds);
 
-    let bar = theme.style(Role::HelpFg).bg(theme.role(Role::HelpBg));
-    let key = theme.style(Role::HelpKeyFg).bg(theme.role(Role::HelpKeyBg));
+    let bar = theme.style(Role::Help);
+    let key = theme.style(Role::HelpKey);
 
     let mut spans: Vec<Span> = Vec::new();
     spans.push(Span::styled(" ", bar)); // left pad
@@ -45,13 +45,13 @@ pub fn render_bottom(
         if k.is_empty() {
             // Instructional text with no trigger key.
             spans.push(Span::styled(label.clone(), bar));
-        } else if let Some((first, rest)) = first_letter_is_key(k, label) {
-            // The key is the label's leading letter → highlight just that letter.
+        } else if let Some((first, rest)) = key_leads_label(k, label) {
+            // The key spells the label's start → highlight just that part.
             spans.push(Span::styled(first, key));
             spans.push(Span::styled(rest, bar));
         } else {
             // Otherwise show the key chip, then the label.
-            spans.push(Span::styled(k.clone(), key));
+            spans.push(Span::styled(chip_name(k).to_string(), key));
             spans.push(Span::styled(" ", bar));
             spans.push(Span::styled(label.clone(), bar));
         }
@@ -61,18 +61,22 @@ pub fn render_bottom(
     frame.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
 }
 
-/// If `key` is a single character equal (case-insensitively) to the first letter
-/// of `label`, split `label` into (first-letter, rest); otherwise `None`.
-fn first_letter_is_key(key: &str, label: &str) -> Option<(String, String)> {
-    let mut kc = key.chars();
-    let (k, None) = (kc.next()?, kc.next()) else { return None };
-    let first = label.chars().next()?;
-    if !first.eq_ignore_ascii_case(&k) {
-        return None;
+/// If `key`, as the help row shows it, spells the start of `label`
+/// (case-insensitively: `f`/`find`, `Del`/`delete`), split `label` into the
+/// key part — written as the key — and the rest; otherwise `None`.
+fn key_leads_label(key: &str, label: &str) -> Option<(String, String)> {
+    let key = chip_name(key);
+    let n = key.len();
+    let head = label.get(..n)?;
+    head.eq_ignore_ascii_case(key).then(|| (key.to_string(), label[n..].to_string()))
+}
+
+/// How the help row spells a key: `Del` for Delete, so it can lead `delete`.
+fn chip_name(key: &str) -> &str {
+    match key {
+        "Delete" => "Del",
+        other => other,
     }
-    let split = label.char_indices().nth(1).map(|(i, _)| i).unwrap_or(label.len());
-    let (a, b) = label.split_at(split);
-    Some((a.to_string(), b.to_string()))
 }
 
 /// The hint list for the current state.

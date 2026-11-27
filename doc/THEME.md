@@ -9,9 +9,28 @@ user-defined themes, the per-role editor, and the active theme. It assumes
 
 A `Theme` (core type, `core/theme.rs`) maps every `Role` to a style: a
 foreground, a background, and Bold / Italic / Underline. `Color::Reset` is
-**nil** — literally no color. Presets are `(quote …)` data in
-`theme/presets.scm`, interpreted by the extension itself. User themes are
-presets' copies with per-role overrides.
+**nil** — literally no color. Every item that has both a foreground and a
+background is **one role carrying both** (`cursor`, `match`, `notice-info`,
+`help-key`, …) — there are no separate `-fg` / `-bg` roles. Presets are
+`(quote …)` data in `theme/presets.scm`, interpreted by the extension itself.
+User themes are presets' copies with per-role overrides.
+
+### One role form everywhere
+
+A role's look is written the same way in `presets.scm`, in `define-theme`, and
+(inside the store's map) in `custom.scm` — the role, then its fields:
+
+```scheme
+(cursor (fg "#2e3440") (bg "#88c0d0") (bold #t))
+```
+
+Every field (`fg`, `bg`, `bold`, `italic`, `underline`) is optional: an omitted
+color is nil, an omitted modifier off. A role listed is that role's whole look;
+a role not listed keeps the built-in one. In `custom.scm` the same fields sit
+under the role's name, in that order:
+`(opt-set! 'theme.custom '(("mine" (("cursor" ((fg "#2e3440") (bg "#88c0d0")))))))`.
+`file-row-size-graph` is the file-size bar's gradient: `fg` its left end (each
+preset uses its highlight color), `bg` its right end (gray).
 
 The extension resolves the active theme and publishes it into ThemeCell
 (`Host.theme`) at bind time and after every change; render reads that
@@ -98,8 +117,8 @@ setting ([SCHEME.md](SCHEME.md)):
 | `theme.active` | `text` | the active theme's name |
 | `theme.custom` | `(map (map (record (fg text) (bg text) (bold bool) (italic bool) (underline bool))))` — theme name → role → style | user themes: per-role overrides of the preset they were copied from |
 
-A color value is a `"#rrggbb"` string or `'nil` ("no color"). A role's override
-is always the full record; there is no partial form.
+A color value is a `"#rrggbb"` string or an ANSI name; an omitted field is the
+default (no color, modifier off), so only what differs is written.
 
 The theme prelude gives users friendlier procedures for `config.scm` and the
 REPL; both write through the store, so they are validated and land in the
@@ -108,7 +127,7 @@ caller's layer:
 | Procedure | Effect |
 |-----------|--------|
 | `(set-theme "name")` | `(opt-set! 'theme.active "name")` |
-| `(define-theme "name" (role fg bg bold italic underline) …)` | set `name`'s overrides in `theme.custom` — a macro, so the role forms are written unquoted, e.g. `(define-theme "mine" (entry-dir "#83a598" nil #t #f #f))`; this is also the form old versions wrote into `config.scm`, so an old file loads unchanged |
+| `(define-theme "name" (role (fg C) (bg C) (bold B) …) …)` | set `name`'s overrides in `theme.custom` — a macro, so the role forms are written unquoted, exactly as in `presets.scm`, e.g. `(define-theme "mine" (entry-dir (fg "#83a598") (bold #t)))` |
 
 So a user can pick a different theme per platform in `config.scm`, while the
 editor's edits land in the `custom` layer and persist in `custom.scm`.

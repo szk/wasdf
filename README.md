@@ -30,9 +30,22 @@ Runs on **macOS**, **Linux**, and **Windows via WSL2**.
 | `f` · `z` | file search · command palette |
 | `c` `m` `R` `E` | copy · move · rename · edit |
 | `v` · `,` | cycle list layout (rows/columns/grid) · cycle the ratio of function pane |
-| `q` | quit |
+| `q` · `Q` | quit · quit and stay in the directory on screen |
 
 `Enter`/`y` mean OK, `Esc`/`n` mean cancel. Full keymap: [doc/UI.md](doc/UI.md).
+
+`Q` leaves your shell in the directory wasdf was showing. A program cannot
+change its parent shell's directory, so wasdf writes it to the file named by
+`--cwd-file` and a shell function does the `cd` (bash / zsh):
+
+```sh
+wasdf() {
+  local f; f="$(mktemp)" || return
+  command wasdf --cwd-file "$f" "$@"
+  local d; d="$(cat "$f")"; rm -f "$f"
+  [ -n "$d" ] && [ "$d" != "$PWD" ] && cd -- "$d"
+}
+```
 
 ## Design
 

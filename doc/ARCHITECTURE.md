@@ -130,7 +130,7 @@ Extension intents travel as data ([EXTENSION.md](EXTENSION.md)).
 | Process | KillProcess | Exec frame only |
 | Capture | SetInputCapture | Install / clear an extension's `InputCapture` |
 | Scheme | Eval, Configure | `Eval{owner, expr}` evaluates an expression in the resident session (`Plan::EvalScheme`); the result goes to `owner`. `Configure(write)` is a structured store write in the `custom` layer — set / reset an option, bind / unbind, a layout, an order — that the codec renders as a store call; it is how the settings UI and extension editors change anything configurable |
-| Misc | Refresh, Quit, Noop, Notify | Notify logs a line to `@/messages` |
+| Misc | Refresh, Quit, QuitCd, Noop, Notify | Notify logs a line to `@/messages`. QuitCd quits and hands the directory on screen back: with `--cwd-file PATH`, a real (non-`@/`) directory is written to PATH for a shell wrapper to `cd` into — a child process cannot change its parent's cwd |
 | Extension | Extension, UpdateExtensionState | Extension intents as data; UpdateExtensionState is the single mechanism for extension-mode state updates |
 
 ## Purity Contract

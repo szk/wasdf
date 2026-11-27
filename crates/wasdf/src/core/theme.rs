@@ -10,32 +10,24 @@ pub enum Role {
     Nameplate,
     PathActive,
     PathMuted,
-    NavCursorFg,
-    NavCursorBg,
+    NavCursor,
     PathSeparator,
     Entry,
     EntryDir,
     EntrySymlink,
-    CursorFg,
-    CursorBg,
-    CursorActiveFg,
-    CursorActiveBg,
+    Cursor,
+    CursorActive,
     SelectionMarker,
     Muted,
-    MatchBg,
-    MatchFg,
-    MatchCurrentBg,
-    MatchCurrentFg,
+    Match,
+    MatchCurrent,
     PropLabel,
     ExecRunning,
     ExecOk,
     ExecFail,
-    NoticeInfoFg,
-    NoticeInfoBg,
-    NoticeErrorFg,
-    NoticeErrorBg,
-    OverlayDangerFg,
-    OverlayDangerBg,
+    NoticeInfo,
+    NoticeError,
+    OverlayDanger,
     Accent,
     // Per-metric monitor roles
     MonitorCpuLabel,
@@ -76,10 +68,8 @@ pub enum Role {
     // file's tip). See ui/middle.rs's `gradient_at`.
     FileRowSizeGraph,
     // Help bar (bottom row)
-    HelpFg,
-    HelpBg,
-    HelpKeyFg,
-    HelpKeyBg,
+    Help,
+    HelpKey,
 }
 
 impl Role {
@@ -92,32 +82,24 @@ impl Role {
         Role::Nameplate,
         Role::PathActive,
         Role::PathMuted,
-        Role::NavCursorFg,
-        Role::NavCursorBg,
+        Role::NavCursor,
         Role::PathSeparator,
         Role::Entry,
         Role::EntryDir,
         Role::EntrySymlink,
-        Role::CursorFg,
-        Role::CursorBg,
-        Role::CursorActiveFg,
-        Role::CursorActiveBg,
+        Role::Cursor,
+        Role::CursorActive,
         Role::SelectionMarker,
         Role::Muted,
-        Role::MatchBg,
-        Role::MatchFg,
-        Role::MatchCurrentBg,
-        Role::MatchCurrentFg,
+        Role::Match,
+        Role::MatchCurrent,
         Role::PropLabel,
         Role::ExecRunning,
         Role::ExecOk,
         Role::ExecFail,
-        Role::NoticeInfoFg,
-        Role::NoticeInfoBg,
-        Role::NoticeErrorFg,
-        Role::NoticeErrorBg,
-        Role::OverlayDangerFg,
-        Role::OverlayDangerBg,
+        Role::NoticeInfo,
+        Role::NoticeError,
+        Role::OverlayDanger,
         Role::Accent,
         Role::MonitorCpuLabel,
         Role::MonitorMemLabel,
@@ -144,10 +126,8 @@ impl Role {
         Role::PropInfoValue,
         Role::FileRowProps,
         Role::FileRowSizeGraph,
-        Role::HelpFg,
-        Role::HelpBg,
-        Role::HelpKeyFg,
-        Role::HelpKeyBg,
+        Role::Help,
+        Role::HelpKey,
     ];
     pub const COUNT: usize = Role::ALL.len();
 
@@ -165,32 +145,24 @@ impl Role {
             Role::Nameplate => "nameplate",
             Role::PathActive => "path-active",
             Role::PathMuted => "path-muted",
-            Role::NavCursorFg => "nav-cursor-fg",
-            Role::NavCursorBg => "nav-cursor-bg",
+            Role::NavCursor => "nav-cursor",
             Role::PathSeparator => "path-separator",
             Role::Entry => "entry",
             Role::EntryDir => "entry-dir",
             Role::EntrySymlink => "entry-symlink",
-            Role::CursorFg => "cursor-fg",
-            Role::CursorBg => "cursor-bg",
-            Role::CursorActiveFg => "cursor-active-fg",
-            Role::CursorActiveBg => "cursor-active-bg",
+            Role::Cursor => "cursor",
+            Role::CursorActive => "cursor-active",
             Role::SelectionMarker => "selection-marker",
             Role::Muted => "muted",
-            Role::MatchBg => "match-bg",
-            Role::MatchFg => "match-fg",
-            Role::MatchCurrentBg => "match-current-bg",
-            Role::MatchCurrentFg => "match-current-fg",
+            Role::Match => "match",
+            Role::MatchCurrent => "match-current",
             Role::PropLabel => "prop-label",
             Role::ExecRunning => "exec-running",
             Role::ExecOk => "exec-ok",
             Role::ExecFail => "exec-fail",
-            Role::NoticeInfoFg => "notice-info-fg",
-            Role::NoticeInfoBg => "notice-info-bg",
-            Role::NoticeErrorFg => "notice-error-fg",
-            Role::NoticeErrorBg => "notice-error-bg",
-            Role::OverlayDangerFg => "overlay-danger-fg",
-            Role::OverlayDangerBg => "overlay-danger-bg",
+            Role::NoticeInfo => "notice-info",
+            Role::NoticeError => "notice-error",
+            Role::OverlayDanger => "overlay-danger",
             Role::Accent => "accent",
             Role::MonitorCpuLabel => "monitor-cpu-label",
             Role::MonitorMemLabel => "monitor-mem-label",
@@ -217,10 +189,8 @@ impl Role {
             Role::PropInfoValue => "prop-info-value",
             Role::FileRowProps => "file-row-props",
             Role::FileRowSizeGraph => "file-row-size-graph",
-            Role::HelpFg => "help-fg",
-            Role::HelpBg => "help-bg",
-            Role::HelpKeyFg => "help-key-fg",
-            Role::HelpKeyBg => "help-key-bg",
+            Role::Help => "help",
+            Role::HelpKey => "help-key",
         }
     }
 
@@ -255,33 +225,26 @@ impl Theme {
         fg[Role::Nameplate.idx()] = Color::Gray;
         fg[Role::PathActive.idx()] = Color::White;
         fg[Role::PathMuted.idx()] = Color::DarkGray;
-        fg[Role::NavCursorFg.idx()] = Color::Black;
-        fg[Role::NavCursorBg.idx()] = Color::Cyan;
+        fg[Role::NavCursor.idx()] = Color::Black;
         fg[Role::PathSeparator.idx()] = Color::Yellow;
         fg[Role::Entry.idx()] = Color::Reset;
         fg[Role::EntryDir.idx()] = Color::Blue;
         fg[Role::EntrySymlink.idx()] = Color::Magenta;
         // Cursor: bright while its panel is focused, subdued while it is not.
-        fg[Role::CursorActiveFg.idx()] = Color::Black;
-        fg[Role::CursorActiveBg.idx()] = Color::Cyan;
-        fg[Role::CursorFg.idx()] = Color::White;
-        fg[Role::CursorBg.idx()] = Color::DarkGray;
+        fg[Role::CursorActive.idx()] = Color::Black;
+        fg[Role::Cursor.idx()] = Color::White;
         fg[Role::SelectionMarker.idx()] = Color::Green;
         fg[Role::Muted.idx()] = Color::DarkGray;
-        fg[Role::MatchBg.idx()] = Color::Yellow;
-        fg[Role::MatchFg.idx()] = Color::Black;
-        fg[Role::MatchCurrentBg.idx()] = Color::LightCyan;
-        fg[Role::MatchCurrentFg.idx()] = Color::Black;
+        fg[Role::Match.idx()] = Color::Black;
+        fg[Role::MatchCurrent.idx()] = Color::Black;
         fg[Role::PropLabel.idx()] = Color::DarkGray;
         fg[Role::ExecRunning.idx()] = Color::Yellow;
         fg[Role::ExecOk.idx()] = Color::Green;
         fg[Role::ExecFail.idx()] = Color::Red;
-        fg[Role::NoticeInfoFg.idx()] = Color::Black;
-        fg[Role::NoticeInfoBg.idx()] = Color::Green;
-        fg[Role::NoticeErrorFg.idx()] = Color::White;
-        fg[Role::NoticeErrorBg.idx()] = Color::Red;
-        fg[Role::OverlayDangerFg.idx()] = Color::Red;
-        // OverlayDangerBg stays Color::Reset (terminal default behind the overlay).
+        fg[Role::NoticeInfo.idx()] = Color::Black;
+        fg[Role::NoticeError.idx()] = Color::White;
+        fg[Role::OverlayDanger.idx()] = Color::Red;
+        // OverlayDanger's bg stays nil (terminal default behind the overlay).
         fg[Role::Accent.idx()] = Color::Cyan;
         // Per-metric monitor labels.
         fg[Role::MonitorCpuLabel.idx()] = Color::Cyan;
@@ -302,14 +265,12 @@ impl Theme {
         fg[Role::PropTimeLabel.idx()] = Color::DarkGray;
         fg[Role::PropInfoLabel.idx()] = Color::DarkGray;
         // Help bar: a dark status strip with negative (inverted) key chips.
-        fg[Role::HelpFg.idx()] = Color::White;
-        fg[Role::HelpBg.idx()] = Color::DarkGray;
-        fg[Role::HelpKeyFg.idx()] = Color::Black;
-        fg[Role::HelpKeyBg.idx()] = Color::White;
-        // The file-size bar's gradient: red at its left end (the largest
-        // files reach here), dark gray at its right end (the zero point,
-        // every file's bar tip lands here).
-        fg[Role::FileRowSizeGraph.idx()] = Color::Red;
+        fg[Role::Help.idx()] = Color::White;
+        fg[Role::HelpKey.idx()] = Color::Black;
+        // The file-size bar's gradient: the highlight color at its left end
+        // (the largest files reach here), gray at its right end (the zero
+        // point, every file's bar tip lands here).
+        fg[Role::FileRowSizeGraph.idx()] = Color::Cyan;
 
         // No style modifier carries a built-in opinion here: `Theme` is a
         // neutral palette primitive. Which roles are bold/italic/underline
@@ -319,7 +280,16 @@ impl Theme {
         let modifiers = [Modifier::empty(); Role::COUNT];
 
         let mut bg = [Color::Reset; Role::COUNT];
-        bg[Role::FileRowSizeGraph.idx()] = Color::DarkGray;
+        bg[Role::FileRowSizeGraph.idx()] = Color::Rgb(0x80, 0x80, 0x80);
+        bg[Role::NavCursor.idx()] = Color::Cyan;
+        bg[Role::CursorActive.idx()] = Color::Cyan;
+        bg[Role::Cursor.idx()] = Color::DarkGray;
+        bg[Role::Match.idx()] = Color::Yellow;
+        bg[Role::MatchCurrent.idx()] = Color::LightCyan;
+        bg[Role::NoticeInfo.idx()] = Color::Green;
+        bg[Role::NoticeError.idx()] = Color::Red;
+        bg[Role::Help.idx()] = Color::DarkGray;
+        bg[Role::HelpKey.idx()] = Color::White;
 
         Theme { fg, bg, modifiers }
     }

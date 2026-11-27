@@ -405,6 +405,9 @@ pub struct AppState {
     pub modes: Vec<ModeFrame>,
     pub next_generation: u64,
     pub quit: bool,
+    /// Set with `quit` by QuitCd: hand the directory on screen back to the
+    /// shell that started wasdf (`--cwd-file`).
+    pub cd_on_quit: bool,
     /// A path to place the cursor on after the next listing loads (e.g. the
     /// directory we came from on CursorLeft, or a navigated-to file).
     pub pending_focus: Option<PathBuf>,
@@ -468,6 +471,7 @@ impl AppState {
             modes: vec![ModeFrame { mode: Mode::File, generation: 0 }],
             next_generation: 1,
             quit: false,
+            cd_on_quit: false,
             pending_focus: None,
             root_return: None,
             filter_stack: Vec::new(),

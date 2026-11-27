@@ -143,7 +143,12 @@ impl Vfs {
         }
         if is_virtual(path) {
             match mount_of(path).and_then(|m| self.find(m)) {
-                Some(p) => p.list(path),
+                // Directories first, as on disk; within each group the
+                // provider's own order (declaration, priority) is kept.
+                Some(p) => p.list(path).map(|mut entries| {
+                    entries.sort_by_key(|e| !e.is_dir);
+                    entries
+                }),
                 None => Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("unknown VFS mount: {}", path.display()),
@@ -202,6 +207,25 @@ mod tests {
         let root = PathBuf::from("@");
         let parent = root.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         assert!(parent.as_os_str().is_empty(), "parent of @ is the empty path");
+    }
+
+    #[test]
+    fn a_virtual_listing_puts_directories_first_and_keeps_the_providers_order() {
+        struct Mixed;
+        impl VfsProvider for Mixed {
+            fn mount(&self) -> &str {
+                "mixed"
+            }
+            fn list(&self, _path: &Path) -> io::Result<Vec<Entry>> {
+                let leaf = |n: &str| Entry::virtual_leaf(PathBuf::from(format!("@/mixed/{n}")), n.into());
+                let dir = |n: &str| Entry::virtual_dir(PathBuf::from(format!("@/mixed/{n}")), n.into());
+                Ok(vec![leaf("about"), dir("Zeta"), leaf("Alpha"), dir("Beta")])
+            }
+        }
+        let mut vfs = Vfs::default();
+        vfs.extend([Box::new(Mixed) as Box<dyn VfsProvider>]);
+        let names: Vec<String> = vfs.list(Path::new("@/mixed"), false).unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["Zeta", "Beta", "about", "Alpha"]);
     }
 
     #[test]

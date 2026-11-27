@@ -71,9 +71,16 @@ through it and the row shows both the overlay's keys and those beneath.
   actions never share a word (the file cursor is `cursor`, the operation is
   `move`; core's suspending editor is `Edit full`, the PTY-hosted one `edit`).
 - **Order** is the store's `help` display order when it lists the label;
-  labels it does not list follow in registration order — Core, then
-  Extension, then User — with a label's first appearance fixing its position. Bindings are written in the
+  labels it does not list follow **alphabetically** (case-insensitive). With
+  no `help` order set, the lead is `cursor`, `select`, `edit`, `find`, `move`,
+  `delete`, `shell`, `quit`, `help` — so the File row reads
+  `wasd cursor  Space select  edit  find  move  Delete  x shell  quit  ? help …`.
+  A user `(order! 'help …)` replaces that lead. Bindings are written in the
   order they should read (`w a s d`).
+- **Chips.** When the key spells the start of its label (case-insensitively)
+  the chip *is* that part of the label, highlighted (`f`+`ind`, `E`+`dit full`,
+  `Del`+`ete`); otherwise the chip precedes the label (`x shell`). The row
+  spells Delete as `Del`.
 - **Overflow** clips at the row width.
 
 ## Keyless entries

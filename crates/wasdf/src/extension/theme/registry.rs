@@ -16,12 +16,12 @@ use crate::script::sexpr::{self, Datum};
 pub const DEFAULT_BOLD_ROLES: &[Role] = &[
     Role::EntryDir,
     Role::PathActive,
-    Role::NavCursorFg,
+    Role::NavCursor,
     Role::MonitorCpuLabel,
     Role::MonitorMemLabel,
     Role::MonitorDskLabel,
     Role::MonitorNetLabel,
-    Role::HelpKeyFg,
+    Role::HelpKey,
 ];
 
 pub fn default_bold(role: Role) -> bool {
@@ -29,19 +29,19 @@ pub fn default_bold(role: Role) -> bool {
 }
 
 /// `role`'s full look in the built-in theme, absent any override — what an
-/// override compares against to decide whether it is redundant. `bg` is
-/// always `Color::Reset` ("nil"): `Theme::default()` carries no per-role
-/// background opinion of its own.
+/// override compares against to decide whether it is redundant.
 pub fn default_style(role: Role) -> RoleStyle {
-    RoleStyle { fg: Theme::default().role(role), bg: Color::Reset, bold: default_bold(role), italic: false, underline: false }
+    let t = Theme::default();
+    RoleStyle { fg: t.role(role), bg: t.bg(role), bold: default_bold(role), italic: false, underline: false }
 }
 
 // ── RoleStyle ────────────────────────────────────────────────────────────────
 
 /// One role's complete look: foreground, background (`Color::Reset` = nil /
 /// transparent), and the three style modifiers. A theme override is always
-/// this whole tuple at once — there is no partial per-attribute override —
-/// so editing one attribute of a role never leaves the others ambiguous.
+/// this whole tuple at once, so editing one attribute of a role never leaves
+/// the others ambiguous; written out, an attribute at its `Default` (nil, off)
+/// is simply omitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoleStyle {
     pub fg: Color,
@@ -49,6 +49,55 @@ pub struct RoleStyle {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+}
+
+impl Default for RoleStyle {
+    fn default() -> Self {
+        RoleStyle { fg: Color::Reset, bg: Color::Reset, bold: false, italic: false, underline: false }
+    }
+}
+
+impl RoleStyle {
+    /// Read `(fg C) (bg C) (bold B) (italic B) (underline B)` field pairs, any
+    /// subset in any order. `None` for an unknown field or an ill-typed value.
+    fn from_fields<'a>(fields: impl IntoIterator<Item = (&'a str, FieldValue<'a>)>) -> Option<RoleStyle> {
+        let mut st = RoleStyle::default();
+        for (name, v) in fields {
+            match (name, v) {
+                ("fg", FieldValue::Color(c)) => st.fg = color_from_text(c)?,
+                ("bg", FieldValue::Color(c)) => st.bg = color_from_text(c)?,
+                ("bold", FieldValue::Flag(b)) => st.bold = b,
+                ("italic", FieldValue::Flag(b)) => st.italic = b,
+                ("underline", FieldValue::Flag(b)) => st.underline = b,
+                _ => return None,
+            }
+        }
+        Some(st)
+    }
+
+    /// The fields that differ from `Default`, in declaration order.
+    fn to_fields(self) -> Vec<(&'static str, OptionValue)> {
+        let d = RoleStyle::default();
+        let mut out = Vec::new();
+        if self.fg != d.fg {
+            out.push(("fg", OptionValue::Text(color_text(self.fg))));
+        }
+        if self.bg != d.bg {
+            out.push(("bg", OptionValue::Text(color_text(self.bg))));
+        }
+        for (name, on) in [("bold", self.bold), ("italic", self.italic), ("underline", self.underline)] {
+            if on {
+                out.push((name, OptionValue::Bool(true)));
+            }
+        }
+        out
+    }
+}
+
+/// A field value as either source spells it: a color token or a flag.
+enum FieldValue<'a> {
+    Color(&'a str),
+    Flag(bool),
 }
 
 // ── NamedTheme ────────────────────────────────────────────────────────────────
@@ -203,8 +252,8 @@ impl ThemeRegistry {
 
 // ── presets.scm ──────────────────────────────────────────────────────────────
 
-/// Read `(quote ((theme "name" (role fg bg bold italic underline) …) …))`
-/// into presets. Unknown role tokens and malformed role forms are skipped.
+/// Read `(quote ((theme "name" (role (fg C) (bg C) (bold B) …) …) …))` into
+/// presets. Unknown role tokens and malformed role forms are skipped.
 pub fn parse_presets(src: &str) -> Vec<NamedTheme> {
     let Ok(datum) = sexpr::parse_quoted(src) else { return Vec::new() };
     let Some(forms) = datum.as_list() else { return Vec::new() };
@@ -221,23 +270,25 @@ pub fn parse_presets(src: &str) -> Vec<NamedTheme> {
         .collect()
 }
 
-/// Each `(role fg bg bold italic underline)` form as a role's whole style; a
-/// form missing a position, or with an unknown role / color, is skipped.
+/// Each `(role (field value) …)` form as a role's whole style; a form with an
+/// unknown role, field, or color is skipped.
 fn role_styles(forms: &[Datum]) -> Vec<(Role, RoleStyle)> {
     forms
         .iter()
         .filter_map(|f| {
-            let p = f.as_list()?;
-            Some((
-                Role::from_token(p.first()?.as_sym()?)?,
-                RoleStyle {
-                    fg: color_from_text(p.get(1)?.text()?)?,
-                    bg: color_from_text(p.get(2)?.text()?)?,
-                    bold: p.get(3)?.as_bool()?,
-                    italic: p.get(4)?.as_bool()?,
-                    underline: p.get(5)?.as_bool()?,
-                },
-            ))
+            let (role, fields) = f.as_list()?.split_first()?;
+            let fields = fields
+                .iter()
+                .map(|field| {
+                    let [name, value] = field.as_list()? else { return None };
+                    let v = match value.as_bool() {
+                        Some(b) => FieldValue::Flag(b),
+                        None => FieldValue::Color(value.text()?),
+                    };
+                    Some((name.as_sym()?, v))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((Role::from_token(role.as_sym()?)?, RoleStyle::from_fields(fields)?))
         })
         .collect()
 }
@@ -272,15 +323,15 @@ pub fn customs_from_value(v: &OptionValue) -> Vec<NamedTheme> {
 
 fn style_from_value(v: &OptionValue) -> Option<RoleStyle> {
     let OptionValue::Map(m) = v else { return None };
-    let text = |k: &str| match m.get(k) {
-        Some(OptionValue::Text(s)) => color_from_text(s),
-        _ => None,
-    };
-    let flag = |k: &str| match m.get(k) {
-        Some(OptionValue::Bool(b)) => Some(*b),
-        _ => None,
-    };
-    Some(RoleStyle { fg: text("fg")?, bg: text("bg")?, bold: flag("bold")?, italic: flag("italic")?, underline: flag("underline")? })
+    let fields = m
+        .iter()
+        .map(|(k, v)| match v {
+            OptionValue::Bool(b) => Some((k.as_str(), FieldValue::Flag(*b))),
+            OptionValue::Text(s) => Some((k.as_str(), FieldValue::Color(s))),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    RoleStyle::from_fields(fields)
 }
 
 /// The value for `theme.custom` holding `themes`.
@@ -293,16 +344,8 @@ pub fn customs_to_value<'a>(themes: impl IntoIterator<Item = &'a NamedTheme>) ->
                     .overrides
                     .iter()
                     .map(|(role, st)| {
-                        let fields: BTreeMap<String, OptionValue> = [
-                            ("fg", OptionValue::Text(color_text(st.fg))),
-                            ("bg", OptionValue::Text(color_text(st.bg))),
-                            ("bold", OptionValue::Bool(st.bold)),
-                            ("italic", OptionValue::Bool(st.italic)),
-                            ("underline", OptionValue::Bool(st.underline)),
-                        ]
-                        .into_iter()
-                        .map(|(k, v)| (k.to_string(), v))
-                        .collect();
+                        let fields: BTreeMap<String, OptionValue> =
+                            st.to_fields().into_iter().map(|(k, v)| (k.to_string(), v)).collect();
                         (role.token().to_string(), OptionValue::Map(fields))
                     })
                     .collect();

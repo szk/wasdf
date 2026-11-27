@@ -87,8 +87,8 @@ pub fn build_line(
         let m = highlights.iter().find(|(s, e, _)| b >= *s && b < *e);
         let style = match m {
             // Search highlight overrides the segment's own colors.
-            Some((_, _, true)) => theme.style(Role::MatchCurrentFg).bg(theme.role(Role::MatchCurrentBg)),
-            Some(_) => theme.style(Role::MatchFg).bg(theme.role(Role::MatchBg)),
+            Some((_, _, true)) => theme.style(Role::MatchCurrent),
+            Some(_) => theme.style(Role::Match),
             None => segs.get(seg_idx).map(|s| s.1).unwrap_or_default(),
         };
         if col >= hscroll {

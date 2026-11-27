@@ -46,15 +46,35 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let cwd = args
-        .get(1)
+    // `--cwd-file PATH`: on `Q`, the directory on screen is written there, for
+    // a shell wrapper to `cd` into (a child cannot change its parent's cwd).
+    let mut cwd_file = None;
+    let mut positional = Vec::new();
+    let mut rest = args.iter().skip(1);
+    while let Some(a) = rest.next() {
+        if a == "--cwd-file" {
+            cwd_file = rest.next().map(PathBuf::from);
+        } else {
+            positional.push(a);
+        }
+    }
+    let cwd = positional
+        .first()
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
 
     match app::run(cwd) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(cd) => {
+            if let (Some(file), Some(dir)) = (cwd_file, cd)
+                && let Err(e) = std::fs::write(&file, dir.as_os_str().as_encoded_bytes())
+            {
+                eprintln!("wasdf: --cwd-file {}: {e}", file.display());
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("wasdf: {e}");
             ExitCode::FAILURE

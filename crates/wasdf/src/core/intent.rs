@@ -274,6 +274,8 @@ pub enum Intent {
     // Misc
     Refresh,
     Quit,
+    /// Quit and hand the directory on screen back to the calling shell.
+    QuitCd,
     Noop,
     /// Show a transient user-facing notice. A generic kernel mechanism: any
     /// extension (or core) emits a message string; the kernel displays it via the

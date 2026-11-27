@@ -60,8 +60,8 @@ impl ExtensionRegistry {
     /// The first registered extension with a color opinion on `entry` (e.g.
     /// `lscolors`), if any — first-wins by registration order, same contract
     /// as `provider()`.
-    pub fn entry_style(&self, entry: &Entry) -> Option<ratatui::style::Style> {
-        self.iter().find_map(|e| e.entry_style(entry))
+    pub fn entry_style(&self, entry: &Entry, theme: &crate::core::Theme) -> Option<ratatui::style::Style> {
+        self.iter().find_map(|e| e.entry_style(entry, theme))
     }
 
     /// Reorder by priority (`ranked`, highest first); an id it does not name

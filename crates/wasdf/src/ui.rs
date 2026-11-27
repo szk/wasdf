@@ -10,6 +10,7 @@ pub mod layout;
 pub mod manager;
 pub mod middle;
 pub mod render;
+pub mod text;
 pub mod top;
 
 pub use manager::UiManager;

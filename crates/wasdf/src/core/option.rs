@@ -38,10 +38,10 @@ impl OptionKind {
             (OptionKind::Int { min, max }, OptionValue::Int(n)) => n >= min && n <= max,
             (OptionKind::Choice(opts), OptionValue::Text(s)) => opts.iter().any(|o| o == s),
             (OptionKind::List(item), OptionValue::List(items)) => items.iter().all(|v| item.accepts(v)),
-            (OptionKind::Record(fields), OptionValue::Map(m)) => {
-                m.len() == fields.len()
-                    && fields.iter().all(|(name, k)| m.get(name).is_some_and(|v| k.accepts(v)))
-            }
+            // Any subset of the fields: an omitted one takes its reader's default.
+            (OptionKind::Record(fields), OptionValue::Map(m)) => m
+                .iter()
+                .all(|(name, v)| fields.iter().any(|(f, k)| f == name && k.accepts(v))),
             (OptionKind::Map(item), OptionValue::Map(m)) => m.values().all(|v| item.accepts(v)),
             _ => false,
         }
@@ -506,8 +506,10 @@ mod tests {
             )
         };
         assert!(style.accepts(&rec("#fff", true)));
-        let missing = OptionValue::Map([("fg".to_string(), OptionValue::Text("#fff".into()))].into_iter().collect());
-        assert!(!style.accepts(&missing), "a record needs every field");
+        let partial = OptionValue::Map([("fg".to_string(), OptionValue::Text("#fff".into()))].into_iter().collect());
+        assert!(style.accepts(&partial), "any subset of the fields");
+        let unknown = OptionValue::Map([("size".to_string(), OptionValue::Int(1))].into_iter().collect());
+        assert!(!style.accepts(&unknown), "but only declared ones");
         let map = OptionValue::Map([("dark".to_string(), rec("#000", false))].into_iter().collect());
         assert!(themes.accepts(&map));
         assert!(!themes.accepts(&OptionValue::Map([("x".to_string(), OptionValue::Int(1))].into_iter().collect())));

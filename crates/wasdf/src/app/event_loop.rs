@@ -15,7 +15,9 @@ use crate::app::kernel::App;
 use crate::app::terminal;
 use crate::core::AppEvent;
 
-pub fn run(cwd: PathBuf) -> io::Result<()> {
+/// Run until quit. `Some(dir)` when the user asked to leave the calling shell
+/// in `dir` (QuitCd on a real directory).
+pub fn run(cwd: PathBuf) -> io::Result<Option<PathBuf>> {
     let mut term = terminal::init();
     let mut app = App::boot(cwd);
     app.ui.set_cell_px(terminal::cell_px(&mut term));
@@ -124,7 +126,9 @@ pub fn run(cwd: PathBuf) -> io::Result<()> {
     };
 
     terminal::restore();
-    result
+    // A virtual directory (`@/…`) is nowhere a shell can go.
+    let cd = (app.state.cd_on_quit && !crate::vfs::is_virtual(&app.state.cwd)).then(|| app.state.cwd.clone());
+    result.map(|()| cd)
 }
 
 /// Render one frame.

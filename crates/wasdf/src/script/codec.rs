@@ -305,6 +305,34 @@ fn span_style_from_datum(d: &Datum) -> Option<SpanStyle> {
     }
 }
 
+/// A short readable name for `intent`, for the key list: the keymap spelling
+/// (`cursor-up`), an extension intent as `ext:intent`, a pushed Select by its
+/// id, a navigation by its target.
+pub fn intent_text(intent: &Intent) -> String {
+    match intent {
+        Intent::Extension(e) => format!("{}:{}", e.extension, e.intent),
+        Intent::PushMode(m) => match &**m {
+            Mode::Select(spec) => spec.id.clone(),
+            other => kebab(&format!("{other:?}")),
+        },
+        Intent::NavigateTo(p) => format!("navigate-to {}", p.display()),
+        other => kebab(&format!("{other:?}")),
+    }
+}
+
+/// `CursorUp { .. }` → `cursor-up`: the leading variant name, kebab-cased.
+fn kebab(debug: &str) -> String {
+    let name = debug.split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default();
+    let mut out = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            out.push('-');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
+}
+
 fn intent_from_name(s: &str) -> Option<Intent> {
     use Intent::*;
     Some(match s {
@@ -354,6 +382,8 @@ fn intent_from_name(s: &str) -> Option<Intent> {
         "toggle-vfs-root" => ToggleVfsRoot,
         "refresh" => Refresh,
         "quit" => Quit,
+        "quit-cd" => QuitCd,
+        "key-list" => PushMode(Box::new(Mode::Select(SelectSpec::key_list(Vec::new())))),
         "noop" => Noop,
         // Function-panel Enter sends an empty path; the reducer fills the cursor.
         "open" => Open { path: PathBuf::new() },

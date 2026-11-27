@@ -6,10 +6,12 @@
 //!
 //! The `lscolors.coloring` option (`@/settings/Extensions/lscolors`) picks the
 //! source table: `none` (off), `LS_COLORS` (the shell's env var — a no-op if
-//! unset), or `Palette` — the `PaletteRegistry`'s active named palette, browsable
-//! and editable under `@/settings/Extensions/lscolors/Themes` (see `LsColorsNode`
-//! below), seeded from the bundled `dark`/`light` presets in `presets.scm` so
-//! coloring works out of the box with no `LS_COLORS` in the environment.
+//! unset), `Palette` — the `PaletteRegistry`'s active named palette, browsable
+//! and editable under `@/settings/Extensions/lscolors/Palette` (see
+//! `LsColorsNode` below), seeded from the bundled `dark`/`light` presets in
+//! `presets.scm` so coloring works out of the box with no `LS_COLORS` in the
+//! environment — or `Themes`: directories in the active theme's `title-focused`
+//! color, bold, and everything else from the active palette.
 
 use std::cell::RefCell;
 use std::io;
@@ -17,11 +19,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard};
 
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 
 use crate::core::{
     AppState, ConfigWrite, Entry, ExtensionIntent, ExtensionValue, InputFormSpec, Intent, Mode, OptionStore,
-    OptionValue, KEY_ITEM,
+    OptionValue, Role, Theme, KEY_ITEM,
 };
 use crate::extension::settings::SettingsNode;
 use crate::extension::{About, Extension};
@@ -81,7 +83,15 @@ impl PaletteState {
 
 // ── LsColorsNode ──────────────────────────────────────────────────────────────
 
-/// Serves the `@/settings/Extensions/lscolors/Themes` subtree via the
+/// The settings node the palettes are browsed under.
+const NODE: &str = "Palette";
+
+/// `@/settings/Extensions/lscolors/Palette`: where the palettes are browsed.
+fn node_root() -> std::path::PathBuf {
+    vfs_root().join("settings").join("Extensions").join(ID).join(NODE)
+}
+
+/// Serves the `@/settings/Extensions/lscolors/Palette` subtree via the
 /// `SettingsNode` graft — the ls-colors analogue of `theme::ThemeNode`, minus
 /// the per-role editor: a palette's `raw` LS_COLORS string edits as one text
 /// field instead of per-key color pickers (the table has no fixed role set to
@@ -92,19 +102,19 @@ struct LsColorsNode {
 
 impl SettingsNode for LsColorsNode {
     fn anchor(&self) -> (&str, &str) {
-        (ID, "Themes")
+        (ID, NODE)
     }
 
     fn list(&self, path: &Path) -> io::Result<Vec<Entry>> {
         let reg = self.state.read().ok_or_else(|| io::Error::other("lscolors registry lock poisoned"))?;
 
         let depth = path.components().count();
-        // @/settings/Extensions/lscolors/Themes → depth 5
-        // @/settings/Extensions/lscolors/Themes/<name> → depth 6
-        let base = vfs_root().join("settings").join("Extensions").join(ID).join("Themes");
+        // @/settings/Extensions/lscolors/Palette → depth 5
+        // @/settings/Extensions/lscolors/Palette/<name> → depth 6
+        let base = node_root();
 
         if depth <= 5 {
-            // Root of Themes: one dir entry per palette, then `+ New palette…`.
+            // The node's root: one dir entry per palette, then `+ New palette…`.
             let active = reg.active().to_string();
             let mut entries: Vec<Entry> = reg.names().into_iter().map(|name| {
                 let np = reg.get(&name).unwrap();
@@ -220,6 +230,20 @@ impl LsColorsExtension {
     }
 }
 
+impl LsColorsExtension {
+    /// `entry`'s style in the active palette, parsed once per options generation.
+    fn palette_style(&self, store: &OptionStore, entry: &Entry) -> Option<Style> {
+        let generation = store.generation();
+        let stale = self.active_cache.borrow().as_ref().map(|(g, _)| *g != generation).unwrap_or(true);
+        if stale {
+            let table = self.state.read()?.resolve_active();
+            *self.active_cache.borrow_mut() = Some((generation, table));
+        }
+        let cache = self.active_cache.borrow();
+        parse::style_for(&cache.as_ref()?.1, entry)
+    }
+}
+
 impl Default for LsColorsExtension {
     fn default() -> Self {
         Self::new()
@@ -255,20 +279,18 @@ impl Extension for LsColorsExtension {
         vec![Arc::new(LsColorsNode { state: self.state.clone() })]
     }
 
-    fn entry_style(&self, entry: &Entry) -> Option<Style> {
+    fn entry_style(&self, entry: &Entry, theme: &Theme) -> Option<Style> {
         let store = self.state.options.get()?;
         match store.get_str("lscolors.coloring").as_str() {
             "LS_COLORS" => parse::style_for(&self.env_table, entry),
-            "Palette" => {
-                let generation = store.generation();
-                let stale = self.active_cache.borrow().as_ref().map(|(g, _)| *g != generation).unwrap_or(true);
-                if stale {
-                    let table = self.state.read()?.resolve_active();
-                    *self.active_cache.borrow_mut() = Some((generation, table));
-                }
-                let cache = self.active_cache.borrow();
-                parse::style_for(&cache.as_ref()?.1, entry)
+            "Palette" => self.palette_style(store, entry),
+            // The focused panel title's color — only its color: the role's
+            // own bg and modifiers stay out of the file list.
+            "Themes" if entry.is_dir => {
+                let fg = theme.style(Role::TitleFocused).fg?;
+                Some(Style::default().fg(fg).add_modifier(Modifier::BOLD))
             }
+            "Themes" => self.palette_style(store, entry),
             // "none" (or any unrecognized value) — no opinion.
             _ => None,
         }
@@ -434,8 +456,8 @@ impl Extension for LsColorsExtension {
                 {
                     out.push(PaletteState::write_active(first));
                 }
-                // The deleted palette's directory is gone — return to the Themes root.
-                out.push(Intent::NavigateTo(vfs_root().join("settings").join("Extensions").join(ID).join("Themes")));
+                // The deleted palette's directory is gone — return to the node's root.
+                out.push(Intent::NavigateTo(node_root()));
                 out
             }
 
@@ -502,7 +524,22 @@ mod tests {
         assert_eq!(e.state.read().unwrap().active(), "dark");
         run(&e, "set-active", ExtensionValue::String("light".into()));
         assert_eq!(e.state.read().unwrap().active(), "light");
-        assert!(e.entry_style(&entry("x", true)).is_some());
+        assert!(e.entry_style(&entry("x", true), &Theme::default()).is_some());
+    }
+
+    #[test]
+    fn themes_coloring_draws_directories_in_the_focused_title_color_and_files_from_the_palette() {
+        let e = bound_ext();
+        let store = e.state.options.get().unwrap();
+        assert!(store.set("lscolors.coloring", OptionValue::Text("Themes".into())));
+        let theme = Theme::default();
+        let dir = e.entry_style(&entry("src", true), &theme).unwrap();
+        assert_eq!(dir.fg, theme.style(Role::TitleFocused).fg);
+        assert!(dir.add_modifier.contains(Modifier::BOLD));
+        assert!(store.set("lscolors.coloring", OptionValue::Text("Palette".into())));
+        let in_palette = e.entry_style(&entry("a.rs", false), &theme);
+        assert!(store.set("lscolors.coloring", OptionValue::Text("Themes".into())));
+        assert_eq!(e.entry_style(&entry("a.rs", false), &theme), in_palette, "files follow the palette");
     }
 
 }

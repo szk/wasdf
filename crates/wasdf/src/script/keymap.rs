@@ -35,6 +35,9 @@ pub struct Binding {
     pub owner: Option<String>,
 }
 
+/// The help row's lead when the store sets no `help` order (doc/HELP.md).
+const DEFAULT_HELP_ORDER: &[&str] = &["cursor", "select", "edit", "find", "move", "delete", "shell", "quit", "help"];
+
 #[derive(Default)]
 pub struct KeymapRegistry {
     bindings: Vec<Binding>,
@@ -84,8 +87,7 @@ impl KeymapRegistry {
 
     /// Order the Extension layer by extension priority (`ranked`, highest
     /// first). Resolution keeps the first of equally specific bindings, so
-    /// this is what makes the higher-priority extension win a collision; the
-    /// help row's registration order follows it too.
+    /// this is what makes the higher-priority extension win a collision.
     pub fn set_extension_order(&mut self, ranked: &[String]) {
         let rank = |b: &Binding| {
             b.owner.as_ref().map_or(0, |o| ranked.iter().position(|r| r == o).unwrap_or(ranked.len()))
@@ -136,12 +138,14 @@ impl KeymapRegistry {
         panel: &str,
         key: Key,
     ) -> Option<&Binding> {
-        // Bindings fire on the press only. Once the Kitty protocol is enabled
-        // every keystroke also arrives as a release (and, held, as repeats);
-        // matching those too would fire every binding two or more times.
-        if key.kind != KeyKind::Press {
+        // A release never fires a binding (with the Kitty protocol every
+        // keystroke also arrives as one). A held key's repeat fires it again,
+        // as the repeated presses of a terminal without the protocol do — left
+        // unmatched it would fall through to text input instead.
+        if key.kind == KeyKind::Release {
             return None;
         }
+        let key = Key { kind: KeyKind::Press, ..key };
         for frame in state.modes.iter().rev() {
             let mode_id = frame.mode.id();
             if let Some(b) = self.resolve_in_mode(conds, state, &mode_id, panel, key) {
@@ -207,8 +211,7 @@ impl KeymapRegistry {
 impl KeymapRegistry {
     /// Every labelled binding in force right now, as `(chip, label)` pairs ready
     /// for the help row — keys sharing a label already merged, in the `help`
-    /// display order, then registration order (Core, then Extension by
-    /// priority, then User).
+    /// display order (or [`DEFAULT_HELP_ORDER`]), then alphabetically.
     ///
     /// Each candidate key is put back through [`resolve_binding`](Self::resolve_binding),
     /// so what is advertised is what would actually fire: a key bound twice is
@@ -236,10 +239,34 @@ impl KeymapRegistry {
                 None => groups.push((label, vec![b.key])),
             }
         }
-        // Labels the `help` order lists come first, in its order; the rest keep
-        // registration order (a stable sort).
-        groups.sort_by_key(|(label, _)| self.help_order.iter().position(|l| l == label).unwrap_or(usize::MAX));
+        // Labels the `help` order lists come first, in its order; the rest
+        // follow alphabetically.
+        let listed = |label: &str| match self.help_order.is_empty() {
+            true => DEFAULT_HELP_ORDER.iter().position(|l| *l == label),
+            false => self.help_order.iter().position(|l| l == label),
+        };
+        groups.sort_by_key(|(label, _)| match listed(label) {
+            Some(i) => (i, String::new()),
+            None => (usize::MAX, label.to_lowercase()),
+        });
         groups.into_iter().map(|(label, keys)| (chip(&keys), label)).collect()
+    }
+
+    /// Every binding that would fire in `state` and `panel`, one per key, in
+    /// registration order — what the key list (`?`) shows.
+    pub fn bindings_in_force(&self, conds: &Conditions, state: &AppState, panel: &str) -> Vec<&Binding> {
+        let mut seen: Vec<Key> = Vec::new();
+        let mut out = Vec::new();
+        for b in &self.bindings {
+            if seen.contains(&b.key) {
+                continue;
+            }
+            seen.push(b.key);
+            if let Some(winner) = self.resolve_binding(conds, state, panel, b.key) {
+                out.push(winner);
+            }
+        }
+        out
     }
 
     /// The keys, if any, that currently reach `intent` in `panel` — how the

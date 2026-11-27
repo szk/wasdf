@@ -309,15 +309,20 @@ impl PtyExtension {
             out.push(Intent::Notify(format!("{label}: {}", if ok { "ok" } else { "failed" })));
             crate::services::messages::log(format!("pty {id}: {label} finished"), !ok);
             // A file edited in the panel has a new size and mtime; the Suspend
-            // path already refreshes for exactly this reason.
-            if matches!(origin, Origin::Edit { .. }) {
+            // path already refreshes for exactly this reason. An editor's
+            // session has nothing left worth reading once it exits, so its slot
+            // goes too, as `pty-delete` would.
+            let edit = matches!(origin, Origin::Edit { .. });
+            if edit {
                 out.push(Intent::Refresh);
+                table.remove(id);
             }
             if self.attached.get() == Some(id) {
                 // The keyboard always comes back — a dead child cannot use it.
-                // Whether the *panel* also goes is the user's choice; keeping it
-                // leaves the final output readable and scrollable.
-                let close = match self.opt_str("pty.close-on-exit").as_str() {
+                // Whether the *panel* also goes is the user's choice (an
+                // editor's always does); keeping it leaves the final output
+                // readable and scrollable.
+                let close = edit || match self.opt_str("pty.close-on-exit").as_str() {
                     "always" => true,
                     "success" => ok,
                     _ => false,
@@ -371,7 +376,7 @@ impl Extension for PtyExtension {
     fn commands(&self) -> Vec<CommandDef> {
         // The release key detaches outright rather than opening a submenu, so
         // session management lives in the palette instead of behind a prefix.
-        ["next", "prev", "kill", "detach"]
+        ["next", "prev", "kill", "detach", "delete"]
             .into_iter()
             .map(|name| CommandDef {
                 name: format!("pty-{name}"),
@@ -464,6 +469,15 @@ impl Extension for PtyExtension {
             // `X`: always another one.
             "new-shell" => self.new_shell(state),
             "detach" => self.close(),
+            // `d` on a released session: stop its child and drop its slot, so
+            // it no longer appears among the sessions `h`/`l` step through.
+            "delete" => {
+                let Some(id) = self.attached_ok() else { return Vec::new() };
+                if let Some(mut s) = self.sessions.borrow_mut().remove(id) {
+                    s.kill();
+                }
+                self.close()
+            }
             "next" | "prev" => {
                 let target = self
                     .sessions
@@ -602,6 +616,44 @@ mod tests {
         let out = e.release();
         assert_eq!(out, vec![Intent::SetInputCapture(None)]);
         assert_eq!(e.attached.get(), Some(1), "still attached, just not captured");
+    }
+
+    #[test]
+    fn deleting_a_released_session_drops_its_slot_and_gives_the_panel_back() {
+        let e = ext();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        e.bind_events(tx);
+        let state = AppState::new(std::env::temp_dir());
+        let argv = vec!["sleep".to_string(), "30".to_string()];
+        e.spawn(Origin::Shell, "sleep".into(), argv, std::env::temp_dir(), &state);
+        let id = e.attached_ok().expect("spawned and attached");
+        e.release();
+        let out = e.handle_intent(&ei("delete"), &state);
+        assert!(e.sessions.borrow().get(id).is_none(), "the slot is gone");
+        assert_eq!(e.attached.get(), None);
+        assert_eq!(out, vec![Intent::SetInputCapture(None), Intent::SetFunctionForm(None)]);
+    }
+
+    #[test]
+    fn an_editor_that_exits_drops_its_slot_and_gives_the_panel_back() {
+        let e = ext();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        e.bind_events(tx);
+        let state = AppState::new(std::env::temp_dir());
+        let origin = Origin::Edit { path: std::env::temp_dir().join("x.txt") };
+        e.spawn(origin, "true".into(), vec!["true".into()], std::env::temp_dir(), &state);
+        let id = e.attached.get().expect("attached");
+        let mut out = Vec::new();
+        for _ in 0..500 {
+            out = e.reap();
+            if !out.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(e.sessions.borrow().get(id).is_none(), "the editor's slot is gone");
+        assert!(out.contains(&Intent::SetFunctionForm(None)), "{out:?}");
+        assert!(out.contains(&Intent::Refresh));
     }
 
     #[test]

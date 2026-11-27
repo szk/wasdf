@@ -21,6 +21,7 @@ ratatui = { workspace = true, features = ["crossterm"] }
 crossterm = { workspace = true }
 fuzzy-matcher = { workspace = true }
 tui-input = { workspace = true }
+unicode-width = "0.2"
 steel-core = "0.8"
 libloading = "0.8"
 libc = "0.2"

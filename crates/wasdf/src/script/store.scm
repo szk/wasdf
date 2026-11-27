@@ -116,12 +116,14 @@
 ;; through a lambda that calls its enclosing procedure: steel treats such a
 ;; call as the lambda's own tail self-call and fails with an arity error.
 
-;; Record / map keys may be written as symbols; they are stored as strings.
+;; Map keys may be written as symbols; they are stored as strings. A record
+;; keeps whichever of its fields are present, as symbols, in the order the kind
+;; declares them, so it reads (and persists) the way it was declared.
 (define (store--normalize kind v)
   (cond ((and (pair? kind) (list? v) (eq? (car kind) 'map))
          (store--normalize-pairs (lambda (name) (car (cdr kind))) v))
         ((and (pair? kind) (list? v) (eq? (car kind) 'record))
-         (store--normalize-pairs (lambda (name) (store--field-kind (cdr kind) name)) v))
+         (append (store--record-known (cdr kind) v) (store--record-unknown (cdr kind) v)))
         ((and (pair? kind) (list? v) (eq? (car kind) 'list))
          (store--normalize-items (car (cdr kind)) v))
         (else v)))
@@ -144,6 +146,28 @@
         (list name (if k (store--normalize k (car (cdr p))) (car (cdr p)))))
       p))
 
+(define (store--find-pair name pairs)
+  (cond ((null? pairs) #f)
+        ((and (store--pair? (car pairs)) (equal? (store--name (car (car pairs))) name)) (car pairs))
+        (else (store--find-pair name (cdr pairs)))))
+
+(define (store--record-known fields pairs)
+  (if (null? fields)
+      '()
+      (let* ((name (store--name (car (car fields))))
+             (p (store--find-pair name pairs))
+             (rest (store--record-known (cdr fields) pairs)))
+        (if p
+            (cons (list (string->symbol name) (store--normalize (car (cdr (car fields))) (car (cdr p)))) rest)
+            rest))))
+
+;; Fields the kind does not declare stay as written, so validation rejects them.
+(define (store--record-unknown fields pairs)
+  (cond ((null? pairs) '())
+        ((and (store--pair? (car pairs)) (store--field-kind fields (store--name (car (car pairs)))))
+         (store--record-unknown fields (cdr pairs)))
+        (else (cons (car pairs) (store--record-unknown fields (cdr pairs))))))
+
 (define (store--field-kind fields name)
   (cond ((null? fields) #f)
         ((equal? (store--name (car (car fields))) name) (car (cdr (car fields))))
@@ -159,7 +183,7 @@
         ((eq? (car kind) 'list) (and (list? v) (store--items-ok? (car (cdr kind)) v)))
         ((eq? (car kind) 'map) (and (list? v) (store--map-ok? (car (cdr kind)) v)))
         ((eq? (car kind) 'record)
-         (and (list? v) (= (length v) (length (cdr kind))) (store--record-ok? (cdr kind) v)))
+         (and (list? v) (<= (length v) (length (cdr kind))) (store--record-ok? (cdr kind) v)))
         (else #f)))
 
 (define (store--items-ok? kind xs)
@@ -179,7 +203,7 @@
   (cond ((null? pairs) #t)
         ((not (store--pair? (car pairs))) #f)
         (else
-         (let ((fk (store--field-kind fields (car (car pairs)))))
+         (let ((fk (store--field-kind fields (store--name (car (car pairs))))))
            (if (and fk (store--accepts? fk (car (cdr (car pairs)))))
                (store--record-ok? fields (cdr pairs))
                #f)))))

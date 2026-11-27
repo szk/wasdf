@@ -34,6 +34,11 @@ impl Notice {
 pub trait CommandLookup {
     fn intent_of(&self, name: &str) -> Option<Intent>;
     fn command_candidates(&self) -> Vec<crate::core::mode::Candidate>;
+    /// The key list's rows: every binding that would fire in `state`'s mode
+    /// and focused panel. Default none.
+    fn key_candidates(&self, _state: &AppState) -> Vec<crate::core::mode::Candidate> {
+        Vec::new()
+    }
     /// The selectable options (token, label) for a resolver op, for the command
     /// Select's checkboxes. Default none; the kernel supplies them from the chain.
     fn resolver_options(&self, _op: &str) -> Vec<(String, String)> {
@@ -553,6 +558,11 @@ pub fn apply_intent(state: &mut AppState, intent: Intent, ctx: &dyn CommandLooku
             state.quit = true;
             Effects::none()
         }
+        Intent::QuitCd => {
+            state.quit = true;
+            state.cd_on_quit = true;
+            Effects::none()
+        }
         Intent::Noop => Effects::none(),
         Intent::SetInputCapture(c) => {
             state.input_capture = c.as_deref().cloned();
@@ -700,12 +710,11 @@ fn select_move(state: &mut AppState, dir: Dir) -> Effects {
         // would be permanently unreachable here.
         sel.phase = SelectPhase::Navigate;
     } else {
-        match dir {
-            Dir::Down if !sel.results.is_empty() => {
-                sel.selected = (sel.selected + 1).min(sel.results.len() - 1);
-            }
-            Dir::Up => sel.selected = sel.selected.saturating_sub(1),
-            _ => {}
+        // The candidate list as drawn: one column (left/right do nothing), or
+        // the key list's columns — the same stepping rule either way.
+        let n = sel.results.len();
+        if let Some(i) = step_index(n, grid_rows(n, geom), sel.selected, dir) {
+            sel.selected = i;
         }
     }
     Effects::none()
@@ -904,6 +913,13 @@ fn push_mode(state: &mut AppState, mode: Mode, ctx: &dyn CommandLookup) -> Effec
                 && matches!(&spec.source, SelectSource::Static(c) if c.is_empty()) =>
         {
             Mode::Select(crate::core::SelectSpec::command_palette(ctx.command_candidates()))
+        }
+        // The key list describes the mode it was opened from, so it is filled
+        // before the push changes the mode.
+        Mode::Select(spec)
+            if spec.id == "key-list" && matches!(&spec.source, SelectSource::Static(c) if c.is_empty()) =>
+        {
+            Mode::Select(crate::core::SelectSpec::key_list(ctx.key_candidates(state)))
         }
         other => other,
     };
@@ -1252,6 +1268,10 @@ fn current_line_is_empty(text: &str, caret: usize) -> bool {
 fn raw_key(state: &mut AppState, key: Key) -> Effects {
     if state.function.search.input_active {
         readline_query(&mut state.function.search.query, &mut state.function.search.caret, key);
+        return Effects::none();
+    }
+    // A picker without an input (the key list) has nothing to type into.
+    if matches!(state.mode(), Mode::Select(spec) if matches!(spec.input, SelectInput::None)) {
         return Effects::none();
     }
     let Some(sel) = &mut state.select else {
@@ -1962,6 +1982,16 @@ mod tests {
         s.function.visible = true;
         mv(&mut s, Intent::FuncDown);
         assert_eq!(s.focused_panel, PANEL_FUNCTION, "shown, it takes focus as before");
+    }
+
+    #[test]
+    fn quit_cd_quits_and_asks_for_the_directory_to_be_handed_back() {
+        let mut s = AppState::new(std::path::PathBuf::from("/d"));
+        mv(&mut s, Intent::Quit);
+        assert!(s.quit && !s.cd_on_quit);
+        let mut s = AppState::new(std::path::PathBuf::from("/d"));
+        mv(&mut s, Intent::QuitCd);
+        assert!(s.quit && s.cd_on_quit);
     }
 
     #[test]

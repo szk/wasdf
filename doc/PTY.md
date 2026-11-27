@@ -250,7 +250,9 @@ reader thread calls it after the read loop ends and stores the status in
 since a child exiting leaves no trace in `AppState` for the deduplicated
 cursor-changed broadcast to notice — and emits the completion notice, the
 `@/messages` line, (for `Origin::Edit`) the Refresh, and the `close-on-exit`
-handling from there.
+handling from there. An editor (`Origin::Edit`) that exits is deleted outright
+(`pty-delete`): its slot is dropped and, if on screen, the panel given back,
+whatever `close-on-exit` says.
 
 ---
 
@@ -286,7 +288,8 @@ scroll like every other function-panel frame (§5): the output stays readable,
 `k`/`j` walk the scrollback, and `x` takes the keyboard back. `Enter` keeps
 core's meaning while released — Open, the file under the file cursor, via the
 resolver; the pty extension binds no Enter. Closing the panel outright is a
-separate action (`pty-detach`, or `pty.close-on-exit`).
+separate action (`pty-detach`, or `pty.close-on-exit`); `d` closes it and
+drops the session's slot as well (`pty-delete`).
 
 `Ctrl-C` is not special. Under capture it encodes to `\x03` and goes to the
 child, which is the whole point of a terminal panel. wasdf does not need its
@@ -405,6 +408,7 @@ on the path out of a capture:
 | `pty-detach` | give the panel back; the session keeps running |
 | `pty-next` / `pty-prev` | attach the next / previous session in id order |
 | `pty-kill` | kill the attached child |
+| `pty-delete` | kill the attached child and drop its session slot, giving the panel back |
 
 Sessions are reached with:
 
@@ -414,8 +418,9 @@ Sessions are reached with:
 | `X` | file / function panel | Always start another shell |
 | `e` | file panel | The editor on the file under the cursor (`pty.edit-host`) |
 | `h` / `l` | function panel, released | Step left / right through the open sessions |
+| `d` | function panel, released | Delete the session on screen (`pty-delete`): its child is stopped and its slot dropped (it takes `d` from the file cursor while released) |
 | `j` / `k` | function panel, released | Scroll the terminal (core's own bindings) |
-| `w` `a` `s` `d` | either | Move the file cursor — which gives the panel back to the preview |
+| `w` `a` `s` `d` | either | Move the file cursor — which gives the panel back to the preview (`d` is delete while released) |
 
 Stepping with `h`/`l` *shows* a session without
 grabbing the keyboard, since browsing terminals should not cost an escape per
@@ -621,7 +626,8 @@ with the extension id automatically and appears under
   The keyboard always comes back regardless (a dead child cannot use it), so
   `never` (the default) leaves the final output on screen and scrollable, which
   is usually what you want after a command finishes. `always` clears the panel
-  too; `success` clears it only on exit code 0.
+  too; `success` clears it only on exit code 0. An editor's session ignores
+  it: an exited editor is always deleted.
 
 Options are read through `Host.options`.
 
