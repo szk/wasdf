@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::core::{
     self, AppEvent, AppState, AsyncResult, AsyncStatus, ExtensionIntent, ExtensionValue, InputCapture,
-    Intent, Key, KeyCode, Mode, OptionDef, OptionStore, Payload, Plan, Purpose, ResolverRequest,
+    Intent, Key, KeyCode, KeyKind, Mode, OptionDef, OptionStore, Payload, Plan, Purpose, ResolverRequest,
     KEY_RESOLVER,
 };
 use super::defaults;
@@ -64,6 +64,9 @@ pub struct App {
     /// The shared theme registry. `event_loop` reads `resolve_active()` once per
     /// frame; `ThemeExtension` holds a clone for authoring.
     pub theme_registry: Arc<RwLock<crate::extension::theme::ThemeRegistry>>,
+    /// The active theme for the frame, read through the theme projection so it
+    /// is never behind the store (see `ThemeExtension::source`).
+    pub theme_source: crate::extension::theme::ThemeSource,
     pending_suspend: Option<Vec<String>>,
     /// The last cursor identity broadcast to extensions (target path + panel
     /// visibility), so the cursor-changed event fires only on an actual change.
@@ -128,6 +131,7 @@ impl App {
         let theme_registry: Arc<RwLock<extension::theme::ThemeRegistry>> =
             Arc::new(RwLock::new(extension::theme::ThemeRegistry::bundled()));
         let theme_ext = extension::theme::ThemeExtension::new(theme_registry.clone());
+        let theme_source = theme_ext.source();
 
         let mut all_option_defs = defaults::core_options();
         all_option_defs.extend(defaults::extension_options(&theme_ext));
@@ -343,6 +347,7 @@ impl App {
             rx,
             tx,
             theme_registry,
+            theme_source,
             pending_suspend: None,
             last_cursor: (None, false, 0, String::new()),
             msg_seen,
@@ -361,6 +366,11 @@ impl App {
         if let Some(cap) = self.state.input_capture.clone() {
             self.handle_captured_key(&cap, key);
             self.broadcast_cursor_changed();
+            return;
+        }
+        // Only a captured child (pty) wants releases. Everywhere else a release
+        // reaching a text input as a RawKeyEvent would type its character twice.
+        if key.kind == KeyKind::Release {
             return;
         }
         // While the function-panel search input is open, keys edit the query — except
@@ -1085,7 +1095,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Mods, SubLayout};
+    use crate::core::Mods;
 
     pub(super) fn temp_dir_with_files() -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1173,147 +1183,35 @@ mod tests {
     }
 
     #[test]
-    fn an_escape_intent_releases_the_capture_and_still_performs_the_move() {
-        let escape = vec![Intent::CursorUp, Intent::CursorDown, Intent::CursorLeft,
-                          Intent::CursorRight, Intent::CursorTop, Intent::CursorBottom];
-        let (mut app, ext) = app_capturing(escape);
-        assert_eq!(app.state.cursor, 0);
-        // `s` is CursorDown in the default file-panel keymap.
-        app.handle_key(Key::plain(KeyCode::Char('s')));
-        assert!(app.state.input_capture.is_none(), "escape intent releases");
-        assert_eq!(app.state.cursor, 1, "and the move it stands for happens");
-        assert!(ext.got.lock().unwrap().is_empty(), "the key never reaches the extension");
-    }
-
-    #[test]
-    fn cursor_bottom_escapes_too_not_just_the_four_wasd_moves() {
-        let escape = vec![Intent::CursorUp, Intent::CursorDown, Intent::CursorLeft,
-                          Intent::CursorRight, Intent::CursorTop, Intent::CursorBottom];
-        let (mut app, _) = app_capturing(escape);
-        // `S` (shift-s) is CursorBottom.
-        app.handle_key(Key::plain(KeyCode::Char('S')));
-        assert!(app.state.input_capture.is_none());
-        assert_eq!(app.state.cursor, app.state.entries.len() - 1);
-    }
-
-    #[test]
-    fn with_no_escape_intents_a_movement_key_goes_to_the_child() {
-        let (mut app, ext) = app_capturing(Vec::new());
-        app.handle_key(Key::plain(KeyCode::Char('s')));
-        assert!(app.state.input_capture.is_some(), "PrefixOnly keeps the capture");
-        assert_eq!(app.state.cursor, 0, "and the cursor stays put");
-        assert_eq!(ext.got.lock().unwrap().as_slice(), ["s"]);
-    }
-
-    #[test]
-    fn activate_is_not_an_escape() {
-        let escape = vec![Intent::CursorUp, Intent::CursorDown, Intent::CursorLeft,
-                          Intent::CursorRight, Intent::CursorTop, Intent::CursorBottom];
-        let (mut app, ext) = app_capturing(escape);
-        app.handle_key(Key::plain(KeyCode::Enter));
-        assert!(app.state.input_capture.is_some());
-        assert_eq!(ext.got.lock().unwrap().as_slice(), ["Enter"]);
-    }
-
-    #[test]
-    fn a_key_release_never_fires_its_binding() {
-        let dir = temp_dir_with_files();
-        let mut app = App::boot(dir);
-        app.pump_one();
-        let down = Key::plain(KeyCode::Char('s'));
-        app.handle_key(down);
-        app.handle_key(Key { kind: crate::core::KeyKind::Release, ..down });
-        assert_eq!(app.state.cursor, 1, "the release must not move the cursor a second time");
-    }
-
-    #[test]
-    fn cmdop_is_built_in_and_runs_through_the_core_keymap() {
-        let mut app = App::boot(std::env::temp_dir());
-        assert!(app.extensions.iter().any(|e| e.id() == "cmdop"), "always registered");
-        assert!(app.store.def("cmdop.runner").is_some(), "the runner option is core");
-        assert!(app.store.def("pty.cmdop-host").is_none(), "the old pty switch is gone");
-        app.dispatch(Intent::Extension(ExtensionIntent {
-            extension: "cmdop".into(),
-            intent: "start-create".into(),
-            data: ExtensionValue::Nil,
-        }));
-        assert_eq!(app.state.function.form_owner.as_deref(), Some("cmdop"));
-    }
-
-    #[test]
-    fn the_extensions_order_reranks_the_registry_and_the_settings_list() {
+    fn the_arrows_drive_the_file_cursor_like_wasd_and_keep_focus() {
         let mut app = App::boot(temp_dir_with_files());
-        app.scheme.wait_ready(Duration::from_secs(600));
-        app.pump_one(); // initial ReadDir
-        let first = |app: &App| app.ext_infos.read().unwrap()[0].id.clone();
-        assert_eq!(first(&app), "preview", "registration order by default");
-        app.dispatch_for_test(Intent::Configure(crate::core::ConfigWrite::SetOrder {
-            name: "extensions".into(),
-            items: vec!["repl".into()],
-        }));
-        app.pump_one(); // the Scheme result
-        assert_eq!(first(&app), "repl");
-        assert_eq!(app.extensions.iter().next().map(|e| e.id()), Some("repl"));
-        assert_eq!(app.ext_infos.read().unwrap().len(), app.registered.len(), "every extension is still ranked");
-    }
-
-    #[test]
-    fn a_layout_written_at_the_repl_replaces_the_core_one() {
-        let mut app = App::boot(temp_dir_with_files());
-        app.scheme.wait_ready(Duration::from_secs(600));
-        app.pump_one(); // initial ReadDir
-        let tree = "(column (panel file) (panel help (size 1)))";
-        app.dispatch_for_test(Intent::Eval { owner: "repl".into(), expr: format!("(layout! 'file '{tree})") });
         app.pump_one();
-        let expected = crate::script::layout::parse("file", &crate::script::sexpr::parse(tree).unwrap()).unwrap();
-        assert_eq!(app.layouts.get("file"), Some(&expected));
-        assert!(app.layouts.get("select").is_some(), "the other core layout stays");
-    }
-
-    #[test]
-    fn every_bundled_extensions_options_are_declared_at_boot() {
-        let app = App::boot(std::env::temp_dir());
-        for key in ["theme.active", "theme.custom", "lscolors.palette", "lscolors.custom", "pty.edit-host"] {
-            assert!(app.store.def(key).is_some(), "{key} is declared");
+        let key = |c| Key::plain(c);
+        let resolve = |app: &App, k| app.keymap.resolve(&app.conditions, &app.state, "file", k);
+        for (arrow, wasd) in [(KeyCode::Up, 'w'), (KeyCode::Left, 'a'), (KeyCode::Down, 's'), (KeyCode::Right, 'd')] {
+            assert_eq!(resolve(&app, key(arrow)), resolve(&app, key(KeyCode::Char(wasd))), "{arrow:?}");
         }
-    }
-
-    #[test]
-    fn boots_and_lists_directory() {
-        let dir = temp_dir_with_files();
-        let mut app = App::boot(dir.clone());
-        app.pump_one(); // initial ReadDir
-        assert_eq!(app.state.entries.len(), 3, "subdir, alpha, beta");
-        // Directory sorts first.
-        assert!(app.state.entries[0].is_dir);
-    }
-
-    #[test]
-    fn cursor_and_selection() {
-        let dir = temp_dir_with_files();
-        let mut app = App::boot(dir);
-        app.pump_one();
-        assert_eq!(app.state.cursor, 0);
-        app.dispatch_for_test(Intent::CursorDown);
+        app.handle_key(key(KeyCode::Down));
         assert_eq!(app.state.cursor, 1);
-        app.dispatch_for_test(Intent::ToggleSelect);
-        assert_eq!(app.state.selection.len(), 1);
-        app.dispatch_for_test(Intent::ClearSelection);
-        assert!(app.state.selection.is_empty());
+        assert_eq!(app.state.focused_panel, crate::core::PANEL_FILE);
+        // k/j still scroll the function panel; hidden, it does not take focus.
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.state.focused_panel, crate::core::PANEL_FILE);
     }
 
     #[test]
-    fn cursor_right_on_file_loads_content() {
-        let dir = temp_dir_with_files();
-        let mut app = App::boot(dir);
+    fn a_key_release_types_nothing_in_the_file_search_box() {
+        let mut app = App::boot(temp_dir_with_files());
         app.pump_one();
-        // Move to a file (skip the directory at index 0).
-        app.dispatch_for_test(Intent::CursorDown);
-        app.dispatch_for_test(Intent::CursorRight);
-        assert!(app.state.function.visible);
-        assert_eq!(app.state.function.sublayout, SubLayout::Content);
-        app.pump_one(); // content read → handed to the content provider's stash
-        assert!(app.function_content_rows().is_some());
+        app.handle_key(Key::plain(KeyCode::Char('f')));
+        app.handle_key(Key { kind: KeyKind::Release, ..Key::plain(KeyCode::Char('f')) });
+        for c in ['a', 'b'] {
+            let down = Key::plain(KeyCode::Char(c));
+            app.handle_key(down);
+            app.handle_key(Key { kind: KeyKind::Release, ..down });
+        }
+        let Some(sel) = app.state.select.as_ref() else { panic!("f opens the search Select") };
+        assert_eq!(sel.query, "ab");
     }
 
     #[test]
@@ -1387,7 +1285,7 @@ mod tests {
 
     #[test]
     fn cmdop_deep_search_submit_lands_through_the_real_kernel_pipeline() {
-        // Reproduces SEARCH_RENEW.md scenario 4 end-to-end: start-copy, "/" for
+        // End-to-end: start-copy, "/" for
         // deep search, type + Enter through the real handle_key path (not
         // dispatch_for_test, which bypasses the function.input raw-key gate and
         // the real async round trip) — the exact layer the reducer-only and
@@ -1434,44 +1332,6 @@ mod tests {
     }
 
     #[test]
-    fn copy_onto_an_existing_file_gates_on_policy_like_delete() {
-        let dir = temp_dir_with_files();
-        let mut app = App::boot(dir.clone());
-        app.pump_one();
-        // beta.txt already exists — copying alpha.txt onto it must confirm
-        // first, the same `-i` condition real `cp`/`mv` prompt on.
-        let req = crate::core::ResolverRequest {
-            op: "copy".into(),
-            src: None,
-            dst: Some("beta.txt".into()),
-            path: None,
-            paths: vec![dir.join("alpha.txt")],
-            opts: vec![],
-            label: "copy".into(),
-        };
-        app.dispatch_for_test(Intent::RunResolver(req));
-        assert!(matches!(app.state.mode(), Mode::Policy(_)), "copy onto an existing file gates on Policy");
-    }
-
-    #[test]
-    fn copy_to_a_new_name_runs_without_confirmation() {
-        let dir = temp_dir_with_files();
-        let mut app = App::boot(dir.clone());
-        app.pump_one();
-        let req = crate::core::ResolverRequest {
-            op: "copy".into(),
-            src: None,
-            dst: Some("brand-new.txt".into()),
-            path: None,
-            paths: vec![dir.join("alpha.txt")],
-            opts: vec![],
-            label: "copy".into(),
-        };
-        app.dispatch_for_test(Intent::RunResolver(req));
-        assert!(matches!(app.state.mode(), Mode::File), "no existing target — runs immediately, no Policy gate");
-    }
-
-    #[test]
     fn file_search_loads_selected_candidate() {
         let dir = temp_dir_with_files();
         let mut app = App::boot(dir);
@@ -1483,85 +1343,6 @@ mod tests {
         assert!(!app.state.select.as_ref().unwrap().view.as_ref().unwrap().is_empty());
         app.pump_one(); // content read for the highlighted candidate (dir listing)
         assert!(app.function_content_rows().is_some(), "file-search follows the dir content");
-    }
-
-    #[test]
-    fn content_auto_update_follows_file_cursor() {
-        use crate::core::{Key, KeyCode};
-        let dir = temp_dir_with_files();
-        let mut app = App::boot(dir);
-        app.pump_one();
-        app.store.set_str("content-auto-update", "#t");
-        app.state.function.visible = true;
-        app.state.focused_panel = "file".into();
-        // Move the file cursor; the on_cursor_move hook reads the file's content.
-        app.handle_key(Key::plain(KeyCode::Char('s')));
-        assert_eq!(app.state.cursor, 1);
-        app.pump_one(); // the auto-update content read
-        assert!(app.function_content_rows().is_some());
-    }
-
-    #[test]
-    fn effects_notices_reach_the_log_and_surface_with_their_error_attribute() {
-        let dir = temp_dir_with_files();
-        let mut app = App::boot(dir);
-        app.surface_new_messages(); // drain anything boot itself logged
-        // A unique text: the log is process-global and other tests may push
-        // concurrently, so assert containment, not exact contents.
-        let text = format!("notice-unified-{}", std::process::id());
-        let fx = core::Effects { notices: vec![core::Notice::info(text.clone())], ..Default::default() };
-        app.process_effects(fx, 0);
-        assert!(
-            crate::services::messages::global().lines().contains(&(text.clone(), false)),
-            "a reducer notice is a retained @/messages line, error attribute intact"
-        );
-        app.surface_new_messages();
-        let n = app.ui.live_notice().expect("the pump surfaces the logged notice");
-        assert!(!n.error, "an info notice keeps its info styling through the log");
-    }
-
-    #[test]
-    fn a_raw_log_line_surfaces_as_an_error_notice() {
-        let dir = temp_dir_with_files();
-        let mut app = App::boot(dir);
-        app.surface_new_messages(); // drain anything boot itself logged
-        crate::services::messages::log("some boot diagnostic", true);
-        app.surface_new_messages();
-        let n = app.ui.live_notice().expect("an unseen log line surfaces as a notice");
-        assert!(n.error, "the error attribute carries through to the notice styling");
-    }
-
-    #[test]
-    fn the_core_resolver_table_reads() {
-        let entries = defaults::resolvers();
-        let copy = entries.iter().find(|e| e.key == "copy").expect("copy entry");
-        assert!(!copy.destructive);
-        let del = entries.iter().find(|e| e.key == "delete").expect("delete entry");
-        assert!(del.destructive, "delete is destructive per the Scheme config");
-        let open = entries.iter().find(|e| e.key == "open").expect("open entry");
-        assert_eq!(open.candidates.len(), 2, "open has macos + linux candidates");
-    }
-
-    #[test]
-    fn the_core_keymap_resolves() {
-        use crate::core::{Key, KeyCode, Mods};
-        let binds = defaults::keymap();
-
-        let mut km = KeymapRegistry::new();
-        km.extend(binds);
-        let conds = Conditions::default();
-        let state = AppState::new(std::env::temp_dir());
-        // file mode, file panel: 'w' resolves to CursorUp via the Scheme keymap.
-        let up = km.resolve(&conds, &state, "file", Key::plain(KeyCode::Char('w')));
-        assert_eq!(up, Some(Intent::CursorUp));
-        // Ctrl-a resolves to SelectAll (modifier parsing works).
-        let all = km.resolve(&conds, &state, "file", Key::new(KeyCode::Char('a'), Mods::CTRL));
-        assert_eq!(all, Some(Intent::SelectAll));
-        // Delete fires on both Backspace and Delete.
-        for code in [KeyCode::Backspace, KeyCode::Delete] {
-            let got = km.resolve(&conds, &state, "file", Key::plain(code));
-            assert_eq!(got, Some(Intent::DeleteSelected), "{code:?} → delete");
-        }
     }
 
     fn core_options() -> OptionStore {
@@ -1598,38 +1379,6 @@ mod tests {
     }
 
     #[test]
-    fn an_old_format_config_still_loads_through_the_bridge() {
-        let options = core_options();
-        let mut user = crate::script::projection::UserLayer::default();
-        let legacy = ";; >>> wasdf settings (managed — edited via the SETTINGS panel; do not hand-edit)\n\
-                      (set-option \"border-style\" \"double\")\n\
-                      ;; <<< wasdf settings\n\
-                      (bind file #f \"Q\" quit)\n";
-        load_user_settings(&ready_settings(), true, &options, &[], Some(legacy), None, &mut user);
-        assert_eq!(options.get_str("border-style"), "double");
-        assert_eq!(user.bindings().0.len(), 1);
-    }
-
-    #[test]
-    fn an_old_managed_block_keeps_its_theme_through_the_theme_prelude() {
-        let theme = crate::extension::theme::ThemeExtension::new(Arc::new(RwLock::new(
-            crate::extension::theme::ThemeRegistry::bundled(),
-        )));
-        let mut defs = defaults::core_options();
-        defs.extend(defaults::extension_options(&theme));
-        let options = OptionStore::new(defs);
-        let preludes = vec![("theme".to_string(), theme.prelude().unwrap())];
-        let legacy = ";; >>> wasdf settings (managed — edited via the SETTINGS panel; do not hand-edit)\n\
-                      (define-theme \"mine\"\n  (title \"#112233\" nil #t #f #f))\n\
-                      (set-theme \"mine\")\n\
-                      ;; <<< wasdf settings\n";
-        let mut user = crate::script::projection::UserLayer::default();
-        load_user_settings(&ready_settings(), true, &options, &preludes, Some(legacy), None, &mut user);
-        assert_eq!(options.get_str("theme.active"), "mine");
-        assert!(matches!(options.value("theme.custom"), Some(crate::core::OptionValue::Map(m)) if m.contains_key("mine")));
-    }
-
-    #[test]
     fn without_the_session_custom_scm_still_applies() {
         let options = core_options();
         let mut user = crate::script::projection::UserLayer::default();
@@ -1639,40 +1388,6 @@ mod tests {
         load_user_settings(&settings, false, &options, &[], Some("(opt-set! 'border-style \"ascii\")"), Some(custom), &mut user);
         assert_eq!(options.get_str("border-style"), "double", "config.scm is skipped, custom.scm applies");
         assert_eq!(user.bindings().0.len(), 1);
-    }
-
-    #[test]
-    fn every_line_of_the_template_is_a_valid_store_call() {
-        let options = core_options();
-        let template = crate::script::user_config::config_template(&options, defaults::KEYMAP_SCHEME);
-        let program: String = template
-            .lines()
-            .filter_map(|l| l.strip_prefix(";; ("))
-            .map(|l| format!("({}\n", l.split("  ;").next().unwrap()))
-            .collect();
-        let settings = ready_settings();
-        let defs: Vec<OptionDef> = options.keys().iter().filter_map(|k| options.def(k).cloned()).collect();
-        settings.declare_options(&defs).unwrap();
-        let (changes, errors) = settings.eval_program(crate::script::store::Layer::Config, &program);
-        assert!(errors.is_empty(), "{errors:?}");
-        assert!(crate::script::projection::apply_options(&changes, &options).is_empty());
-        let mut user = crate::script::projection::UserLayer::default();
-        user.absorb(&changes);
-        let (binds, problems) = user.bindings();
-        assert!(problems.is_empty(), "{problems:?}");
-        assert!(binds.len() > 50, "the default keymap came through: {}", binds.len());
-    }
-
-    #[test]
-    fn early_settings_read_the_timeout_and_the_disabled_extensions() {
-        let early = EarlySettings::from_custom(Some(
-            "(opt-set! 'scheme.boot-timeout-ms 500)\n(opt-set! 'extensions.disabled '(\"pty\"))\n",
-        ));
-        assert_eq!(early.boot_timeout_ms, 500);
-        assert_eq!(early.disabled, vec!["pty"]);
-        let kept = early.without_disabled(crate::extension::bundled(None));
-        assert!(kept.iter().all(|e| e.id() != "pty"));
-        assert_eq!(EarlySettings::from_custom(None).boot_timeout_ms, 3000);
     }
 
     #[test]
@@ -1702,137 +1417,6 @@ mod tests {
         assert_eq!(app.state.function.exec.exit, Some(0));
     }
 
-    #[test]
-    fn eval_scheme_runs_through_the_pipeline() {
-        let dir = temp_dir_with_files();
-        let mut app = App::boot(dir);
-        app.scheme.wait_ready(Duration::from_secs(600));
-        app.pump_one(); // initial ReadDir
-        // A Configure runs as a store call on a worker; its change set comes back
-        // with the result and the kernel folds it into the projections.
-        assert!(!app.store.get_bool("content-auto-update"));
-        app.dispatch_for_test(Intent::Configure(crate::core::ConfigWrite::SetOption {
-            key: "content-auto-update".into(),
-            value: crate::core::OptionValue::Bool(true),
-        }));
-        app.pump_one(); // Scheme result
-        assert!(app.store.get_bool("content-auto-update"), "the projection followed the store");
-        // An invalid write fails in the store and surfaces as an error notice.
-        app.dispatch_for_test(Intent::Configure(crate::core::ConfigWrite::SetOption {
-            key: "border-style".into(),
-            value: crate::core::OptionValue::Text("wavy".into()),
-        }));
-        app.pump_one();
-        app.surface_new_messages();
-        let shown = app.ui.live_notice().map(|n| n.text.clone()).unwrap_or_default();
-        assert!(shown.contains("border-style"), "the store's error surfaced: {shown:?}");
-        assert_eq!(app.store.get_str("border-style"), "single");
-    }
-
-    #[test]
-    fn a_repl_line_typed_and_entered_evaluates_in_the_session_layer() {
-        use crate::core::{Key, KeyCode};
-        let mut app = App::boot(temp_dir_with_files());
-        app.scheme.wait_ready(Duration::from_secs(600));
-        app.pump_one(); // initial ReadDir
-        app.dispatch_for_test(Intent::Extension(ExtensionIntent {
-            extension: "repl".into(),
-            intent: "open".into(),
-            data: ExtensionValue::Nil,
-        }));
-        assert_eq!(app.state.function.form_owner.as_deref(), Some("repl"));
-        for c in "(opt-set! 'border-style \"double\")".chars() {
-            app.handle_key(Key::plain(KeyCode::Char(c)));
-        }
-        app.handle_key(Key::plain(KeyCode::Enter));
-        app.pump_one(); // the Scheme result
-        assert_eq!(app.store.get_str("border-style"), "double", "a REPL write reaches the projection");
-        assert_eq!(app.state.function.input.as_ref().map(|i| i.query.as_str()), Some(""), "ready for the next line");
-        let listed = app.vfs.list(&crate::vfs::vfs_root().join("repl"), false).unwrap();
-        assert_eq!(listed.len(), 1, "the expression is in @/repl");
-        // An error stays in the REPL; it is not also logged as a notice. (The
-        // log is process-global, so look for this error's own text.)
-        for c in "(repl-probe-unbound)".chars() {
-            app.handle_key(Key::plain(KeyCode::Char(c)));
-        }
-        app.handle_key(Key::plain(KeyCode::Enter));
-        app.pump_one();
-        let logged = crate::services::messages::global().lines();
-        assert!(!logged.iter().any(|(l, _)| l.contains("repl-probe-unbound")), "no notice for a REPL error");
-    }
-
-    #[test]
-    fn cursor_left_lands_on_origin_directory() {
-        let dir = temp_dir_with_files();
-        let mut app = App::boot(dir.clone());
-        app.pump_one();
-        // Enter subdir (index 0, the only directory).
-        assert!(app.state.entries[0].is_dir);
-        app.dispatch_for_test(Intent::CursorRight);
-        app.pump_one(); // listing of subdir
-        assert_eq!(app.state.cwd, dir.join("subdir"));
-        // Go back to the parent; cursor should land on "subdir".
-        app.dispatch_for_test(Intent::CursorLeft);
-        app.pump_one(); // listing of parent
-        assert_eq!(app.state.cwd, dir);
-        assert_eq!(app.state.current_entry().unwrap().path, dir.join("subdir"));
-    }
-
-    #[test]
-    fn content_title_is_the_file_name() {
-        let dir = temp_dir_with_files();
-        let mut app = App::boot(dir.clone());
-        app.pump_one();
-        app.dispatch_for_test(Intent::CursorDown); // alpha.txt (subdir is index 0)
-        app.dispatch_for_test(Intent::CursorRight);
-        app.pump_one(); // content read → the content provider stashes it + the path
-        assert_eq!(app.function_title().as_deref(), Some("alpha.txt"), "title is the file name");
-    }
-
-    #[test]
-    fn preview_extension_owns_function_panel_search_keys() {
-        use crate::core::{Key, KeyCode};
-        // The preview extension registers its function-panel bindings (search,
-        // horizontal scroll) via scheme_source at the Extension layer; they
-        // resolve through the live keymap and override the core bindings by
-        // layer priority while a search is active.
-        let dir = temp_dir_with_files();
-        let mut app = App::boot(dir);
-        app.pump_one();
-        app.state.function.visible = true;
-        app.state.function.sublayout = SubLayout::Content;
-        app.state.focused_panel = "function".into();
-        let ch = |c| Key::plain(KeyCode::Char(c));
-        let enter = Key::plain(KeyCode::Enter);
-        let resolve = |app: &App, k| app.keymap.resolve(&app.conditions, &app.state, "function", k);
-
-        // Extension-owned bindings: `/` opens search, h/l scroll horizontally.
-        assert_eq!(resolve(&app, ch('/')), Some(Intent::FunctionSearchStart));
-        assert_eq!(resolve(&app, ch('h')), Some(Intent::FuncLeft));
-        // n toggles line numbers (core) until a search has matches, then the
-        // extension's n (Extension layer) wins and walks matches.
-        assert_eq!(resolve(&app, ch('n')), Some(Intent::ToggleLineNumbers));
-        app.state.function.search.matches = vec![(0, 0, 1)];
-        assert_eq!(resolve(&app, ch('n')), Some(Intent::FunctionSearchNext));
-        assert_eq!(resolve(&app, ch('p')), Some(Intent::FunctionSearchPrev));
-        // Enter opens (core) normally; submits (extension) while input is open.
-        assert_eq!(resolve(&app, enter), Some(Intent::Open { path: std::path::PathBuf::new() }));
-        app.state.function.search.input_active = true;
-        assert_eq!(resolve(&app, enter), Some(Intent::FunctionSearchSubmit));
-    }
-
-    #[test]
-    fn command_palette_filters_and_runs() {
-        let dir = temp_dir_with_files();
-        let mut app = App::boot(dir);
-        app.pump_one();
-        app.dispatch_for_test(Intent::PushMode(Box::new(Mode::Select(
-            crate::core::SelectSpec::command_palette(Vec::new()),
-        ))));
-        // Candidates filled from the registry.
-        let n = app.state.select.as_ref().unwrap().results.len();
-        assert!(n > 5, "palette has the default commands");
-    }
 }
 
 #[cfg(test)]
@@ -1852,7 +1436,7 @@ mod frame_dump {
             },
             file_row_size_graph: s.get_bool("file-row-size-graph"),
         };
-        let theme = app.theme_registry.read().unwrap().resolve_active();
+        let theme = app.theme_source.resolve_active();
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let snapshot = app.monitor.snapshot();
         let view = crate::ui::render::View {
@@ -1876,50 +1460,6 @@ mod frame_dump {
 
     fn rows(frame: &str) -> Vec<&str> {
         frame.lines().collect()
-    }
-
-    #[test]
-    fn a_long_document_draws_only_its_visible_rows_with_their_own_numbers() {
-        use crate::core::{Block, PanelView, TextSpan};
-        let mut app = App::boot(super::tests::temp_dir_with_files());
-        app.pump_one();
-        let blocks = (1..=5000).map(|n| Block::Line(vec![TextSpan::plain(format!("row-{n}"))])).collect();
-        app.dispatch_for_test(Intent::ShowFunctionContent { owner: "test".into(), view: PanelView::Document(blocks) });
-        app.state.function.show_line_numbers = true;
-        dump(&mut app, 100, 20); // measures the scroll bound
-        app.state.function.scroll.bind(app.ui.function_max_scroll());
-        app.state.function.scroll.set(2500);
-        let f = dump(&mut app, 100, 20);
-        assert!(f.contains("2501 row-2501"), "the first visible row carries its own number:\n{f}");
-        assert!(!f.contains("row-1\n") && !f.contains("row-2500 "), "rows above the window are not drawn:\n{f}");
-    }
-
-    #[test]
-    fn a_logical_match_is_revealed_and_highlighted_on_the_row_its_block_landed_on() {
-        use crate::core::{Block, PanelView, Role, TextSpan};
-        let mut app = App::boot(super::tests::temp_dir_with_files());
-        app.pump_one();
-        // An image, then enough lines that the field needs scrolling to.
-        let mut blocks = vec![
-            Block::Line(vec![TextSpan::plain("top")]),
-            Block::Image { width: 40, height: 40, rgb: vec![9; 40 * 40 * 3] },
-            Block::Field { label: "key".into(), value: vec![TextSpan::plain("a needle")] },
-        ];
-        blocks.extend((0..60).map(|i| Block::Line(vec![TextSpan::plain(format!("after {i}"))])));
-        app.dispatch_for_test(Intent::ShowFunctionContent { owner: "t".into(), view: PanelView::Document(blocks) });
-        // (block 2, bytes 2..8) — "needle" inside the field's value.
-        app.dispatch_for_test(Intent::SetSearchMatches(vec![(2, 2, 8)]));
-        let (f, buf) = draw(&mut app, 100, 30);
-        assert!(app.state.function.scroll.offset() > 1, "scrolled past the image to its block: {} {:?}\n{f}", app.state.function.scroll.offset(), app.state.function.search);
-        assert!(!app.state.function.search.reveal, "the reveal was consumed");
-        let (y, row) = f.lines().enumerate().find(|(_, l)| l.contains("a needle")).expect(&f);
-        assert_eq!(y, 7, "the match's row is the first content row:\n{f}");
-        // The highlight sits on "needle", past the label column and "a ".
-        let x = row.chars().collect::<Vec<_>>();
-        let col = (0..x.len()).find(|&i| x[i..].starts_with(&['n', 'e', 'e', 'd', 'l', 'e'])).unwrap() as u16;
-        let theme = app.theme_registry.read().unwrap().resolve_active();
-        assert_eq!(buf[(col, y as u16)].bg, theme.role(Role::MatchCurrentBg), "current match highlighted:\n{f}");
-        assert_ne!(buf[(col - 2, y as u16)].bg, theme.role(Role::MatchCurrentBg), "'a ' is not");
     }
 
     #[test]

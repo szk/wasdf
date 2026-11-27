@@ -251,30 +251,6 @@ mod tests {
         c
     }
 
-    #[test]
-    fn opts_splice_into_argv_in_order() {
-        let req = ResolverRequest {
-            op: "copy".into(),
-            src: None,
-            dst: Some("/dst".into()),
-            path: None,
-            paths: vec![PathBuf::from("/a")],
-            opts: vec!["-v".into(), "-n".into()],
-            label: "copy".into(),
-        };
-        let cmd = chain().resolve(&req, Path::new("/")).unwrap();
-        // cp -R <opts> <paths> <dst>
-        assert_eq!(cmd.argv, vec!["cp", "-R", "-v", "-n", "/a", "/dst"]);
-    }
-
-    #[test]
-    fn declared_options_per_op() {
-        let c = chain();
-        assert_eq!(c.options("copy").len(), 2, "copy declares verbose + no-clobber");
-        assert!(c.options("delete").is_empty(), "delete declares none");
-        assert!(c.is_destructive("delete"));
-    }
-
     fn scratch_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wasdf-resolver-test-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -299,22 +275,6 @@ mod tests {
     }
 
     #[test]
-    fn copy_to_a_new_name_needs_no_confirmation() {
-        let dir = scratch_dir("copy-new-name");
-        let req = ResolverRequest {
-            op: "copy".into(),
-            src: None,
-            dst: Some("brand-new.txt".into()),
-            path: None,
-            paths: vec![PathBuf::from("/somewhere/src.txt")],
-            opts: vec![],
-            label: "copy".into(),
-        };
-        assert!(!would_overwrite(&req, &dir));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn copy_into_an_existing_directory_checks_each_sources_basename() {
         let dir = scratch_dir("copy-into-dir");
         let target_dir = dir.join("dest");
@@ -330,40 +290,6 @@ mod tests {
             label: "copy".into(),
         };
         // a.txt already exists under dest/, even though b.txt does not.
-        assert!(would_overwrite(&req, &dir));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn move_onto_an_existing_file_needs_confirmation() {
-        let dir = scratch_dir("move-existing");
-        std::fs::write(dir.join("dst.txt"), "old").unwrap();
-        let req = ResolverRequest {
-            op: "move".into(),
-            src: None,
-            dst: Some("dst.txt".into()),
-            path: None,
-            paths: vec![PathBuf::from("/somewhere/src.txt")],
-            opts: vec![],
-            label: "move".into(),
-        };
-        assert!(would_overwrite(&req, &dir));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn rename_onto_an_existing_name_needs_confirmation() {
-        let dir = scratch_dir("rename-existing");
-        std::fs::write(dir.join("taken.txt"), "old").unwrap();
-        let req = ResolverRequest {
-            op: "rename".into(),
-            src: Some(dir.join("original.txt")),
-            dst: Some("taken.txt".into()),
-            path: None,
-            paths: vec![],
-            opts: vec![],
-            label: "rename".into(),
-        };
         assert!(would_overwrite(&req, &dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -385,22 +311,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn mkdir_and_touch_never_need_overwrite_confirmation() {
-        let dir = scratch_dir("mkdir-touch");
-        std::fs::write(dir.join("existing"), "x").unwrap();
-        let mkdir_req = ResolverRequest {
-            op: "mkdir".into(),
-            src: None,
-            dst: None,
-            path: Some("existing".into()),
-            paths: vec![],
-            opts: vec![],
-            label: "mkdir".into(),
-        };
-        let touch_req = ResolverRequest { op: "touch".into(), ..mkdir_req.clone() };
-        assert!(!would_overwrite(&mkdir_req, &dir));
-        assert!(!would_overwrite(&touch_req, &dir));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

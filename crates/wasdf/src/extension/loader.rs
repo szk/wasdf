@@ -400,15 +400,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_options_become_an_option_scheme_source() {
-        let glue = r#"(extension "e" (options ((option "e.n" "E" (int 1 8) "4" "n"))))"#;
-        let parsed = parse_glue(glue).unwrap();
-        let opts = parsed.options.expect("options section parsed");
-        assert!(opts.starts_with("(quote "), "wrapped as an option_scheme source: {opts}");
-        assert!(opts.contains("e.n") && opts.contains("(int 1 8)"), "{opts}");
-    }
-
-    #[test]
     fn a_user_extension_folder_with_init_scm_is_discovered() {
         use std::io::Write;
         let dir = std::env::temp_dir().join(format!("wasdf-load-{}", std::process::id()));

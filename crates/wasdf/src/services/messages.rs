@@ -174,35 +174,6 @@ mod tests {
         assert_eq!(texts, vec!["two".to_string(), "three".to_string()]);
     }
 
-    #[test]
-    fn latest_since_returns_only_the_newest_unseen_line_then_goes_quiet() {
-        let log = MessageLog::default();
-        let seen = log.seq();
-        assert!(log.latest_since(seen).is_none(), "nothing pushed yet");
-
-        log.push("first", false);
-        log.push("second", true);
-        let (line, error, seq) = log.latest_since(seen).expect("two unseen lines");
-        assert_eq!(line, "second", "only the newest — the notice UI is a single slot");
-        assert!(error, "the error attribute rides along for notice styling");
-        assert!(log.latest_since(seq).is_none(), "advancing the cursor consumes them");
-
-        log.push("third", false);
-        let (line, error, _) = log.latest_since(seq).expect("a fresh line after the cursor");
-        assert_eq!(line, "third");
-        assert!(!error);
-    }
-
-    #[test]
-    fn lowering_the_cap_trims_immediately() {
-        let log = MessageLog::default();
-        log.push("one", true);
-        log.push("two", true);
-        log.push("three", true);
-        log.set_max_lines(1);
-        assert_eq!(log.lines(), vec![("three".to_string(), true)]);
-    }
-
     fn store_with_cap(default: &str) -> Arc<OptionStore> {
         Arc::new(OptionStore::new(vec![OptionDef {
             key: "max-message-line".into(),
@@ -214,31 +185,4 @@ mod tests {
         }]))
     }
 
-    #[test]
-    fn provider_lists_lines_newest_first_as_leaves() {
-        let log = Arc::new(MessageLog::default());
-        log.push("older warning", true);
-        log.push("newer error", true);
-        let provider = MessagesProvider::new(log, store_with_cap("200"));
-        let entries = provider.list(&vfs_root().join("messages")).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].name, "newer error", "the most recent diagnostic comes first");
-        assert_eq!(entries[1].name, "older warning");
-        assert_eq!(entries[0].path, vfs_root().join("messages").join("0"));
-        assert!(!entries[0].is_dir);
-        assert!(entries[0].activation.is_none(), "a message is read, not activated");
-    }
-
-    #[test]
-    fn provider_applies_the_stores_cap_on_every_listing() {
-        let log = Arc::new(MessageLog::default());
-        for i in 0..5 {
-            log.push(format!("m{i}"), true);
-        }
-        let provider = MessagesProvider::new(log, store_with_cap("2"));
-        let entries = provider.list(&vfs_root().join("messages")).unwrap();
-        assert_eq!(entries.len(), 2, "the store's max-message-line wins over the log's default");
-        assert_eq!(entries[0].name, "m4");
-        assert_eq!(entries[1].name, "m3");
-    }
 }

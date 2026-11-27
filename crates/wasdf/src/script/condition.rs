@@ -114,7 +114,7 @@ impl Conditions {
             "mode-file",
             Box::new(|s| matches!(s.mode(), Mode::File)),
         );
-        // Shallow-vs-deep `f` split (SEARCH_RENEW.md): a virtual cwd (@/...)
+        // Shallow-vs-deep `f` split (doc/UI.md): a virtual cwd (@/...)
         // has nothing for the recursive walk to read, so `f` there means
         // "shallow-filter the current listing" instead of "deep search".
         self.register("cwd-virtual", Box::new(|s| crate::vfs::is_virtual(&s.cwd)));

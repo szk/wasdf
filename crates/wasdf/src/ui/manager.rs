@@ -80,6 +80,24 @@ impl UiManager {
         })
     }
 
+    /// The terminal's cell size in pixels (`None`: unknown), measured by the
+    /// event loop; image graphics are sized with it.
+    pub fn set_cell_px(&mut self, px: Option<(u16, u16)>) {
+        self.scroll.set_cell_px(px);
+    }
+
+    /// Which image protocols the display side can draw (probed or declared
+    /// by the terminal layer once at start).
+    pub fn set_graphics_support(&mut self, support: crate::ui::graphics::Support) {
+        self.scroll.set_graphics_support(support);
+    }
+
+    /// The graphics the last frame placed (ui/graphics.rs), for the event
+    /// loop to write to the terminal after the draw.
+    pub fn placements(&self) -> &[crate::ui::graphics::Placement] {
+        self.scroll.placements()
+    }
+
     /// Render the whole UI from the read-only state.
     pub fn render(
         &mut self,

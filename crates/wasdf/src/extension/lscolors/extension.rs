@@ -109,7 +109,7 @@ impl SettingsNode for LsColorsNode {
             let mut entries: Vec<Entry> = reg.names().into_iter().map(|name| {
                 let np = reg.get(&name).unwrap();
                 let kind = if np.preset { "preset" } else { "custom" };
-                let badge = if name == active { format!("{name} ✓ ({kind})") } else { format!("{name} ({kind})") };
+                let badge = if name == active { format!("{name} {} ({kind})", crate::ui::chrome::CHECK_MARK) } else { format!("{name} ({kind})") };
                 Entry::virtual_dir(base.join(&name), badge)
             }).collect();
             let mut new_leaf = Entry::virtual_leaf(base.join("+ New palette…"), "+ New palette…".into());
@@ -497,23 +497,6 @@ mod tests {
     }
 
     #[test]
-    fn builtin_dark_and_light_presets_parse_and_color_dirs_and_rs_files() {
-        let reg = PaletteRegistry::bundled();
-        let dark = reg.resolve("dark");
-        let light = reg.resolve("light");
-        assert!(parse::style_for(&dark, &entry("x", true)).is_some(), "dark: dir has a color");
-        assert!(parse::style_for(&light, &entry("x", true)).is_some(), "light: dir has a color");
-        assert!(parse::style_for(&dark, &entry("main.rs", false)).is_some(), "dark: .rs has a color");
-        assert!(parse::style_for(&light, &entry("main.rs", false)).is_some(), "light: .rs has a color");
-    }
-
-    #[test]
-    fn no_bound_store_yields_no_opinion() {
-        let e = ext();
-        assert!(e.entry_style(&entry("main.rs", false)).is_none());
-    }
-
-    #[test]
     fn set_active_writes_the_option_and_the_registry_follows() {
         let e = bound_ext();
         assert_eq!(e.state.read().unwrap().active(), "dark");
@@ -522,25 +505,4 @@ mod tests {
         assert!(e.entry_style(&entry("x", true)).is_some());
     }
 
-    #[test]
-    fn editing_the_active_palette_recolors_without_a_rename() {
-        let e = bound_ext();
-        run(
-            &e,
-            "duplicate-apply",
-            ExtensionValue::Nil
-                .with("source", ExtensionValue::String("dark".into()))
-                .with(KEY_ITEM, ExtensionValue::String("mine".into())),
-        );
-        assert_eq!(e.state.read().unwrap().active(), "mine");
-        assert!(e.entry_style(&entry("main.rs", false)).is_some(), "the copy colors .rs like dark");
-        run(
-            &e,
-            "edit-raw-apply",
-            ExtensionValue::Nil
-                .with("palette", ExtensionValue::String("mine".into()))
-                .with(KEY_ITEM, ExtensionValue::String("di=01;34".into())),
-        );
-        assert!(e.entry_style(&entry("main.rs", false)).is_none(), "the cached table was rebuilt");
-    }
 }

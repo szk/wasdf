@@ -49,6 +49,10 @@ pub fn render(
     let placed = crate::ui::layout::solve(tree, area, &env);
     scroll.set_shown(placed.iter().map(|(id, _)| id.clone()).collect());
     scroll.set_generation(view.options.generation());
+    // Graphics are placed only when no overlay will be drawn over the panels
+    // (an image layer would hide it); the cells fallback shows instead.
+    let overlay = notice.is_some() || matches!(state.mode(), Mode::Policy(_) | Mode::InputForm(_));
+    scroll.begin_graphics(crate::ui::graphics::ImageProtocol::from_option(&view.options.get_str("image-protocol")), !overlay);
     let panel = |id: &str| placed.iter().find(|(p, _)| p == id).map(|(_, r)| panel_area(*r, area, &placed));
 
     // Default to "no clamp"; the function-panel render records real bounds only
@@ -67,15 +71,22 @@ pub fn render(
             _ => {}
         }
     }
+    let mut top: Vec<(&str, usize)> = Vec::new();
     for (id, _) in &placed {
         let Some(pa) = panel(id) else { continue };
+        if matches!(id.as_str(), "nav" | "prop" | "monitor") {
+            top.push((id.as_str(), panels.len()));
+        }
         match id.as_str() {
             "nav" => crate::ui::top::render_nav(frame, pa, state, &mut panels, theme),
-            "prop" => crate::ui::top::render_prop(frame, pa, state, view.monitor.load, &opts.border_style, &mut panels, theme),
+            "prop" => crate::ui::top::render_prop(frame, pa, state, &mut panels, theme),
             "monitor" => crate::ui::top::render_monitor(frame, pa, view.monitor, &mut panels, &opts.monitor, theme),
             _ => {}
         }
     }
+    // A top renderer that pushed nothing (too small) has no frame to label.
+    top.retain(|(_, i)| *i < panels.len());
+    crate::ui::top::place_status(&mut panels, &top, view.monitor, &opts.border_style, std::time::SystemTime::now());
     let anchor = ["file", "select-input", "select-candidates"].into_iter().find_map(&panel);
     let labels = match anchor {
         Some(a) => crate::ui::top::border_labels(
@@ -103,6 +114,7 @@ pub fn render(
         && let Some(form) = &state.input_form {
             render_input_form(frame, area, spec, form, theme);
         }
+    scroll.finish_graphics(frame.buffer_mut());
 }
 
 /// What render reads besides AppState: the layouts, and the projections a
@@ -202,7 +214,7 @@ fn render_input_form(
     let border_style = theme.style(Role::Border);
 
     // Body row count per kind: Text/Int show a fixed small body; Bool/
-    // Choice/List grow with their row count (List: items + "+ Add" + "✓
+    // Choice/List grow with their row count (List: items + "+ Add" + "*
     // Confirm"). All get one blank spacer row above the body and one hint
     // row below.
     let body_rows: u16 = match form {
@@ -302,7 +314,7 @@ fn render_int_body(frame: &mut Frame, area: Rect, value: i64, min: i64, max: i64
 }
 
 /// `List` (free multi-value): a `Table`, one row per item plus a trailing
-/// `"+ Add item"` row and a `"✓ Confirm"` row (see `list_add_row`/
+/// `"+ Add item"` row and a `"* Confirm"` row (see `list_add_row`/
 /// `list_confirm_row` in `core::reducer` for why Enter needs a dedicated
 /// confirm row). The row being edited shows its live-typed text with the
 /// same caret technique `render_text_body` uses.
@@ -335,7 +347,7 @@ fn render_list_body(
     let confirm_selected = selected == items.len() + 1;
     let confirm_style =
         if confirm_selected { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
-    rows.push(Row::new(vec![Cell::from("✓ Confirm")]).style(confirm_style));
+    rows.push(Row::new(vec![Cell::from(format!("{} Confirm", crate::ui::chrome::CHECK_MARK))]).style(confirm_style));
     let table = Table::new(rows, [Constraint::Percentage(100)]);
     frame.render_widget(table, area);
 }
@@ -352,4 +364,3 @@ fn caret_line(buf: &str, cursor: usize) -> Line<'static> {
         Span::raw(after),
     ])
 }
-

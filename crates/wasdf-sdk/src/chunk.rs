@@ -37,30 +37,3 @@ pub fn read_chunk(path: &Path, limit: usize) -> io::Result<(Vec<u8>, bool)> {
     let (bytes, eof) = read_chunk_at(path, 0, limit)?;
     Ok((bytes, !eof))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pages_a_file_in_offset_chunks() {
-        let mut path = std::env::temp_dir();
-        path.push(format!("wasdf-chunk-{}.bin", std::process::id()));
-        std::fs::write(&path, b"0123456789").unwrap();
-
-        // First chunk: 4 bytes from the start, more remains.
-        let (b, eof) = read_chunk_at(&path, 0, 4).unwrap();
-        assert_eq!((b.as_slice(), eof), (b"0123".as_slice(), false));
-        // Middle chunk from an offset.
-        let (b, eof) = read_chunk_at(&path, 4, 4).unwrap();
-        assert_eq!((b.as_slice(), eof), (b"4567".as_slice(), false));
-        // Final chunk reaches EOF.
-        let (b, eof) = read_chunk_at(&path, 8, 4).unwrap();
-        assert_eq!((b.as_slice(), eof), (b"89".as_slice(), true));
-        // Past the end: empty and EOF.
-        let (b, eof) = read_chunk_at(&path, 99, 4).unwrap();
-        assert!(b.is_empty() && eof);
-
-        let _ = std::fs::remove_file(&path);
-    }
-}

@@ -143,7 +143,7 @@ pub enum Intent {
     /// own matches for a nested `f`). A no-op with no filter active — bound only
     /// while `has-filter` holds (see keymap.scm).
     ClearFilter,
-    /// Shallow filter (`f` on a virtual directory — see SEARCH_RENEW.md):
+    /// Shallow filter (`f` on a virtual directory — see doc/UI.md):
     /// push a Select ranking the file panel's *current* `entries` in place,
     /// synchronously, no I/O. The reducer takes the snapshot (this intent
     /// carries none — the keymap codec builds intents without state). Commits
@@ -190,7 +190,7 @@ pub enum Intent {
     LoadContent { owner: String, path: PathBuf, offset: u64 },
     /// Deep search (recursive walk + matcher ranking) from `root`, addressed
     /// to `owner` — the extension-facing counterpart of the file panel's own
-    /// `f` (see SEARCH_RENEW.md). The kernel issues an owner-addressed
+    /// `f` (see doc/UI.md). The kernel issues an owner-addressed
     /// `Plan::Search`; the completion arrives as a generic content Read
     /// (`Content::Dir`) and is handed to `owner`'s `accept_content`, same
     /// as `LoadContent`. Not tied to any one extension.

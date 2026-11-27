@@ -49,8 +49,8 @@ pub struct FunctionRenderCtx<'a> {
 
 /// Core's **internal** laid-out drawable for the function panel: the product of
 /// laying out a logical [`PanelView`] (see `ui/middle/function.rs`), consumed by
-/// the panel blitter. It is no longer produced by extensions — they return a
-/// `PanelView` and core owns all layout — but it remains the seam between the
+/// the panel blitter. Extensions never produce it — they return a
+/// `PanelView` and core owns all layout — it is the seam between the
 /// layout step and the blit/chrome step: core vertically scrolls `lines` by
 /// `scroll`, draws the border/`title`, a scrollbar (when `total` exceeds the
 /// viewport), and an optional bottom-row `prompt` (the search input).
@@ -215,8 +215,7 @@ pub trait Extension: Send {
     /// layout** — label alignment, line wrapping / h-scroll, vertical scroll, line
     /// numbers, theming, and search-match highlighting; the extension only
     /// describes *what* to show. `None` means "nothing to draw" (core shows a
-    /// placeholder). This is the single pull-render path, replacing the old
-    /// extension-assembled `FunctionDraw`.
+    /// placeholder). This is the single pull-render path.
     fn view(&self, _ctx: &FunctionRenderCtx) -> Option<Arc<PanelView>> {
         None
     }

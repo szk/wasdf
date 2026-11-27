@@ -168,12 +168,12 @@ nothing, and takes no lock that a worker can hold for longer than a copy.
 - **What is drawn comes from state.** The nav panel's ancestor columns come
   from `AppState.trail` (computed by the ReadDir worker); owner / group names
   come from the `Entry` (resolved in the worker, memoised per id); system
-  metrics and the load average come from the Monitor snapshot. Monitor always
-  samples the load average (the prop readout); it samples the monitor panel's
-  metrics only while that panel is visible.
+  metrics and the status readout's battery / WiFi come from the Monitor
+  snapshot. Monitor always samples the status readout; it samples the monitor
+  panel's metrics only while that panel is visible.
 - **Draw when dirty.** The loop draws after handling an event and otherwise
   sleeps. It waits with a timeout bounded by the nearest UI deadline: notice
-  expiry, and the prop panel's refresh (its clock and load readout), due every
+  expiry, and the status readout's refresh (its clock), due every
   `prop.refresh-ms` (default 1000; at most once per that interval). Owners of
   out-of-band sources (Monitor, a PTY reader thread) wake it with
   `AppEvent::Tick`. The input thread emits no idle ticks.

@@ -5,6 +5,7 @@
 pub mod bottom;
 pub mod chrome;
 pub mod content;
+pub mod graphics;
 pub mod layout;
 pub mod manager;
 pub mod middle;

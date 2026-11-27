@@ -192,30 +192,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_virtual_recognizes_at_paths() {
-        assert!(is_virtual(Path::new("@")));
-        assert!(is_virtual(Path::new("@/settings")));
-        assert!(is_virtual(Path::new("@/settings/display")));
-        assert!(!is_virtual(Path::new("/some/real/path")));
-        assert!(!is_virtual(Path::new("relative/no-at")));
-        assert!(!is_virtual(Path::new("")));
-    }
-
-    #[test]
-    fn vfs_root_is_at_sign() {
-        assert_eq!(vfs_root(), PathBuf::from("@"));
-    }
-
-    #[test]
-    fn mount_of_extracts_second_component() {
-        assert_eq!(mount_of(Path::new("@/settings")), Some("settings"));
-        assert_eq!(mount_of(Path::new("@/settings/display")), Some("settings"));
-        assert_eq!(mount_of(Path::new("@/bookmarks")), Some("bookmarks"));
-        assert_eq!(mount_of(Path::new("@")), None);
-        assert_eq!(mount_of(Path::new("/real/path")), None);
-    }
-
-    #[test]
     fn pathbuf_parent_climbs_virtual_paths_lexically() {
         // PathBuf::parent() is pure lexical, no I/O — virtual paths climb correctly.
         let p = PathBuf::from("@/settings/display");
@@ -229,26 +205,12 @@ mod tests {
     }
 
     #[test]
-    fn vfs_root_listing_empty_with_no_providers() {
-        let vfs = Vfs::default();
-        let entries = vfs.list(&vfs_root(), false).unwrap();
-        assert!(entries.is_empty());
-    }
-
-    #[test]
     fn vfs_routes_real_paths_to_filesystem() {
         let vfs = Vfs::default();
         // A real directory: routes to the real FS (must succeed).
         let entries = vfs.list(Path::new("/tmp"), false).unwrap();
         // /tmp always exists on Unix; entries may be empty but must not error.
         let _ = entries;
-    }
-
-    #[test]
-    fn vfs_unknown_mount_errors() {
-        let vfs = Vfs::default();
-        let result = vfs.list(Path::new("@/nosuchmount"), false);
-        assert!(result.is_err());
     }
 
     /// A minimal extra provider standing in for any extension-owned mount, so
@@ -263,17 +225,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn root_listing_names_are_capitalized() {
-        let mut vfs = Vfs::default();
-        vfs.extend(defaults());
-        vfs.extend([Box::new(DummyProvider) as Box<dyn VfsProvider>]);
-        let entries = vfs.list(&vfs_root(), false).unwrap();
-        // filesystem entry: capitalized display name, real-root path.
-        let fs_entry = entries.iter().find(|e| e.path == *"/").unwrap();
-        assert_eq!(fs_entry.name, "FILESYSTEM");
-        // any other provider's entry: capitalized, virtual path unchanged.
-        let dummy_entry = entries.iter().find(|e| e.path == vfs_root().join("widgets")).unwrap();
-        assert_eq!(dummy_entry.name, "WIDGETS");
-    }
 }

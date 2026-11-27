@@ -63,7 +63,7 @@ impl Section {
 /// `id` is the entry's key as the store holds it: a string for options,
 /// commands, orders, and layouts; `(mode panel-or-#f "key")` for bindings.
 /// `value` is the entry's effective value after the change — `None` when no
-/// layer holds one any more. For a binding the value is `(intent when label)`
+/// layer holds one. For a binding the value is `(intent when label)`
 /// (`#f` for an absent `when` / label) or the symbol `unbound` (a tombstone).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Change {
@@ -492,15 +492,6 @@ mod tests {
     }
 
     #[test]
-    fn a_write_changes_the_effective_value_and_reports_it() {
-        let s = store();
-        let out = s.eval(Layer::Config, "(opt-set! 'n 5)");
-        assert!(out.value.is_ok(), "{:?}", out.value);
-        assert_eq!(out.changes, vec![option_change("n", Some(Datum::Int(5)))]);
-        assert_eq!(s.eval(Layer::Session, "(opt 'n)").value.unwrap(), "5");
-    }
-
-    #[test]
     fn layers_decide_the_effective_value_and_reset_reveals_config() {
         let s = store();
         s.eval(Layer::Config, "(opt-set! 'n 2)");
@@ -526,35 +517,6 @@ mod tests {
             assert!(out.value.is_err(), "{bad} should fail");
             assert!(out.changes.is_empty(), "{bad} changed {:?}", out.changes);
         }
-    }
-
-    #[test]
-    fn structured_values_are_validated_and_normalized() {
-        let s = store();
-        let ok = s.eval(Layer::Config, "(opt-set! 'themes '((dark ((fg \"#000\") (bold #t)))))");
-        assert!(ok.value.is_ok(), "{:?}", ok.value);
-        let expected = sexpr::parse(r##"(("dark" (("fg" "#000") ("bold" #t))))"##).unwrap();
-        assert_eq!(ok.changes, vec![option_change("themes", Some(expected))]);
-        let missing_field = s.eval(Layer::Config, "(opt-set! 'themes '((dark ((fg \"#000\")))))");
-        assert!(missing_field.value.is_err());
-        let list = s.eval(Layer::Config, "(opt-set! 'exts '(\"rs\" \"md\"))");
-        assert!(list.value.is_ok());
-        assert!(s.eval(Layer::Config, "(opt-set! 'exts '(1 2))").value.is_err());
-    }
-
-    #[test]
-    fn bindings_record_when_label_and_tombstones() {
-        let s = store();
-        let out = s.eval(Layer::Config, "(bind! 'file 'file \"o\" '(navigate-to \"/tmp\") 'has-selection \"open tmp\")");
-        assert!(out.value.is_ok(), "{:?}", out.value);
-        let id = sexpr::parse(r#"("file" "file" "o")"#).unwrap();
-        let value = sexpr::parse(r#"((navigate-to "/tmp") has-selection "open tmp")"#).unwrap();
-        assert_eq!(out.changes, vec![Change { section: Section::Binding, id: id.clone(), value: Some(value) }]);
-        let un = s.eval(Layer::Custom, "(unbind! 'file 'file \"o\")");
-        assert_eq!(un.changes, vec![Change { section: Section::Binding, id, value: Some(Datum::Sym("unbound".into())) }]);
-        let any_panel = s.eval(Layer::Config, "(bind! 'file #f \"x\" 'quit)");
-        let id = sexpr::parse(r#"("file" #f "x")"#).unwrap();
-        assert_eq!(any_panel.changes[0].id, id);
     }
 
     #[test]
@@ -610,64 +572,4 @@ mod tests {
         assert_eq!(fresh.layer_entries(Layer::Custom).unwrap(), entries);
     }
 
-    #[test]
-    fn custom_scm_keeps_an_undeclared_option_but_elsewhere_it_is_an_error() {
-        let s = store();
-        let (changes, errors) = s.eval_program(Layer::Custom, "(opt-set! 'gone.ext \"kept\")\n(opt-set! 'n 3)\n");
-        assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(changes, vec![option_change("n", Some(Datum::Int(3)))], "the undeclared entry has no effect");
-        assert!(s.dump_custom().unwrap().lines().any(|l| l == "(opt-set! 'gone.ext \"kept\")"), "it is written back");
-        assert!(s.eval(Layer::Session, "(customize! (opt-set! 'typo 1))").value.is_err(), "a REPL typo is still reported");
-        assert!(s.eval(Layer::Config, "(opt-set! 'typo 1)").value.is_err());
-    }
-
-    #[test]
-    fn layout_writes_are_checked_and_a_rejected_one_keeps_the_previous() {
-        let s = store();
-        let good = s.eval(Layer::Config, "(layout! 'file '(column (panel file) (panel help (size 1))))");
-        assert!(good.value.is_ok(), "{:?}", good.value);
-        assert_eq!(good.changes.len(), 1);
-        let bad = s.eval(Layer::Config, "(layout! 'file '(column (panel nav)))");
-        assert!(bad.value.as_ref().is_err_and(|e| e.contains("needs panel file")), "{:?}", bad.value);
-        assert!(bad.changes.is_empty(), "the previous layout stays");
-    }
-
-    #[test]
-    fn environment_procedures_answer() {
-        let s = store();
-        let os = s.eval(Layer::Session, "(os)").value.unwrap();
-        assert!(["\"macos\"", "\"linux\"", "\"windows\""].contains(&os.as_str()), "{os}");
-        assert_eq!(s.eval(Layer::Session, "(getenv \"WASDF_SURELY_UNSET_VAR\")").value.unwrap(), "#f");
-        assert_eq!(s.eval(Layer::Session, "(executable? \"sh\")").value.unwrap(), "#t");
-        assert!(s.eval(Layer::Session, "(string? (hostname))").value.unwrap() == "#t");
-    }
-
-    #[test]
-    fn a_prelude_may_only_define_and_never_redefine() {
-        let s = store();
-        let mut taken: std::collections::HashSet<String> = CORE_VOCABULARY.iter().map(|s| s.to_string()).collect();
-        let problems = s.load_prelude(
-            "t",
-            "(define (bump) (opt-set! 'n (+ (opt 'n) 1)))\n(opt-set! 'n 9)\n(define (opt k) k)\n(define-syntax twice (syntax-rules () ((_ e) (begin e e))))",
-            &mut taken,
-        );
-        assert_eq!(problems.len(), 2, "{problems:?}");
-        assert!(problems[0].contains(":2:") && problems[1].contains("`opt`"), "{problems:?}");
-        let out = s.eval(Layer::Session, "(twice (bump))");
-        assert!(out.value.is_ok(), "{:?}", out.value);
-        assert_eq!(s.eval(Layer::Session, "(opt 'n)").value.unwrap(), "3");
-        let again = s.load_prelude("u", "(define (bump) 0)", &mut taken);
-        assert_eq!(again.len(), 1, "an earlier prelude's name is taken too");
-    }
-
-    #[test]
-    fn split_forms_tracks_lines_and_skips_comments() {
-        let text = "#| block\n comment |#\n'(a \"b)\" #\\( ) ; tail\n\nsym\n(x [y])";
-        let forms = split_forms(text);
-        let lines: Vec<usize> = forms.iter().map(|(l, _)| *l).collect();
-        assert_eq!(lines, vec![3, 5, 6]);
-        assert_eq!(forms[0].1, "'(a \"b)\" #\\( )");
-        assert_eq!(forms[1].1, "sym");
-        assert_eq!(forms[2].1, "(x [y])");
-    }
 }

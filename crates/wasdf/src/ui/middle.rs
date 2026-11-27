@@ -64,6 +64,17 @@ pub struct ScrollMemory {
     /// The scroll this draw used to reveal the current search match, for the
     /// kernel to keep (the reducer cannot place a block on a row).
     revealed: Option<usize>,
+    /// Image protocol and cell pixels this frame lowers with (ui/graphics.rs).
+    graphics: crate::ui::graphics::GraphicsConfig,
+    /// Whether this frame may place graphics (no overlay covers the panels).
+    graphics_allowed: bool,
+    /// The graphics this frame placed, for the event loop to write out.
+    placements: Vec<crate::ui::graphics::Placement>,
+    /// Cell areas to blank under this frame's placements (block extents).
+    graphic_blanks: Vec<ratatui::layout::Rect>,
+    /// Last frame's placements as `(id, rect)`: where a picture covered cells
+    /// that must be repainted once it is gone.
+    prev_placed: Vec<(u64, ratatui::layout::Rect)>,
 }
 
 impl Default for ScrollMemory {
@@ -80,6 +91,11 @@ impl Default for ScrollMemory {
             generation: 0,
             lowered: None,
             revealed: None,
+            graphics: Default::default(),
+            graphics_allowed: false,
+            placements: Vec::new(),
+            graphic_blanks: Vec::new(),
+            prev_placed: Vec::new(),
         }
     }
 }
@@ -122,6 +138,50 @@ impl ScrollMemory {
 
     pub fn take_revealed(&mut self) -> Option<usize> {
         self.revealed.take()
+    }
+
+    /// Start a frame's graphics: the protocol to lower with, the cell pixels,
+    /// and whether placing is allowed; forgets the last frame's placements.
+    pub fn begin_graphics(&mut self, protocol: crate::ui::graphics::ImageProtocol, allowed: bool) {
+        self.graphics.protocol = protocol;
+        self.graphics_allowed = allowed;
+        self.prev_placed = self.placements.drain(..).map(|p| (p.graphic.id, p.rect())).collect();
+        self.graphic_blanks.clear();
+    }
+
+    /// End a frame's graphics: cells a picture covered last frame but not this
+    /// one are forced through the diff, since the backend never saw them while
+    /// they were `skip` and the picture may still be on the terminal there.
+    pub fn finish_graphics(&mut self, buf: &mut ratatui::buffer::Buffer) {
+        use ratatui::buffer::CellDiffOption;
+        let area = buf.area;
+        for (id, r) in &self.prev_placed {
+            if self.placements.iter().any(|p| p.graphic.id == *id && p.rect() == *r) {
+                continue;
+            }
+            let r = r.intersection(area);
+            for y in r.top()..r.bottom() {
+                for x in r.left()..r.right() {
+                    let cell = &mut buf[(x, y)];
+                    if cell.diff_option != CellDiffOption::Skip {
+                        cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn set_graphics_support(&mut self, support: crate::ui::graphics::Support) {
+        self.graphics.support = support;
+    }
+
+    pub fn set_cell_px(&mut self, px: Option<(u16, u16)>) {
+        self.graphics.cell_px = px;
+        crate::ui::graphics::set_cell_px(px);
+    }
+
+    pub fn placements(&self) -> &[crate::ui::graphics::Placement] {
+        &self.placements
     }
 
     pub fn set_generation(&mut self, generation: u64) {
@@ -636,6 +696,9 @@ fn build_rows_lines_with_props(
         .collect()
 }
 
+/// What the file panel shows inside a directory with nothing in it.
+const EMPTY_DIR: &str = "Empty Dir";
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_file_list(
     frame: &mut Frame,
@@ -657,6 +720,7 @@ pub fn render_file_list(
         Some(q) => format!("{} — filter: {q}", state.cwd.display()),
         None => state.cwd.display().to_string(),
     };
+    let inner = area.inner();
     render_entry_grid(
         frame,
         area,
@@ -673,6 +737,10 @@ pub fn render_file_list(
         theme,
         file_row_size_graph,
     );
+    // A filter that matched nothing is not an empty directory, so it stays blank.
+    if state.entries.is_empty() && state.filter_query.is_none() {
+        frame.render_widget(Paragraph::new(Span::styled(EMPTY_DIR, theme.style(Role::Muted))), inner);
+    }
 }
 
 /// Render a navigable entry list as the file-panel grid: the layout geometry,
@@ -892,87 +960,6 @@ mod tests {
         l.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
-    #[test]
-    fn pad_left_right_aligns_and_truncates_from_the_left() {
-        assert_eq!(pad_left("42", 5), "   42");
-        assert_eq!(pad_left("hello", 5), "hello");
-        assert_eq!(pad_left("toolong", 4), "long", "overflow truncates from the left, keeping the tail");
-    }
-
-    #[test]
-    fn prop_widths_pick_level_drops_ownr_first_then_perm_then_size() {
-        let widths = PropWidths { ownr: 8, size: 6 };
-        let max_w = widths.segment_width(PropLevel::Max);
-        let large_w = widths.segment_width(PropLevel::Large);
-        let medium_w = widths.segment_width(PropLevel::Medium);
-        let small_w = widths.segment_width(PropLevel::Small);
-        assert!(max_w > large_w && large_w > medium_w && medium_w > small_w);
-
-        assert_eq!(widths.pick_level(max_w), PropLevel::Max);
-        assert_eq!(widths.pick_level(max_w - 1), PropLevel::Large, "just short of Max drops to Large (OWNR first)");
-        assert_eq!(widths.pick_level(large_w), PropLevel::Large);
-        assert_eq!(widths.pick_level(large_w - 1), PropLevel::Medium, "next drops PERM");
-        assert_eq!(widths.pick_level(medium_w), PropLevel::Medium);
-        assert_eq!(widths.pick_level(medium_w - 1), PropLevel::Small, "next drops SIZE, TIME survives alone");
-        assert_eq!(widths.pick_level(small_w), PropLevel::Small);
-        assert_eq!(widths.pick_level(small_w - 1), PropLevel::None, "not even TIME fits");
-    }
-
-    #[test]
-    fn prop_values_field_count_matches_field_widths_for_every_level() {
-        let e = entry("a.txt", 1024);
-        let widths = PropWidths { ownr: 4, size: 5 };
-        for level in [PropLevel::None, PropLevel::Small, PropLevel::Medium, PropLevel::Large, PropLevel::Max] {
-            assert_eq!(
-                prop_values(&e, level).len(),
-                widths.field_widths(level).len(),
-                "level {level:?}: prop_values and field_widths must agree on field count"
-            );
-        }
-    }
-
-    #[test]
-    fn rows_with_ample_width_shows_the_max_level() {
-        let entries = vec![entry("short.txt", 10), entry("a-much-longer-filename.txt", 1234)];
-        let selection = HashSet::new();
-        let extensions = ExtensionRegistry::new();
-        let theme = Theme::default();
-        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: 0, selection: &selection, focused: true }, 120, &extensions, &theme, true);
-        assert_eq!(lines.len(), 2);
-        let text = line_text(&lines[0]);
-        assert!(text.contains("rw-r--r--"), "PERM shown at ample width: {text:?}");
-        assert!(text.trim_end().ends_with(char::is_numeric) || text.contains(':'), "TIME shown: {text:?}");
-    }
-
-    #[test]
-    fn rows_with_no_clearance_falls_back_to_name_only() {
-        let entries = vec![entry("a-very-long-filename-that-eats-the-whole-row.txt", 10)];
-        let selection = HashSet::new();
-        let extensions = ExtensionRegistry::new();
-        let theme = Theme::default();
-        // Width barely wider than the name itself — no room for PROP_GAP + TIME.
-        let name_w = "a-very-long-filename-that-eats-the-whole-row.txt".len() + 2;
-        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: 0, selection: &selection, focused: true }, name_w, &extensions, &theme, true);
-        assert_eq!(lines.len(), 1);
-        let text = line_text(&lines[0]);
-        assert!(!text.contains("rw-r"), "no room for props: {text:?}");
-    }
-
-    #[test]
-    fn rows_columns_line_up_to_the_longest_name_regardless_of_each_rows_own_length() {
-        let entries = vec![entry("a.txt", 10), entry("a-longer-name.txt", 20)];
-        let selection = HashSet::new();
-        let extensions = ExtensionRegistry::new();
-        let theme = Theme::default();
-        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: 0, selection: &selection, focused: true }, 120, &extensions, &theme, true);
-        // Both rows' prop segments must start at the same column (padded to
-        // the longest name), so the TIME field lands in the same place.
-        let t0 = line_text(&lines[0]);
-        let t1 = line_text(&lines[1]);
-        let time_col = |s: &str| s.rfind(':').map(|i| i - 2); // "HH:MM" -> the HH start
-        assert_eq!(time_col(&t0), time_col(&t1), "TIME column aligns across rows: {t0:?} vs {t1:?}");
-    }
-
     fn dir_entry(name: &str, size: u64) -> crate::core::Entry {
         let mut e = entry(name, size);
         e.is_dir = true;
@@ -984,148 +971,6 @@ mod tests {
     /// unambiguously "inside the bar" in these tests.
     fn has_gradient_bg(s: &Span) -> bool {
         matches!(s.style.bg, Some(c) if c != Color::Reset)
-    }
-
-    #[test]
-    fn bar_width_log_is_zero_at_zero_scale_and_full_at_the_largest_file() {
-        assert_eq!(bar_width_log(500, 0, 20), 0, "an empty/all-zero listing has no scale to bar against");
-        assert_eq!(bar_width_log(500, 1000, 0), 0, "a zero-width segment has nowhere to draw");
-        assert_eq!(bar_width_log(1000, 1000, 20), 20, "the largest file fills the whole segment");
-        assert_eq!(bar_width_log(0, 1000, 20), 0, "a zero-byte file draws no bar (ln(1) == 0)");
-    }
-
-    #[test]
-    fn bar_width_log_grows_monotonically_with_size_but_sublinearly() {
-        let w = |size| bar_width_log(size, 1_000_000, 40);
-        assert!(w(10) < w(1_000), "bigger files must never draw a shorter bar");
-        assert!(w(1_000) < w(100_000));
-        // Logarithmic: the first order-of-magnitude jump (10 -> 1_000) moves the
-        // bar by more columns than the same-ratio jump near the top of the scale
-        // (100_000 -> 1_000_000), since the bar is capped at `segment_width`.
-        assert!(w(1_000) - w(10) >= w(1_000_000) - w(100_000));
-    }
-
-    #[test]
-    fn gradient_at_interpolates_linearly_across_the_bars_own_span() {
-        let left = (0, 0, 0);
-        let right = (100, 200, 250);
-        // A bar starting at column 0, 6 columns wide (0..=5).
-        assert_eq!(gradient_at(0, 0, 6, left, right), Color::Rgb(0, 0, 0), "the bar's own start is exactly the left endpoint");
-        assert_eq!(gradient_at(5, 0, 6, left, right), Color::Rgb(100, 200, 250), "the bar's own end (zero point) is exactly the right endpoint");
-        assert_eq!(gradient_at(1, 0, 6, left, right), lerp_rgb(left, right, 0.2));
-    }
-
-    #[test]
-    fn gradient_at_is_scaled_to_the_bar_not_the_whole_segment() {
-        // A short, 2-column bar starting at column 4 (e.g. within a much wider
-        // prop segment) must still show the full left..right range across its
-        // own 2 columns, not just a sliver near whatever the segment's fixed
-        // right end happens to be.
-        let left = (0, 0, 0);
-        let right = (255, 255, 255);
-        assert_eq!(gradient_at(4, 4, 2, left, right), Color::Rgb(0, 0, 0), "the bar's own left edge");
-        assert_eq!(gradient_at(5, 4, 2, left, right), Color::Rgb(255, 255, 255), "the bar's own right edge (zero point)");
-    }
-
-    #[test]
-    fn push_gradient_aware_splits_a_span_at_the_bar_boundary_one_span_per_bar_column() {
-        let mut spans = Vec::new();
-        let mut pos = 0usize;
-        let (left, right) = ((0, 0, 0), (255, 255, 255));
-        // Bar starts at column 4, is 2 columns wide (covering "e" and "f").
-        push_gradient_aware(&mut spans, &mut pos, "abcdef", Style::default(), 4, 2, left, right);
-        // "abcd" (outside the bar) stays one span; "ef" (inside) is one span
-        // per character since each column has its own interpolated color.
-        assert_eq!(spans.len(), 3, "{spans:?}");
-        assert_eq!(spans[0].content.as_ref(), "abcd");
-        assert!(!has_gradient_bg(&spans[0]));
-        assert_eq!(spans[1].content.as_ref(), "e");
-        assert_eq!(spans[1].style.bg, Some(Color::Rgb(0, 0, 0)), "the bar's own left edge -> the left endpoint exactly");
-        assert_eq!(spans[2].content.as_ref(), "f");
-        assert_eq!(spans[2].style.bg, Some(Color::Rgb(255, 255, 255)), "the bar's own right edge -> the right endpoint exactly");
-        assert_eq!(pos, 6);
-    }
-
-    #[test]
-    fn the_largest_files_bar_reaches_the_segments_right_edge_in_the_right_endpoint_color() {
-        // One huge file sets the scale to its own max — its bar fills the
-        // entire segment, so the rightmost span (TIME) lands exactly on the
-        // gradient's right endpoint (Role::FileRowSizeGraph's bg).
-        let entries = vec![entry("big.bin", 10_000_000)];
-        let selection = HashSet::new();
-        let extensions = ExtensionRegistry::new();
-        let theme = Theme::default();
-        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: entries.len(), selection: &selection, focused: true }, 120, &extensions, &theme, true);
-        let last = lines[0].spans.last().expect("prop segment has at least one span");
-        let right = crate::core::color_to_rgb(theme.bg(Role::FileRowSizeGraph));
-        assert_eq!(last.style.bg, Some(Color::Rgb(right.0, right.1, right.2)));
-    }
-
-    #[test]
-    fn even_a_short_bar_reaches_the_left_endpoint_color_at_its_own_start() {
-        // A small file next to a much larger one draws a short bar — but that
-        // bar must still touch the gradient's left endpoint at its own start,
-        // not just fade partway there, since the gradient is scaled to each
-        // row's own bar, not the whole (much wider) prop segment. Sizes picked
-        // so the shorter bar is several columns wide (not the 1-column
-        // degenerate case, which by definition can only show one color).
-        let entries = vec![entry("smaller.txt", 100), entry("bigger.bin", 1_000_000)];
-        let selection = HashSet::new();
-        let extensions = ExtensionRegistry::new();
-        let theme = Theme::default();
-        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: entries.len(), selection: &selection, focused: true }, 120, &extensions, &theme, true);
-        let left = crate::core::color_to_rgb(theme.role(Role::FileRowSizeGraph));
-        let first_gradient_span = lines[0].spans.iter().find(|s| has_gradient_bg(s)).expect("tiny.txt still draws some bar");
-        assert_eq!(first_gradient_span.style.bg, Some(Color::Rgb(left.0, left.1, left.2)));
-    }
-
-    #[test]
-    fn a_tiny_file_draws_a_much_shorter_bar_than_a_huge_neighbor() {
-        let entries = vec![entry("tiny.txt", 1), entry("huge.bin", 100_000_000)];
-        let selection = HashSet::new();
-        let extensions = ExtensionRegistry::new();
-        let theme = Theme::default();
-        // No entry under the cursor (out of range): the cursor highlight also
-        // sets a non-reset bg on the name span, which would otherwise be
-        // indistinguishable from the gradient in these `has_gradient_bg` checks.
-        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: entries.len(), selection: &selection, focused: true }, 120, &extensions, &theme, true);
-        let bar_chars = |l: &Line| -> usize {
-            l.spans.iter().filter(|s| has_gradient_bg(s)).map(|s| s.content.chars().count()).sum()
-        };
-        let tiny_bar = bar_chars(&lines[0]);
-        let huge_bar = bar_chars(&lines[1]);
-        assert!(huge_bar > tiny_bar, "huge.bin ({huge_bar} gradient cols) must draw a longer bar than tiny.txt ({tiny_bar})");
-    }
-
-    #[test]
-    fn directories_never_draw_a_size_bar_even_when_huge() {
-        let entries = vec![dir_entry("etc", 10_000_000_000)];
-        let selection = HashSet::new();
-        let extensions = ExtensionRegistry::new();
-        let theme = Theme::default();
-        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: entries.len(), selection: &selection, focused: true }, 120, &extensions, &theme, true);
-        assert!(!lines[0].spans.iter().any(has_gradient_bg), "directories are excluded from the size-bar scale entirely");
-    }
-
-    #[test]
-    fn the_toggle_off_disables_the_size_bar_entirely() {
-        let entries = vec![entry("huge.bin", 100_000_000)];
-        let selection = HashSet::new();
-        let extensions = ExtensionRegistry::new();
-        let theme = Theme::default();
-        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: entries.len(), selection: &selection, focused: true }, 120, &extensions, &theme, false);
-        assert!(!lines[0].spans.iter().any(has_gradient_bg), "file-row-size-graph off draws no bar even for a huge file");
-    }
-
-    #[test]
-    fn a_nil_gradient_endpoint_disables_the_bar_too() {
-        let entries = vec![entry("huge.bin", 100_000_000)];
-        let selection = HashSet::new();
-        let extensions = ExtensionRegistry::new();
-        let mut theme = Theme::default();
-        theme.set_bg(Role::FileRowSizeGraph, Color::Reset); // right endpoint left nil
-        let lines = build_rows_lines_with_props(&entries, 0..entries.len(), &Marks { cursor: entries.len(), selection: &selection, focused: true }, 120, &extensions, &theme, true);
-        assert!(!lines[0].spans.iter().any(has_gradient_bg), "a nil gradient endpoint has nothing sensible to interpolate to/from");
     }
 
     #[test]

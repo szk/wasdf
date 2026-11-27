@@ -61,4 +61,3 @@ impl crate::core::CommandLookup for CommandRegistry {
         self.candidates()
     }
 }
-

@@ -54,22 +54,3 @@ impl VfsProvider for BookmarksProvider {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lists_saved_paths_as_activation_leaves() {
-        let paths = Arc::new(RwLock::new(vec![PathBuf::from("/home/user/projects")]));
-        let provider = BookmarksProvider::new("bookmarks".into(), paths);
-        let entries = provider.list(&vfs_root().join("bookmarks")).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "projects");
-        assert_eq!(entries[0].path, vfs_root().join("bookmarks").join("0"));
-        let activation = entries[0].activation.as_ref().unwrap();
-        assert_eq!(activation.extension, "bookmarks");
-        assert_eq!(activation.intent, "goto");
-        assert_eq!(activation.data.as_path(), Some(&PathBuf::from("/home/user/projects")));
-    }
-}

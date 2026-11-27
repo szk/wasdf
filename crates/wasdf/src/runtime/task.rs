@@ -165,9 +165,9 @@ fn run_plan(
                     crate::fs::make_entry_from(re.path, name, re.meta)
                 })
                 .collect();
-            // Unaddressed (today's file-search): a Select's own Search
+            // Unaddressed (file-search): a Select's own Search
             // completion. Owner-addressed (deep search from an extension,
-            // e.g. CmdOp's `/` — see SEARCH_RENEW.md decision 6): the same
+            // e.g. CmdOp's `/`): the same
             // generic content Read every cursor-follow provider already uses,
             // so the kernel routes it to `owner`'s `accept_content` with no
             // new plumbing.
@@ -338,25 +338,8 @@ mod tests {
     }
 
     #[test]
-    fn an_unaddressed_search_completes_as_its_own_select_result() {
-        let dir = scratch_dir("unaddressed");
-        let plan = Plan::Search { root: dir.clone(), query: "needle".into(), show_hidden: false, owner: None };
-        let (status, payload) = run(&plan, &dir);
-        assert_eq!(status, AsyncStatus::Ok);
-        match payload {
-            Payload::Entries { path, entries, .. } => {
-                assert_eq!(path, dir);
-                assert!(entries.iter().any(|e| e.name == "needle.txt"));
-            }
-            other => panic!("expected Payload::Entries, got {other:?}"),
-        }
-        assert_eq!(plan.purpose(), Purpose::Search, "unaddressed: drives a Select's own view");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn an_owner_addressed_search_completes_as_a_content_read() {
-        // The extension-facing deep search (SEARCH_RENEW.md decision 6):
+        // The extension-facing deep search:
         // same walk + ranking, but addressed like Plan::Read so the kernel
         // routes it to the owner's accept_content with zero new plumbing.
         let dir = scratch_dir("addressed");
@@ -383,7 +366,7 @@ mod tests {
     #[test]
     fn max_results_caps_the_walk_not_just_a_hardcoded_constant() {
         // @/settings/Matcher/max-results (MatcherConfig::max_results) bounds the
-        // raw fs::walk itself, not a fixed 20_000 the walk previously hardcoded.
+        // raw fs::walk itself, not a fixed constant.
         let dir = scratch_dir("cap");
         let plan = Plan::Search { root: dir.clone(), query: "".into(), show_hidden: false, owner: None };
         let cfg = MatcherConfig { max_results: 1, ..MatcherConfig::default() };
@@ -398,4 +381,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

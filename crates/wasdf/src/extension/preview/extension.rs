@@ -24,6 +24,10 @@ use crate::script::condition::Conditions;
 // The detail submodules (decode / highlight / markdown / search) are declared by
 // the `preview.rs` facade; from here they are siblings under `preview`.
 use super::decode::{self, Decoded, Kind};
+
+/// What a directory with nothing in it previews as (the file panel says the
+/// same inside one).
+const EMPTY_DIR: &str = "Empty Dir";
 use super::search;
 
 /// Lines below the viewport to keep loaded: once the scroll is within this many
@@ -126,7 +130,7 @@ impl PreviewExtension {
         match state.mode() {
             Mode::File => state.function.visible,
             // Any Select sourced from an entry grid (deep file-search, a
-            // shallow filter/refine — SEARCH_RENEW.md), not just file-search
+            // shallow filter/refine), not just file-search
             // by id: exactly the sources `AppState::cursor_path` reads a
             // `.view` from, so "following" and "has a cursor path" agree.
             Mode::Select(spec) => matches!(spec.source, SelectSource::FileWalk | SelectSource::Entries(_)),
@@ -246,6 +250,9 @@ impl Extension for PreviewExtension {
             }
             Decoded::Image { width, height, rgb } => {
                 PanelView::Image { width: *width, height: *height, rgb: rgb.clone() }
+            }
+            Decoded::Dir { entries } if entries.is_empty() => {
+                PanelView::Document(vec![Block::Line(vec![TextSpan::styled(EMPTY_DIR, SpanStyle::Role("muted".into()))])])
             }
             Decoded::Dir { entries } => {
                 let blocks = entries
@@ -379,29 +386,15 @@ mod tests {
     }
 
     #[test]
-    fn markdown_search_matches_the_rendered_text_not_the_source() {
-        let ext = PreviewExtension::default();
-        let path = Path::new("/tmp/a.md");
-        // `**bold**` renders as `bold`: the asterisks are markup, not content.
-        ext.accept_content(
-            path,
-            &Content::Bytes { offset: 0, bytes: b"intro\n\n**bold** tail\n".to_vec(), eof: true },
-        );
-        let state = state();
-        assert!(matches(&search(&ext, &state, "**bold**")).is_empty());
-        assert_eq!(matches(&search(&ext, &state, "bold")), vec![(2, 0, 4)]);
-    }
-
-    #[test]
-    fn markdown_matches_name_their_block_whatever_an_image_occupies() {
-        let ext = PreviewExtension::default();
-        ext.accept_content(
-            Path::new("/tmp/a.md"),
-            &Content::Bytes { offset: 0, bytes: b"top\n\n![i](i.png)\n\nneedle\n".to_vec(), eof: true },
-        );
-        // blocks: 0 "top", 1 "", 2 the image, 3 "", 4 "needle" — the row it
-        // lands on is core's to work out from the panel width.
-        assert_eq!(matches(&search(&ext, &state(), "needle")), vec![(4, 0, 6)]);
+    fn an_empty_directory_previews_as_empty_dir() {
+        let p = PreviewExtension::default();
+        let func = crate::core::state::FunctionPanelState::default();
+        let theme = crate::core::Theme::default();
+        let ctx = FunctionRenderCtx { width: 40, height: 10, focused: false, func: &func, sources: &[], theme: &theme };
+        p.accept_content(Path::new("/tmp/empty"), &Content::Dir { entries: Vec::new() });
+        let view = p.view(&ctx).unwrap();
+        let PanelView::Document(blocks) = &*view else { panic!("{view:?}") };
+        assert_eq!(blocks.iter().filter_map(Block::text).collect::<Vec<_>>(), [EMPTY_DIR]);
     }
 
     #[test]

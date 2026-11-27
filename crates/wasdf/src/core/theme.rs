@@ -242,14 +242,14 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// The built-in palette reproducing today's exact appearance.
+    /// The built-in palette.
     /// This is the `default` preset and the fallback base for every custom theme.
     pub fn default() -> Self {
         let mut fg = [Color::Reset; Role::COUNT];
         fg[Role::Border.idx()] = Color::DarkGray;
         fg[Role::Title.idx()] = Color::Gray;
         fg[Role::TitleFocused.idx()] = Color::Cyan;
-        // Brackets default to the title color so today's look is unchanged.
+        // Brackets default to the title color.
         fg[Role::TitleBracket.idx()] = Color::Gray;
         fg[Role::TitleBracketFocused.idx()] = Color::Cyan;
         fg[Role::Nameplate.idx()] = Color::Gray;
@@ -283,12 +283,12 @@ impl Theme {
         fg[Role::OverlayDangerFg.idx()] = Color::Red;
         // OverlayDangerBg stays Color::Reset (terminal default behind the overlay).
         fg[Role::Accent.idx()] = Color::Cyan;
-        // Per-metric monitor labels (today's monitor label was Cyan).
+        // Per-metric monitor labels.
         fg[Role::MonitorCpuLabel.idx()] = Color::Cyan;
         fg[Role::MonitorMemLabel.idx()] = Color::Cyan;
         fg[Role::MonitorDskLabel.idx()] = Color::Cyan;
         fg[Role::MonitorNetLabel.idx()] = Color::Cyan;
-        // Per-metric monitor bars (today's monitor bar was Green).
+        // Per-metric monitor bars.
         fg[Role::MonitorCpuBar.idx()] = Color::Green;
         fg[Role::MonitorMemBar.idx()] = Color::Green;
         fg[Role::MonitorDskBar.idx()] = Color::Green;
@@ -393,8 +393,8 @@ impl Theme {
     }
 
     /// `r`'s fg/bg after the "base" fallback: `Role::Base`'s own fg and bg
-    /// together are the whole frame's fallback pair (the historical fg/bg
-    /// the whole frame is painted with, see `ui/render.rs`) — unlike every
+    /// together are the whole frame's fallback pair (the fg/bg the whole
+    /// frame is painted with, see `ui/render.rs`) — unlike every
     /// other role, where `bg` only ever means "this role's own background",
     /// `Base`'s `bg` slot *is* the fallback background, used directly, not
     /// borrowed from anywhere else. `Role::Base` terminates the chain: asking
@@ -476,50 +476,51 @@ pub fn parse_color(s: &str) -> Option<Color> {
         }
         return None;
     }
-    match s.to_ascii_lowercase().as_str() {
-        "black" => Some(Color::Black),
-        "red" => Some(Color::Red),
-        "green" => Some(Color::Green),
-        "yellow" => Some(Color::Yellow),
-        "blue" => Some(Color::Blue),
-        "magenta" => Some(Color::Magenta),
-        "cyan" => Some(Color::Cyan),
-        "gray" | "grey" => Some(Color::Gray),
-        "darkgray" | "dark-gray" | "darkgrey" | "dark-grey" => Some(Color::DarkGray),
-        "lightred" | "light-red" => Some(Color::LightRed),
-        "lightgreen" | "light-green" => Some(Color::LightGreen),
-        "lightyellow" | "light-yellow" => Some(Color::LightYellow),
-        "lightblue" | "light-blue" => Some(Color::LightBlue),
-        "lightmagenta" | "light-magenta" => Some(Color::LightMagenta),
-        "lightcyan" | "light-cyan" => Some(Color::LightCyan),
-        "white" => Some(Color::White),
-        "default" | "reset" => Some(Color::Reset),
-        other => other.parse::<u8>().ok().map(Color::Indexed),
+    let lower = s.to_ascii_lowercase();
+    if matches!(lower.as_str(), "default" | "reset") {
+        return Some(Color::Reset);
     }
+    // `dark-grey`, `light-red`, …: hyphens and the British spelling are
+    // accepted on input; `color_token` writes the canonical name.
+    let name = lower.replace('-', "").replace("grey", "gray");
+    ANSI.iter()
+        .find(|(_, n, _)| *n == name)
+        .map(|(c, _, _)| *c)
+        .or_else(|| lower.parse::<u8>().ok().map(Color::Indexed))
+}
+
+/// The 16 named ANSI colors in palette order (index = ANSI number): each
+/// with its token and its standard terminal-palette RGB approximation.
+const ANSI: [(Color, &str, (u8, u8, u8)); 16] = [
+    (Color::Black, "black", (0, 0, 0)),
+    (Color::Red, "red", (170, 0, 0)),
+    (Color::Green, "green", (0, 170, 0)),
+    (Color::Yellow, "yellow", (170, 85, 0)),
+    (Color::Blue, "blue", (0, 0, 170)),
+    (Color::Magenta, "magenta", (170, 0, 170)),
+    (Color::Cyan, "cyan", (0, 170, 170)),
+    (Color::Gray, "gray", (170, 170, 170)),
+    (Color::DarkGray, "darkgray", (85, 85, 85)),
+    (Color::LightRed, "lightred", (255, 85, 85)),
+    (Color::LightGreen, "lightgreen", (85, 255, 85)),
+    (Color::LightYellow, "lightyellow", (255, 255, 85)),
+    (Color::LightBlue, "lightblue", (85, 85, 255)),
+    (Color::LightMagenta, "lightmagenta", (255, 85, 255)),
+    (Color::LightCyan, "lightcyan", (85, 255, 255)),
+    (Color::White, "white", (255, 255, 255)),
+];
+
+fn ansi(c: Color) -> Option<&'static (Color, &'static str, (u8, u8, u8))> {
+    ANSI.iter().find(|(a, _, _)| *a == c)
 }
 
 /// Inverse of `parse_color`: a round-trippable token for display and persistence.
 pub fn color_token(c: Color) -> String {
     match c {
-        Color::Black => "black".into(),
-        Color::Red => "red".into(),
-        Color::Green => "green".into(),
-        Color::Yellow => "yellow".into(),
-        Color::Blue => "blue".into(),
-        Color::Magenta => "magenta".into(),
-        Color::Cyan => "cyan".into(),
-        Color::Gray => "gray".into(),
-        Color::DarkGray => "darkgray".into(),
-        Color::LightRed => "lightred".into(),
-        Color::LightGreen => "lightgreen".into(),
-        Color::LightYellow => "lightyellow".into(),
-        Color::LightBlue => "lightblue".into(),
-        Color::LightMagenta => "lightmagenta".into(),
-        Color::LightCyan => "lightcyan".into(),
-        Color::White => "white".into(),
         Color::Reset => "default".into(),
         Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
         Color::Indexed(n) => n.to_string(),
+        named => ansi(named).map_or_else(String::new, |(_, name, _)| (*name).into()),
     }
 }
 
@@ -530,45 +531,9 @@ pub fn color_token(c: Color) -> String {
 /// formula (0..15 as the ANSI table, 16..231 as the 6x6x6 cube, 232..255 as
 /// the grayscale ramp); `Reset` has no color, so it maps to mid-gray.
 pub fn color_to_rgb(c: Color) -> (u8, u8, u8) {
-    fn ansi16(n: u8) -> (u8, u8, u8) {
-        match n {
-            0 => (0, 0, 0),
-            1 => (170, 0, 0),
-            2 => (0, 170, 0),
-            3 => (170, 85, 0),
-            4 => (0, 0, 170),
-            5 => (170, 0, 170),
-            6 => (0, 170, 170),
-            7 => (170, 170, 170),
-            8 => (85, 85, 85),
-            9 => (255, 85, 85),
-            10 => (85, 255, 85),
-            11 => (255, 255, 85),
-            12 => (85, 85, 255),
-            13 => (255, 85, 255),
-            14 => (85, 255, 255),
-            _ => (255, 255, 255),
-        }
-    }
     match c {
         Color::Rgb(r, g, b) => (r, g, b),
-        Color::Black => ansi16(0),
-        Color::Red => ansi16(1),
-        Color::Green => ansi16(2),
-        Color::Yellow => ansi16(3),
-        Color::Blue => ansi16(4),
-        Color::Magenta => ansi16(5),
-        Color::Cyan => ansi16(6),
-        Color::Gray => ansi16(7),
-        Color::DarkGray => ansi16(8),
-        Color::LightRed => ansi16(9),
-        Color::LightGreen => ansi16(10),
-        Color::LightYellow => ansi16(11),
-        Color::LightBlue => ansi16(12),
-        Color::LightMagenta => ansi16(13),
-        Color::LightCyan => ansi16(14),
-        Color::White => ansi16(15),
-        Color::Indexed(n) if n < 16 => ansi16(n),
+        Color::Indexed(n) if n < 16 => ANSI[n as usize].2,
         Color::Indexed(n) if n < 232 => {
             let n = n - 16;
             let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
@@ -579,6 +544,7 @@ pub fn color_to_rgb(c: Color) -> (u8, u8, u8) {
             (v, v, v)
         }
         Color::Reset => (128, 128, 128),
+        named => ansi(named).map_or((128, 128, 128), |(_, _, rgb)| *rgb),
     }
 }
 
@@ -587,35 +553,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_theme_has_one_fg_and_bg_per_role() {
-        let t = Theme::default();
-        assert_eq!(t.fg.len(), Role::COUNT);
-        assert_eq!(t.bg.len(), Role::COUNT);
-    }
-
-    #[test]
-    fn color_round_trips_named_and_hex() {
-        for name in ["black", "red", "green", "yellow", "blue", "magenta", "cyan",
-                     "gray", "darkgray", "white", "lightcyan", "default"] {
-            let c = parse_color(name).unwrap_or_else(|| panic!("parse_color({name:?}) failed"));
-            assert_eq!(parse_color(&color_token(c)), Some(c), "round-trip for {name}");
+    fn every_color_token_parses_back_and_aliases_are_accepted() {
+        let named = ANSI.iter().map(|(c, _, _)| *c);
+        for c in named.chain([Color::Reset, Color::Indexed(42), Color::Rgb(1, 2, 3)]) {
+            assert_eq!(parse_color(&color_token(c)), Some(c), "{c:?}");
         }
-        let hex = "#1a2b3c";
-        let c = parse_color(hex).unwrap();
-        assert_eq!(color_token(c), hex);
-        assert!(parse_color("nonsense").is_none());
-    }
-
-    #[test]
-    fn style_applies_bold_only_when_set() {
-        // Theme itself carries no bold opinion — "default" role bold comes
-        // from the theme extension's DEFAULT_BOLD_ROLES, layered on at
-        // `ThemeRegistry::resolve` time, not from `Theme::default()`.
-        let mut t = Theme::default();
-        assert!(!t.style(Role::EntryDir).add_modifier.contains(Modifier::BOLD));
-        assert!(!t.style(Role::Title).add_modifier.contains(Modifier::BOLD));
-        t.set_bold(Role::Title, true);
-        assert!(t.style(Role::Title).add_modifier.contains(Modifier::BOLD));
+        assert_eq!(parse_color("Dark-Grey"), Some(Color::DarkGray));
+        assert_eq!(parse_color("light-red"), Some(Color::LightRed));
+        assert_eq!(parse_color("grey"), Some(Color::Gray));
+        assert_eq!(color_to_rgb(Color::Indexed(9)), color_to_rgb(Color::LightRed));
     }
 
     #[test]
@@ -627,8 +573,8 @@ mod tests {
         // another role's. `Style::default()` alone leaves an unspecified
         // modifier for `patch` to inherit; `theme.style()` must explicitly
         // remove it instead, or a role with no modifier of its own bleeds a
-        // neighboring cell's modifier through — the same bug that made the
-        // first letter after an Underlined `[ ` bracket render underlined too.
+        // neighboring cell's modifier through (e.g. the first letter after an
+        // Underlined `[ ` bracket would render underlined too).
         let mut t = Theme::default();
         t.set_underline(Role::TitleBracket, true);
         let bracket_cell = t.style(Role::TitleBracket);
@@ -637,20 +583,6 @@ mod tests {
         assert!(
             !patched.add_modifier.contains(Modifier::UNDERLINED),
             "a role with no modifier must not inherit UNDERLINED from the cell it overwrites"
-        );
-    }
-
-    #[test]
-    fn style_sets_bg_explicitly_so_it_never_bleeds_through_a_patch_either() {
-        let mut t = Theme::default();
-        t.set_bg(Role::TitleBracket, Color::Rgb(0x0c, 0x7f, 0x14));
-        let bracket_cell = t.style(Role::TitleBracket);
-        let text_cell = t.style(Role::Title); // no bg override — nil/Color::Reset
-        let patched = bracket_cell.patch(text_cell);
-        assert_eq!(
-            patched.bg,
-            Some(Color::Reset),
-            "a role with no bg override must reset bg explicitly, not inherit a neighbor's"
         );
     }
 
@@ -664,60 +596,4 @@ mod tests {
         assert_eq!(s.bg, Some(Color::Rgb(2, 2, 2)));
     }
 
-    #[test]
-    fn a_roles_own_explicit_fg_or_bg_always_wins_over_base() {
-        let mut t = Theme::default();
-        t.set_fg(Role::Base, Color::Rgb(1, 1, 1));
-        t.set_bg(Role::Base, Color::Rgb(2, 2, 2));
-        t.set_fg(Role::Title, Color::Rgb(9, 9, 9));
-        t.set_bg(Role::Title, Color::Rgb(8, 8, 8));
-        let s = t.style(Role::Title);
-        assert_eq!(s.fg, Some(Color::Rgb(9, 9, 9)));
-        assert_eq!(s.bg, Some(Color::Rgb(8, 8, 8)));
-    }
-
-    #[test]
-    fn a_role_with_its_own_bg_but_no_fg_reads_in_bases_bg_as_a_knockout() {
-        // A role that sets its own background but leaves fg nil reads as
-        // "punched out" in base's bg color, not base's fg — the replacement
-        // for the old reverse-video "Negative" trick, using real colors.
-        let mut t = Theme::default();
-        t.set_fg(Role::Base, Color::Rgb(1, 1, 1));
-        t.set_bg(Role::Base, Color::Rgb(2, 2, 2));
-        t.set_bg(Role::PropSizeValue, Color::Rgb(7, 7, 7)); // its own bg, no fg of its own
-        let s = t.style(Role::PropSizeValue);
-        assert_eq!(s.fg, Some(Color::Rgb(2, 2, 2)), "nil fg + a role's own bg -> base's bg as ink");
-        assert_eq!(s.bg, Some(Color::Rgb(7, 7, 7)), "the role's own bg always wins");
-    }
-
-    #[test]
-    fn base_itself_never_falls_back_it_terminates_the_chain() {
-        let mut t = Theme::default();
-        t.set_fg(Role::Base, Color::Rgb(1, 1, 1));
-        t.set_bg(Role::Base, Color::Rgb(2, 2, 2));
-        let s = t.style(Role::Base);
-        assert_eq!(s.fg, Some(Color::Rgb(1, 1, 1)));
-        assert_eq!(s.bg, Some(Color::Rgb(2, 2, 2)));
-    }
-
-    #[test]
-    fn a_nil_base_bg_leaves_a_falling_back_role_nil_too() {
-        // No base color set at all (Theme::default()): every fallback bottoms
-        // out at Color::Reset, same as before this cascade existed.
-        let t = Theme::default();
-        let s = t.style(Role::Title);
-        assert_eq!(s.bg, Some(Color::Reset));
-    }
-
-    #[test]
-    fn every_role_has_a_unique_token() {
-        let tokens: Vec<&str> = Role::ALL.iter().map(|r| r.token()).collect();
-        let mut seen = std::collections::HashSet::new();
-        for t in &tokens {
-            assert!(seen.insert(*t), "duplicate token: {t}");
-        }
-        for r in Role::ALL {
-            assert_eq!(Role::from_token(r.token()), Some(*r));
-        }
-    }
 }

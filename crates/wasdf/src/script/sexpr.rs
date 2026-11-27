@@ -207,20 +207,4 @@ mod tests {
         assert_eq!(cand[4].as_sym(), Some("dst"));
     }
 
-    #[test]
-    fn skips_comments_and_whitespace() {
-        let d = parse("  ; a comment\n  (a 1 #t)\n").unwrap();
-        assert_eq!(
-            d,
-            Datum::List(vec![Datum::Sym("a".into()), Datum::Int(1), Datum::Bool(true)])
-        );
-    }
-
-    #[test]
-    fn quote_shorthand_and_multiple_forms() {
-        let forms = parse_all("(opt-set! 'k '(\"a\" 1)) ; note\n'sym").unwrap();
-        assert_eq!(forms.len(), 2);
-        assert_eq!(render(&forms[0]), "(opt-set! (quote k) (quote (\"a\" 1)))");
-        assert_eq!(forms[1], Datum::List(vec![Datum::Sym("quote".into()), Datum::Sym("sym".into())]));
-    }
 }

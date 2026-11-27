@@ -18,6 +18,10 @@ use crate::core::AppEvent;
 pub fn run(cwd: PathBuf) -> io::Result<()> {
     let mut term = terminal::init();
     let mut app = App::boot(cwd);
+    app.ui.set_cell_px(terminal::cell_px(&mut term));
+    app.ui.set_graphics_support(terminal::graphics_support());
+    // What graphics are on screen; emits only the changes (ui/graphics.rs).
+    let mut graphics = crate::ui::graphics::Output::new(terminal::remote());
 
     // While a Suspended child (the editor) runs in the foreground, the input
     // thread must not also read stdin — otherwise it steals the editor's input
@@ -68,17 +72,13 @@ pub fn run(cwd: PathBuf) -> io::Result<()> {
             derived = Some((generation, d));
         }
         let Some((_, d)) = &derived else { unreachable!("built above") };
-        let snapshot = app.monitor.snapshot();
-        let view = crate::ui::render::View {
-            opts: &d.top,
-            layouts: &app.layouts,
-            options: &app.store,
-            keymap: &app.keymap,
-            conds: &app.conditions,
-            monitor: &snapshot,
-        };
-        let theme = &d.theme;
-        if let Err(e) = term.draw(|f| app.ui.render(f, &app.state, &app.extensions, &view, theme)) {
+        if let Err(e) = draw(&mut term, &mut app, d) {
+            break Err(e);
+        }
+        // Graphics go out after the draw, as control strings, and only what
+        // changed.
+        let cmds = graphics.frame(app.ui.placements(), crate::ui::graphics::take_passthrough());
+        if let Err(e) = terminal::write_graphics(&mut term, &cmds) {
             break Err(e);
         }
         app.after_draw();
@@ -92,7 +92,12 @@ pub fn run(cwd: PathBuf) -> io::Result<()> {
         match app.rx.recv_timeout(deadline) {
             Ok(AppEvent::Key(k)) => app.handle_key(k),
             Ok(AppEvent::Async(r)) => app.handle_async(r),
-            Ok(AppEvent::Resize(_, _)) | Ok(AppEvent::Tick) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(AppEvent::Resize(_, _)) => {
+                // ratatui clears the screen on resize; the cell size may move.
+                app.ui.set_cell_px(terminal::cell_px(&mut term));
+                graphics.invalidate();
+            }
+            Ok(AppEvent::Tick) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break Ok(()),
         }
         // After the event, never before: an extension reacting to something
@@ -112,12 +117,28 @@ pub fn run(cwd: PathBuf) -> io::Result<()> {
                 Ok(t) => term = t,
                 Err(e) => break Err(e),
             }
+            // A fresh screen: nothing of ours is on it.
+            graphics.invalidate();
             app.after_suspend();
         }
     };
 
     terminal::restore();
     result
+}
+
+/// Render one frame.
+fn draw(term: &mut ratatui::DefaultTerminal, app: &mut App, d: &Derived) -> io::Result<()> {
+    let snapshot = app.monitor.snapshot();
+    let view = crate::ui::render::View {
+        opts: &d.top,
+        layouts: &app.layouts,
+        options: &app.store,
+        keymap: &app.keymap,
+        conds: &app.conditions,
+        monitor: &snapshot,
+    };
+    term.draw(|f| app.ui.render(f, &app.state, &app.extensions, &view, &d.theme)).map(|_| ())
 }
 
 /// What render needs from the options, built once per options generation.
@@ -139,7 +160,9 @@ impl Derived {
             },
             file_row_size_graph: s.get_bool("file-row-size-graph"),
         };
-        let theme = app.theme_registry.read().map(|r| r.resolve_active()).unwrap_or_else(|_| crate::core::Theme::default());
+        // Through the projection, not the shared registry: the registry only
+        // follows the store when synced, and this is cached per generation.
+        let theme = app.theme_source.resolve_active();
         Derived { top, theme }
     }
 }

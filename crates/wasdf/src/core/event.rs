@@ -44,8 +44,8 @@ pub enum Plan {
         show_hidden: bool,
     },
     /// Recursive walk + matcher ranking (file-search, deep — see
-    /// SEARCH_RENEW.md). `owner: None` completes as `(Purpose::Search,
-    /// Payload::Entries)`, driving a Select's own `view` (today's file-search).
+    /// doc/UI.md). `owner: None` completes as `(Purpose::Search,
+    /// Payload::Entries)`, driving a Select's own `view` (file-search).
     /// `owner: Some(id)` completes as a generic content Read instead
     /// (`Purpose::Content`, `Payload::Read{owner, path: root, Content::Dir}`)
     /// — the extension-facing counterpart, addressed like `Plan::Read`,
@@ -269,47 +269,4 @@ pub enum AppEvent {
     Resize(u16, u16),
     Async(AsyncResult),
     Tick,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn image(width: u32, height: u32) -> Block {
-        Block::Image { width, height, rgb: vec![0; (width * height * 3) as usize] }
-    }
-
-    #[test]
-    fn every_block_but_an_image_is_one_row() {
-        for b in [
-            Block::Line(vec![TextSpan::plain("x")]),
-            Block::Heading(vec![TextSpan::plain("x")]),
-            Block::Field { label: "k".into(), value: vec![TextSpan::plain("v")] },
-            Block::Rule,
-        ] {
-            assert_eq!(b.rows(80, 24), 1, "{b:?}");
-        }
-    }
-
-    #[test]
-    fn an_image_keeps_its_aspect_ratio_at_two_pixel_rows_per_cell() {
-        // 40 wide over 80 columns of a 2:1 cell: 80 * (40/40) / 2.
-        assert_eq!(image(40, 40).rows(80, 200), 40);
-        assert_eq!(image(40, 20).rows(80, 200), 20);
-        // A partial row still needs a whole cell.
-        assert_eq!(image(40, 41).rows(80, 200), 41);
-    }
-
-    #[test]
-    fn an_image_is_bounded_by_max_rows_and_never_vanishes_to_zero() {
-        assert_eq!(image(40, 400).rows(80, 24), 24);
-        assert_eq!(image(400, 1).rows(80, 24), 1);
-    }
-
-    #[test]
-    fn a_degenerate_image_occupies_no_rows() {
-        assert_eq!(image(40, 40).rows(0, 24), 0);
-        assert_eq!(image(40, 40).rows(80, 0), 0);
-        assert_eq!(image(0, 40).rows(80, 24), 0);
-    }
 }

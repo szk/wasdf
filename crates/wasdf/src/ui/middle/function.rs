@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use crate::ui::chrome::{PanelArea, PanelFrame, ScrollInfo};
 use crate::ui::content;
+use crate::ui::graphics::{self, Graphic, GraphicsConfig, Placement};
 
 use super::{max_scroll, scrolled, ScrollMemory};
 
@@ -51,12 +52,7 @@ pub fn render_function(
                     Some((total, position)) => {
                         push_function(panels, area, &title, focused, ScrollInfo { total, viewport: inner.height as usize, position }, mem)
                     }
-                    None => {
-                        mem.set_function_title(&title);
-                        panels.push(
-                            area.frame().title(title).focused(focused),
-                        );
-                    }
+                    None => push_unscrolled(panels, area, &title, focused, mem),
                 }
             }
             return;
@@ -99,6 +95,7 @@ pub fn render_function(
                 let title = content::title(content_target(state).as_deref(), &state.function.search);
                 let draw = layout_view(&view, state, inner, title, theme, mem);
                 draw_function(frame, area, inner, draw, focused, mem, panels);
+                blank_placed(frame, mem, theme);
             } else {
                 // No content to draw. Distinguish "nothing under the cursor"
                 // (an empty directory — there is nothing to preview) from a
@@ -119,8 +116,7 @@ pub fn render_function(
                     Paragraph::new(Span::styled(msg, theme.style(Role::Muted))),
                     inner,
                 );
-                mem.set_function_title("content");
-                panels.push(area.frame().title("content").focused(focused));
+                push_unscrolled(panels, area, "content", focused, mem);
             }
         }
     }
@@ -143,6 +139,19 @@ fn push_function(
         f = f.scroll(scroll);
     }
     panels.push(f);
+}
+
+/// Push a panel frame that has no scrollbar.
+fn push_unscrolled(panels: &mut Vec<PanelFrame>, area: PanelArea, title: &str, focused: bool, mem: &mut ScrollMemory) {
+    mem.set_function_title(title);
+    panels.push(area.frame().title(title).focused(focused));
+}
+
+/// The columns an image block takes: clear of the line-number gutter, so the
+/// picture lines up with the prose around it. Returns `(gutter, cols)`.
+fn image_cols(inner: Rect, line_numbers: bool) -> (u16, u16) {
+    let gutter = if line_numbers { LINE_NUMBER_WIDTH } else { 0 };
+    (gutter, inner.width.saturating_sub(gutter))
 }
 
 /// Blit a laid-out [`FunctionDraw`] into the function panel: its visible
@@ -183,6 +192,10 @@ pub(super) struct Lowered {
     size: (u16, u16),
     line_numbers: bool,
     generation: u64,
+    /// The graphics config the images were encoded with.
+    graphics: GraphicsConfig,
+    /// The encoded images, by where they sit in `rows`.
+    images: Vec<LoweredImage>,
     rows: Vec<Row>,
     /// Per row, the block it shows and the bytes before that block's text on
     /// the row (a field's label column) — how logical search matches are put
@@ -193,7 +206,17 @@ pub(super) struct Lowered {
     width: usize,
 }
 
-fn lower(view: &Arc<PanelView>, inner: Rect, line_numbers: bool, generation: u64, theme: &Theme) -> Lowered {
+/// An image lowered with a graphics protocol: its first row, its left column
+/// offset in the panel, the rows its block spans, and the encoded picture.
+pub(super) struct LoweredImage {
+    row: usize,
+    col: u16,
+    span: usize,
+    graphic: Arc<Graphic>,
+}
+
+fn lower(view: &Arc<PanelView>, inner: Rect, line_numbers: bool, generation: u64, graphics: GraphicsConfig, theme: &Theme) -> Lowered {
+    let mut images = Vec::new();
     let (rows, origins, first_row, width) = match &**view {
         PanelView::Document(blocks) => {
             let label_w = blocks
@@ -208,6 +231,20 @@ fn lower(view: &Arc<PanelView>, inner: Rect, line_numbers: bool, generation: u64
             for (i, b) in blocks.iter().enumerate() {
                 first_row.push(rows.len());
                 let text_len = b.text().map(|t| t.len());
+                // The chosen protocol cannot draw here: say so on the image's
+                // first row; its symbol cells follow.
+                if let (Block::Image { .. }, Some(msg)) = (b, graphics.unavailable()) {
+                    rows.push(unavailable_row(msg, theme));
+                    origins.push(None);
+                }
+                let start = rows.len();
+                if let (Block::Image { width: w, height: h, rgb }, Some((proto, px))) = (b, graphics.active()) {
+                    let (gutter, cols) = image_cols(inner, line_numbers);
+                    let span = b.rows(cols, inner.height.max(1));
+                    if let Some(g) = graphics::prepare(proto, px, *w, *h, rgb, cols, span) {
+                        images.push(LoweredImage { row: start, col: gutter, span: span as usize, graphic: g });
+                    }
+                }
                 for row in lower_block(b, label_w, inner, line_numbers, theme) {
                     origins.push(match (&row, text_len) {
                         (Row::Text(text, _), Some(n)) => Some((i, text.len() - n)),
@@ -229,12 +266,20 @@ fn lower(view: &Arc<PanelView>, inner: Rect, line_numbers: bool, generation: u64
             (rows, origins, first_row, width)
         }
         PanelView::Image { width, height, rgb } => {
-            let rows: Vec<Row> = content::image_cells(*width, *height, rgb, inner.width, inner.height).into_iter().map(Row::Image).collect();
+            let note = graphics.unavailable().map(|msg| unavailable_row(msg, theme));
+            let cell_rows = inner.height.saturating_sub(u16::from(note.is_some()));
+            let cells = content::image_cells(*width, *height, rgb, inner.width, cell_rows).into_iter().map(Row::Image);
+            let rows: Vec<Row> = note.into_iter().chain(cells).collect();
+            if let Some((proto, px)) = graphics.active()
+                && let Some(g) = graphics::prepare(proto, px, *width, *height, rgb, inner.width, inner.height)
+            {
+                images.push(LoweredImage { row: 0, col: 0, span: rows.len(), graphic: g });
+            }
             let origins = vec![None; rows.len()];
             (rows, origins, Vec::new(), 0)
         }
     };
-    Lowered { view: view.clone(), size: (inner.width, inner.height), line_numbers, generation, rows, origins, first_row, width }
+    Lowered { view: view.clone(), size: (inner.width, inner.height), line_numbers, generation, graphics, images, rows, origins, first_row, width }
 }
 
 /// Lay out a logical [`PanelView`] into a drawable [`FunctionDraw`]. This is the
@@ -250,9 +295,10 @@ fn layout_view(view: &Arc<PanelView>, state: &AppState, inner: Rect, title: Stri
             && l.size == (inner.width, inner.height)
             && l.line_numbers == f.show_line_numbers
             && l.generation == mem.generation
+            && l.graphics == mem.graphics
     };
     if !mem.lowered.as_ref().is_some_and(fresh) {
-        mem.lowered = Some(lower(view, inner, f.show_line_numbers, mem.generation, theme));
+        mem.lowered = Some(lower(view, inner, f.show_line_numbers, mem.generation, mem.graphics, theme));
     }
     let Some(lowered) = mem.lowered.as_ref() else { unreachable!("filled above") };
     let document = matches!(&**view, PanelView::Document(_));
@@ -272,6 +318,18 @@ fn layout_view(view: &Arc<PanelView>, state: &AppState, inner: Rect, title: Stri
     let matches = &f.search.matches;
     // Clamp h-scroll to the content width (no over-scroll into blank).
     let hscroll = f.hscroll.offset().min(lowered.width.saturating_sub(inner.width as usize));
+    // Place every image whose picture is wholly on screen; the rest keep
+    // their cells. `blank_placed` clears the cells under them after the draw.
+    if mem.graphics_allowed {
+        for img in &lowered.images {
+            if img.row >= scroll && img.row + img.graphic.rows as usize <= scroll + content_h {
+                let (x, y) = (inner.x + img.col, inner.y + (img.row - scroll) as u16);
+                let span = img.span.min(scroll + content_h - img.row) as u16;
+                mem.placements.push(Placement { x, y, graphic: img.graphic.clone() });
+                mem.graphic_blanks.push(Rect { x, y, width: inner.width.saturating_sub(img.col), height: span });
+            }
+        }
+    }
     let lines: Vec<Line> = lowered.rows[scroll..(scroll + content_h).min(total)]
         .iter()
         .enumerate()
@@ -292,6 +350,38 @@ fn layout_view(view: &Arc<PanelView>, state: &AppState, inner: Rect, title: Stri
         })
         .collect();
     FunctionDraw { lines, title, scroll, total, width: lowered.width, prompt }
+}
+
+/// The muted line an image shows when `image-protocol` cannot draw on this
+/// display (`ui::graphics::GraphicsConfig::unavailable`).
+fn unavailable_row(msg: String, theme: &Theme) -> Row {
+    let segs = vec![(msg.len(), theme.style(Role::Muted))];
+    Row::Text(msg, segs)
+}
+
+/// Clear the cells under this frame's placed images: the whole block area to
+/// the base color, and the picture's own cells marked `skip` so the backend
+/// never paints over the graphic the event loop writes there.
+fn blank_placed(frame: &mut Frame, mem: &mut ScrollMemory, theme: &Theme) {
+    let base = theme.style(Role::Base);
+    let buf = frame.buffer_mut();
+    let area = buf.area;
+    for r in mem.graphic_blanks.drain(..) {
+        for y in r.top()..r.bottom().min(area.bottom()) {
+            for x in r.left()..r.right().min(area.right()) {
+                buf[(x, y)].reset();
+                buf[(x, y)].set_style(base);
+            }
+        }
+    }
+    for p in &mem.placements {
+        let r = p.rect().intersection(area);
+        for y in r.top()..r.bottom() {
+            for x in r.left()..r.right() {
+                buf[(x, y)].set_diff_option(ratatui::buffer::CellDiffOption::Skip);
+            }
+        }
+    }
 }
 
 /// One laid-out panel row. Text rows still carry their logical `(byte-len,
@@ -329,10 +419,7 @@ fn lower_block(b: &Block, label_w: usize, inner: Rect, line_numbers: bool, theme
             vec![Row::Text(text, segs)]
         }
         Block::Image { width: w, height: h, rgb } => {
-            // Keep the picture clear of the line-number gutter so it lines up
-            // with the prose around it.
-            let gutter = if line_numbers { LINE_NUMBER_WIDTH } else { 0 };
-            let cols = inner.width.saturating_sub(gutter);
+            let (gutter, cols) = image_cols(inner, line_numbers);
             let rows = b.rows(cols, inner.height.max(1));
             content::image_cells(*w, *h, rgb, cols, rows)
                 .into_iter()
@@ -388,7 +475,7 @@ fn span_style(s: &TextSpan, theme: &Theme, emphasized: bool) -> Style {
 
 /// The path whose content the function panel is showing (for the title): the
 /// File-mode cursor entry, or the moving hit in any Select entry-grid view
-/// (deep file-search, a shallow filter/refine — SEARCH_RENEW.md). Mirrors the
+/// (deep file-search, a shallow filter/refine). Mirrors the
 /// previewer's own cursor target so the title matches what is rendered; both
 /// share `AppState::cursor_path`, the single mode-dispatch for "what's under
 /// the cursor".
@@ -460,25 +547,24 @@ fn render_command_summary(frame: &mut Frame, area: PanelArea, inner: Rect, state
             // Assemble the live command line. With a resolved skeleton, walk it so
             // the panel shows the actual external command (`mv …`, `cp -R …`),
             // filling placeholders with the live opts / paths / target. Without one
-            // (extension ctx / tests), fall back to the op key plus the same args.
+            // (extension ctx / tests), walk the op key plus the same args.
+            use crate::core::CmdToken;
+            let fallback;
+            let tokens = if spec.command_line.is_empty() {
+                fallback = [CmdToken::Lit(template.op.clone()), CmdToken::Opts, CmdToken::Src, CmdToken::Paths, CmdToken::Dst];
+                &fallback[..]
+            } else {
+                &spec.command_line[..]
+            };
             let disp = |p: &std::path::PathBuf| p.display().to_string();
             let mut parts: Vec<String> = Vec::new();
-            if spec.command_line.is_empty() {
-                parts.push(template.op.clone());
-                parts.extend(opts.clone());
-                parts.extend(template.src.iter().map(disp));
-                parts.extend(template.paths.iter().map(disp));
-                parts.push(target);
-            } else {
-                use crate::core::CmdToken;
-                for tok in &spec.command_line {
-                    match tok {
-                        CmdToken::Lit(s) => parts.push(s.clone()),
-                        CmdToken::Opts => parts.extend(opts.clone()),
-                        CmdToken::Src => parts.extend(template.src.iter().map(disp)),
-                        CmdToken::Paths => parts.extend(template.paths.iter().map(disp)),
-                        CmdToken::Dst | CmdToken::Path => parts.push(target.clone()),
-                    }
+            for tok in tokens {
+                match tok {
+                    CmdToken::Lit(s) => parts.push(s.clone()),
+                    CmdToken::Opts => parts.extend(opts.iter().cloned()),
+                    CmdToken::Src => parts.extend(template.src.iter().map(disp)),
+                    CmdToken::Paths => parts.extend(template.paths.iter().map(disp)),
+                    CmdToken::Dst | CmdToken::Path => parts.push(target.clone()),
                 }
             }
 
@@ -495,6 +581,5 @@ fn render_command_summary(frame: &mut Frame, area: PanelArea, inner: Rect, state
             lines.push(Line::from(Span::styled(hint, theme.style(Role::Muted))));
         }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-    mem.set_function_title("Command");
-    panels.push(area.frame().title("Command").focused(focused));
+    push_unscrolled(panels, area, "Command", focused, mem);
 }

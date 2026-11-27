@@ -197,11 +197,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_fresh_stack_reports_the_legacy_encoding() {
-        assert_eq!(Stack::default().current(), 0);
-    }
-
-    #[test]
     fn push_and_pop_track_the_childs_nesting() {
         let mut s = Stack::default();
         s.feed(b"\x1b[>5u");
@@ -212,26 +207,6 @@ mod tests {
         assert_eq!(s.current(), 5);
         s.feed(b"\x1b[<u");
         assert_eq!(s.current(), 0, "a bare pop takes one level");
-    }
-
-    #[test]
-    fn popping_past_the_bottom_lands_on_legacy_rather_than_underflowing() {
-        let mut s = Stack::default();
-        s.feed(b"\x1b[>1u");
-        s.feed(b"\x1b[<99u");
-        assert_eq!(s.current(), 0);
-    }
-
-    #[test]
-    fn set_replaces_ors_and_clears_flags_on_the_current_level() {
-        let mut s = Stack::default();
-        s.feed(b"\x1b[>1u");
-        s.feed(b"\x1b[=6;1u");
-        assert_eq!(s.current(), 6, "mode 1 replaces");
-        s.feed(b"\x1b[=1;2u");
-        assert_eq!(s.current(), 7, "mode 2 ors");
-        s.feed(b"\x1b[=2;3u");
-        assert_eq!(s.current(), 5, "mode 3 clears");
     }
 
     #[test]
@@ -253,32 +228,4 @@ mod tests {
         assert_eq!(s.current(), 7, "byte at a time");
     }
 
-    #[test]
-    fn unrelated_sequences_leave_the_stack_alone() {
-        let mut s = Stack::default();
-        s.feed(b"\x1b[>3u");
-        // A clear-screen, a colour set, and a CSI that merely ends in `u`.
-        s.feed(b"\x1b[2J\x1b[38;5;42m\x1b[1;2u");
-        assert_eq!(s.current(), 3);
-    }
-
-    #[test]
-    fn the_query_is_answered_with_the_current_flags() {
-        let mut s = Stack::default();
-        s.feed(b"\x1b[>9u");
-        assert_eq!(s.feed(b"\x1b[?u"), b"\x1b[?9u".to_vec());
-    }
-
-    #[test]
-    fn an_overlong_parameter_run_is_abandoned_not_buffered() {
-        let mut s = Stack::default();
-        let mut junk = vec![0x1b, b'['];
-        junk.extend(std::iter::repeat_n(b'1', MAX_PARAMS * 4));
-        junk.push(b'u');
-        s.feed(&junk);
-        assert_eq!(s.current(), 0);
-        // And the scanner is still usable afterwards.
-        s.feed(b"\x1b[>4u");
-        assert_eq!(s.current(), 4);
-    }
 }

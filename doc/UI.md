@@ -188,8 +188,8 @@ plain border line. The scrollbar occupies the panel's existing right-border
 column and never consumes interior width.
 
 A panel's top border may carry a left-aligned title (`[ title ]`, or an
-unbracketed banner) and a right-aligned info string (e.g. the prop panel's load
-and clock readout). Both are drawn over the border and flow around junction
+unbracketed banner) and a right-aligned info string (e.g. the top row's status
+readout). Both are drawn over the border and flow around junction
 cells, so the connected frame and its junctions stay intact under long text.
 
 The `[ ` / ` ]` brackets carry their own theme role, distinct from the title
@@ -246,8 +246,17 @@ Panels nest: the **top** panel is a container whose children are **nav**,
 |-------|-------------|----------|
 | top | Container for the top row; holds the nav, prop, and monitor panels side by side | kernel UI |
 | nav | Child of top. A Finder-style column (Miller) directory navigator: the path from root to the current directory runs along the panel's horizontal axis, each level's sibling directories stack vertically in its column (the path element centered, `─` linking adjacent levels), the current directory is highlighted, and columns are right-aligned on overflow so it stays visible. The columns are `AppState.trail`, computed by the ReadDir worker — the panel reads no directory itself. Its title is the app banner `/ wasdf vX /` (unbracketed) | kernel UI |
-| prop | Child of top. The cursor entry's properties — PATH, SIZE (human + bytes), PERM (permissions, owner, group — names resolved in the worker), and the C/M/A times — each truncated to width. Its top border carries a live readout, right-aligned: the load averages (from the Monitor snapshot) and the local time, refreshed every `prop.refresh-ms` (default 1000) | kernel UI |
-| monitor | Child of top. System metrics (cpu, mem, net, disk) as gauges with rolling sparklines, drawn from the Monitor service's latest snapshot; the sampler runs on its own thread at `monitor.*` cadence. Toggled by `top.monitor-visible` | kernel UI |
+| prop | Child of top. The cursor entry's properties — PATH, SIZE (human + bytes), PERM (permissions, owner, group — names resolved in the worker), and the C/M/A times — each truncated to width | kernel UI |
+| monitor | Child of top. System metrics as gauges with rolling sparklines, top to bottom CPU / MEM / NET / DSK — a short panel loses rows from the bottom, so CPU/MEM/NET stay longest — drawn from the Monitor service's latest snapshot; the sampler runs on its own thread at `monitor.*` cadence. Toggled by `top.monitor-visible` | kernel UI |
+
+**Status readout.** The rightmost top panel's border carries, right-aligned
+and clear of the corner, `[WiFi:76%]─[BAT:87%]─[YY-MM-DD HH:MM:SS]─`: the
+clock at the right end, the battery (`+` while charging) and WiFi signal to its
+left, each only when the machine reports it (battery: Linux
+`/sys/class/power_supply`, macOS `pmset`; WiFi: Linux `/proc/net/wireless`,
+sampled every 30 s). Too narrow, it gives up the date, the seconds, WiFi,
+then BAT. Refreshed every
+`prop.refresh-ms` (default 1000).
 | file | The file list. Its title shows the full current-directory path | kernel UI |
 | function | Renderer container (see the frame table below) | kernel UI + extensions |
 | help | Key hints, drawn in reverse video (negative). **Generated from the labelled bindings actually in force** — every chip is a key that would really fire, resolved through the same walk `handle_key` uses, so the row cannot drift from the keymap ([HELP.md](HELP.md)). While an extension holds the raw keyboard the row shows the capture's release key instead, since nothing else is reachable | kernel UI |
@@ -292,8 +301,10 @@ nothing to preview: the provider **drops its stashed content** so the previous
 file's content and title do not linger, and the content frame shows the `(empty)`
 placeholder (matching the prop panel). This is a property of *following with no
 target*, not of hiding the panel — a panel that is merely hidden keeps its stash,
-so toggling it back does not force a reload. The file panel itself simply shows
-no rows.
+so toggling it back does not force a reload. The file panel itself shows a
+muted `Empty Dir` (a filter that matched nothing stays blank — that is not an
+empty directory). A **directory under the cursor** that has nothing in it
+previews as the same muted `Empty Dir`.
 
 A content read that was already **in flight** when the cursor left its target
 is **dropped on arrival**: the kernel discards any cursor-follow completion whose
@@ -324,6 +335,24 @@ cursor entry (nothing worth previewing for that file), the function panel
 shows `N/A` (file metadata lives in the prop panel) — distinct from `(empty)`
 (nothing under the cursor at all) and `(loading…)` (a read is in flight).
 
+
+### Images: `image-protocol`
+
+`@/settings/Display/image-protocol` picks how image previews (a picture file,
+a Markdown image) reach the display: `off` (default) draws them as symbol
+cells, which works everywhere; `sixel` / `kitty` use that graphics protocol.
+The picture is scaled — up or down, aspect kept — until its longer side meets
+the image area. It is placed only when it is wholly visible and no overlay
+covers the panels; otherwise its symbol cells show.
+
+Whether the display can draw the chosen protocol is known at start: upstream
+probes its terminal once (a kitty graphics query answered `OK`, and DA1
+parameter `4` for sixel); a backend that draws itself declares it (cz-wasdf's
+framebuffer: kitty only). When it cannot — or the terminal reports no cell
+size in pixels — the image area's first row reads
+`image-protocol: <name> not available` above the symbol cells. Kitty pixels
+travel through POSIX shared memory (`t=s`), inline base64 over ssh; see
+`ui/graphics.rs`.
 ## Vertical Responsiveness
 
 Two size classes. A layout's `(size N M)` gives the Large and Compact sizes; the
@@ -617,7 +646,7 @@ to the extension before that, so Cancel never needs to roll anything back.
 | Bool | a 2-row List, `On`/`Off` | wasd/arrows (any direction) or Space — flips | `"#t"` / `"#f"` |
 | Choice | a List, one row per option | w/s or Up/Down | the chosen option string |
 | Int | a Gauge over `min..max` | a/d or Left/Right ±1, w/s or Up/Down ±10, W/S or Home/End → min/max, or type digits directly | the decimal string |
-| List | a Table (items + "+ Add" + "✓ Confirm" rows) | w/s or Up/Down browse, `a` add, `d`/Delete/Backspace remove, Enter edits/adds/confirms depending on the row | comma-joined |
+| List | a Table (items + "+ Add" + "* Confirm" rows) | w/s or Up/Down browse, `a` add, `d`/Delete/Backspace remove, Enter edits/adds/confirms depending on the row | comma-joined |
 
 Runtime state lives in `AppState::input_form`, one `InputFormState` variant
 per kind holding just what that widget needs. Typing (Text, and List's nested
@@ -643,7 +672,7 @@ keymap-declared either.
 Enter confirms: pop the mode, then re-inject `template` with the encoded
 value inserted under the reserved `KEY_ITEM` key, regardless of kind. (`List` is the one
 exception: Enter is contextual on which row is selected — it edits/adds a
-row on every row except the trailing "✓ Confirm" one, since `keymap.scm`
+row on every row except the trailing "* Confirm" one, since `keymap.scm`
 binds Enter to `Intent::Confirm` for every InputForm instance and there is
 no other way to give Enter both a row-local meaning and a way to actually
 confirm.) Esc always cancels the **whole** popup regardless of any such
@@ -716,10 +745,12 @@ operates on the **function** panel focuses the function panel. This is a single,
 uniform rule in the reducer (`intent_focus`), applied before every intent is
 handled — not per-intent focus code:
 
-- **File panel** ← `Cursor{Up,Down,Left,Right,Top,Bottom}` (the `wasd` keys) and
-  `Activate`.
+- **File panel** ← `Cursor{Up,Down,Left,Right,Top,Bottom}` (the `wasd` keys and,
+  from the file panel, the arrows) and `Activate`.
 - **Function panel** ← `Func{Up,Down,Left,Right}` (the `hjkl` keys from the file
-  panel), `Scroll*` / `Page*`, and `Open`.
+  panel), `Scroll*` / `Page*`, and `Open` — only while the function panel is on
+  screen (beside a Select that gives it a hint, otherwise when shown). A hidden
+  panel never takes focus: its keys would apply with nothing to show them.
 - **Exception — an active form keeps focus.** While an extension holds the
   function panel as an active form (`SetFunctionForm`) and the panel has focus,
   keys bound to file-targeting intents (`wasd`, `W`/`S`, `Enter` → Activate) are
@@ -763,15 +794,15 @@ Core layer (`app/keymap.scm`):
 
 | Key | Intent | Description |
 |-----|--------|-------------|
-| w | CursorUp | move the cursor up one cell (clamp at the column top) |
-| s | CursorDown | move the cursor down one cell (clamp at the column bottom) |
-| a | CursorLeft | move the cursor one column left; at the leftmost column, parent directory |
-| d | CursorRight | move the cursor one column right; at the **Rows** right wall, dir → enter, file → show its content (Columns/Grid clamp) |
+| w, Up | CursorUp | move the cursor up one cell (clamp at the column top) |
+| s, Down | CursorDown | move the cursor down one cell (clamp at the column bottom) |
+| a, Left | CursorLeft | move the cursor one column left; at the leftmost column, parent directory |
+| d, Right | CursorRight | move the cursor one column right; at the **Rows** right wall, dir → enter, file → show its content (Columns/Grid clamp) |
 | Enter, e | Activate | enter the directory, or open the file via the resolver (any cell, any layout) |
 | W, S | CursorTop, CursorBottom | first / last entry |
 | v | CycleListLayout | Rows → Columns → Grid → Rows |
-| k, Up; j, Down | FuncUp, FuncDown | scroll the function panel |
-| h, Left; l, Right | FuncLeft, FuncRight | h-scroll the function panel |
+| k, j | FuncUp, FuncDown | scroll the function panel |
+| h, l | FuncLeft, FuncRight | h-scroll the function panel |
 | Space | ToggleSelect | toggle selection; the cursor does not advance |
 | Ctrl-a | SelectAll | select all |
 | f | push `file-search` (`:when (and (not filter-maxed) (not cwd-virtual))`), or FilterListing (`:when (and (not filter-maxed) cwd-virtual)`) | deep search on a real directory, shallow filter on a virtual one — see "Deep search vs. shallow filter" |
@@ -904,7 +935,7 @@ caret's line is empty, in which case Enter submits.
 
 | Key | Intent | Condition |
 |-----|--------|-----------|
-| Enter | Confirm (pop, re-inject `template` with the encoded value under `KEY_ITEM` — except `List`, where Enter edits/adds a row unless the cursor is on the trailing "✓ Confirm" row) | |
+| Enter | Confirm (pop, re-inject `template` with the encoded value under `KEY_ITEM` — except `List`, where Enter edits/adds a row unless the cursor is on the trailing "* Confirm" row) | |
 | Esc | Cancel (pop, emit nothing, regardless of kind or any nested row-edit state) | |
 | w, Up; s, Down | CursorUp, CursorDown | not input-form-typing |
 | Left; Right | CursorLeft, CursorRight | not input-form-typing |

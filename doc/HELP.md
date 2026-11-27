@@ -69,7 +69,7 @@ through it and the row shows both the overlay's keys and those beneath.
   otherwise they join with `/` (`Enter/Esc`).
 - Because merging is by label, a label must name one meaning: two unrelated
   actions never share a word (the file cursor is `cursor`, the operation is
-  `move`; core's suspending editor is `edit full`, the PTY-hosted one `edit`).
+  `move`; core's suspending editor is `Edit full`, the PTY-hosted one `edit`).
 - **Order** is the store's `help` display order when it lists the label;
   labels it does not list follow in registration order — Core, then
   Extension, then User — with a label's first appearance fixing its position. Bindings are written in the

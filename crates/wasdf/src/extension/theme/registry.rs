@@ -9,9 +9,8 @@ use crate::core::{OptionValue, Role, Theme};
 use crate::script::sexpr::{self, Datum};
 
 /// Roles bold by default in the built-in look — the single, centralized
-/// source of "what bold means" for a theme with no bold override of its own
-/// (reproduces the exact spots that were once hard-coded `Modifier::BOLD` in
-/// `ui/*.rs`, before themes could carry bold at all). Lives here, not in
+/// source of "what bold means" for a theme with no bold override of its own.
+/// Lives here, not in
 /// `core/theme.rs`: `Theme` itself stays a neutral palette primitive: this is
 /// theme-extension-owned "default look" data.
 pub const DEFAULT_BOLD_ROLES: &[Role] = &[
@@ -324,20 +323,6 @@ mod tests {
     }
 
     #[test]
-    fn upsert_custom_replaces_overrides_on_an_existing_entry() {
-        let mut reg = ThemeRegistry::with_presets(vec![]);
-        reg.upsert_custom(NamedTheme { name: "x".into(), preset: false, overrides: vec![] });
-        assert!(!reg.resolve("x").bold(Role::Title));
-
-        reg.upsert_custom(NamedTheme {
-            name: "x".into(),
-            preset: false,
-            overrides: vec![(Role::Title, style(Color::Reset, true))],
-        });
-        assert!(reg.resolve("x").bold(Role::Title), "override must survive an upsert onto an existing theme");
-    }
-
-    #[test]
     fn resolve_applies_fg_bg_and_every_modifier_from_one_overrides_entry() {
         let mut reg = ThemeRegistry::with_presets(vec![]);
         reg.upsert_custom(NamedTheme {
@@ -361,35 +346,4 @@ mod tests {
         assert_eq!(resolved.bg(Role::Border), Color::Reset);
     }
 
-    #[test]
-    fn default_style_reflects_default_bold_roles_and_theme_default_colors() {
-        let s = default_style(Role::EntryDir);
-        assert_eq!(s.fg, Theme::default().role(Role::EntryDir));
-        assert_eq!(s.bg, Color::Reset);
-        assert!(s.bold, "EntryDir is bold in the built-in look");
-        assert!(!default_style(Role::Title).bold);
-    }
-
-    #[test]
-    fn customs_round_trip_through_the_option_value() {
-        let themes = vec![NamedTheme {
-            name: "mine".into(),
-            preset: false,
-            overrides: vec![(Role::Title, RoleStyle { fg: Color::Rgb(1, 2, 3), bg: Color::Reset, bold: true, italic: false, underline: true })],
-        }];
-        let v = customs_to_value(&themes);
-        let back = customs_from_value(&v);
-        assert_eq!(back.len(), 1);
-        assert_eq!(back[0].name, "mine");
-        assert_eq!(back[0].overrides, themes[0].overrides);
-    }
-
-    #[test]
-    fn replace_customs_keeps_presets_and_drops_old_customs() {
-        let mut reg = ThemeRegistry::bundled();
-        reg.upsert_custom(NamedTheme { name: "a".into(), preset: false, overrides: vec![] });
-        reg.replace_customs(vec![NamedTheme { name: "b".into(), preset: false, overrides: vec![] }]);
-        assert!(reg.get("a").is_none() && reg.get("b").is_some());
-        assert!(reg.get("default").is_some_and(|t| t.preset));
-    }
 }

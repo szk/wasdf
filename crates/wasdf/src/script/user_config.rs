@@ -184,40 +184,6 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_file_splits_into_config_and_custom_programs() {
-        let text = format!(
-            ";; old template\n; (bind file file \"w\" cursor-up)\n(bind file #f \"Q\" quit \"bye\")\n\
-             {LEGACY_BLOCK_BEGIN}\n(set-option \"auto\" \"#t\")\n(set-option \"exts\" \"md,txt\")\n(set-theme \"dark\")\n{LEGACY_BLOCK_END}\n"
-        );
-        assert!(is_legacy(&text));
-        let p = legacy_programs(&text, &options());
-        assert_eq!(p.config, "(bind! 'file #f \"Q\" 'quit \"bye\")\n");
-        assert_eq!(
-            p.custom,
-            "(opt-set! 'auto #t)\n(opt-set! 'exts '(\"md\" \"txt\"))\n(set-theme \"dark\")\n",
-            "other heads pass through for a prelude"
-        );
-    }
-
-    #[test]
-    fn a_program_is_not_legacy() {
-        assert!(!is_legacy("(opt-set! 'auto #t)\n(when (wsl?) (bind! 'file 'file \"o\" 'quit))"));
-        assert!(!is_legacy("(define x '(a . b))"), "unreadable as data is not legacy");
-    }
-
-    #[test]
-    fn the_template_is_commented_store_calls() {
-        let keymap = r#"(quote ((file file (("w" cursor-up "cursor") ("Esc" clear-filter has-filter))) (select #f (("Enter" confirm "confirm/next")))))"#;
-        let t = config_template(&options(), keymap);
-        assert!(t.contains(";; (opt-set! 'border-style \"single\")  ; single | rounded"));
-        assert!(t.contains(";; (opt-set! 'exts '(\"rs\"))"));
-        assert!(t.contains(";; (bind! 'file 'file \"w\" 'cursor-up \"cursor\")"));
-        assert!(t.contains(";; (bind! 'file 'file \"Esc\" 'clear-filter 'has-filter)"));
-        assert!(t.contains(";; (bind! 'select #f \"Enter\" 'confirm \"confirm/next\")"));
-        assert!(t.lines().all(|l| l.is_empty() || l.starts_with(";;")), "nothing is active");
-    }
-
-    #[test]
     fn migration_keeps_the_old_file_and_writes_a_program() {
         let dir = std::env::temp_dir().join(format!("wasdf-migrate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

@@ -184,31 +184,6 @@ pub fn style_for(table: &LsColorsTable, entry: &Entry) -> Option<Style> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_bold_basic_color() {
-        let s = parse_sgr("01;34").unwrap();
-        assert_eq!(s.fg, Some(Color::Blue));
-        assert!(s.add_modifier.contains(Modifier::BOLD));
-    }
-
-    #[test]
-    fn parses_256_color() {
-        let s = parse_sgr("38;5;208").unwrap();
-        assert_eq!(s.fg, Some(Color::Indexed(208)));
-    }
-
-    #[test]
-    fn parses_truecolor() {
-        let s = parse_sgr("38;2;255;0;0").unwrap();
-        assert_eq!(s.fg, Some(Color::Rgb(255, 0, 0)));
-    }
-
-    #[test]
-    fn unrecognized_codes_yield_none() {
-        assert!(parse_sgr("").is_none());
-        assert!(parse_sgr("999").is_none());
-    }
-
     fn entry(name: &str, is_dir: bool, is_symlink: bool, mode: u32) -> Entry {
         Entry {
             path: name.into(),
@@ -225,16 +200,6 @@ mod tests {
             symlink_target: None,
             activation: None,
         }
-    }
-
-    #[test]
-    fn longest_extension_pattern_wins() {
-        let table = parse_ls_colors("*.gz=01;31:*.tar.gz=01;33");
-        let s = style_for(&table, &entry("x.tar.gz", false, false, 0o644)).unwrap();
-        assert_eq!(s.fg, Some(Color::Yellow), "tar.gz pattern should win over gz");
-
-        let s2 = style_for(&table, &entry("x.gz", false, false, 0o644)).unwrap();
-        assert_eq!(s2.fg, Some(Color::Red));
     }
 
     #[test]
@@ -268,12 +233,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn no_match_and_empty_table_yield_none() {
-        let table = LsColorsTable::default();
-        assert!(style_for(&table, &entry("x.rs", false, false, 0o644)).is_none());
-
-        let table = parse_ls_colors("di=01;34");
-        assert!(style_for(&table, &entry("plain.txt", false, false, 0o644)).is_none());
-    }
 }

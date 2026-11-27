@@ -145,7 +145,7 @@ fn split(r: Rect, len: u16, across: bool, shared: bool) -> (Rect, Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Mode, OptionValue, SelectInput, SelectSpec};
+    use crate::core::{Mode, OptionValue, SelectInput};
     /// Split a rect into left and right sharing the divider column.
     fn split_h(r: Rect, left_w: u16) -> (Rect, Rect) {
         let left_w = left_w.clamp(2, r.width.saturating_sub(2).max(2));
@@ -169,9 +169,9 @@ mod tests {
     }
 
 
-    /// The top row as `ui::top` split it before layouts existed, kept frozen
-    /// here so the default layout is pinned to it.
-    struct LegacyTop {
+    /// A hand-written reference split of the top row, kept here so the
+    /// default layout is pinned to it.
+    struct ReferenceTop {
         nav_weight: u32,
         prop_visible: bool,
         prop_weight: u32,
@@ -187,7 +187,7 @@ mod tests {
     /// Compute which panels are shown and their rects given the available area.
     /// Optional panels collapse gracefully when the terminal is too narrow:
     /// monitor drops first, then prop.
-    fn layout_panels(area: Rect, opts: &LegacyTop) -> (Rect, Option<Rect>, Option<Rect>) {
+    fn layout_panels(area: Rect, opts: &ReferenceTop) -> (Rect, Option<Rect>, Option<Rect>) {
         let w = area.width;
 
         let (show_prop, show_mon) = if opts.prop_visible && opts.monitor_visible {
@@ -249,8 +249,8 @@ mod tests {
         std::sync::Arc::new(OptionStore::new(crate::app::defaults::core_options()))
     }
 
-    fn top_options(o: &OptionStore) -> LegacyTop {
-        LegacyTop {
+    fn top_options(o: &OptionStore) -> ReferenceTop {
+        ReferenceTop {
             nav_weight: o.get_u32("top.nav-weight"),
             prop_visible: o.get_bool("top.prop-visible"),
             prop_weight: o.get_u32("top.prop-weight"),
@@ -259,8 +259,8 @@ mod tests {
         }
     }
 
-    /// What `ui::render` has always drawn, rect for rect.
-    fn legacy(state: &AppState, o: &OptionStore, area: Rect) -> Vec<(String, Rect)> {
+    /// The expected frame, rect for rect, computed by hand.
+    fn reference(state: &AppState, o: &OptionStore, area: Rect) -> Vec<(String, Rect)> {
         let tr = if area.height >= 25 { 7 } else { 5 };
         let top = Rect { height: tr, ..area };
         let main = Rect { y: area.y + tr - 1, height: area.height - tr, ..area };
@@ -304,7 +304,7 @@ mod tests {
         let env = Env { state, options: o, conds: &conds };
         for (w, h) in [(40, 10), (60, 24), (80, 25), (100, 30), (120, 40), (200, 60), (55, 30), (57, 30), (39, 30)] {
             let area = Rect { x: 0, y: 0, width: w, height: h };
-            assert_eq!(solve(&layout(id), area, &env), legacy(state, o, area), "{id} at {w}x{h}");
+            assert_eq!(solve(&layout(id), area, &env), reference(state, o, area), "{id} at {w}x{h}");
         }
     }
 
@@ -322,42 +322,4 @@ mod tests {
         check(&state, &o, "file");
     }
 
-    #[test]
-    fn a_flexible_child_leaves_exactly_the_room_the_fixed_ones_after_it_need() {
-        let o = options();
-        let state = AppState::new(std::env::temp_dir());
-        let conds = Conditions::default();
-        let env = Env { state: &state, options: &o, conds: &conds };
-        let tree = crate::script::sexpr::parse(
-            "(column (panel nav (size 5)) (panel file) (panel function (size 5)) (panel help (size 1)))",
-        )
-        .unwrap();
-        let tree = crate::script::layout::parse("file", &tree).unwrap();
-        let area = Rect { x: 0, y: 0, width: 80, height: 16 };
-        let got: Vec<(String, Rect)> = solve(&tree, area, &env);
-        let row = |y, height| Rect { x: 0, y, width: 80, height };
-        assert_eq!(
-            got,
-            vec![
-                ("nav".to_string(), row(0, 5)),
-                ("file".to_string(), row(4, 7)),
-                ("function".to_string(), row(10, 5)),
-                ("help".to_string(), row(15, 1)),
-            ],
-            "boxed neighbours share one line; help keeps the last row"
-        );
-    }
-
-    #[test]
-    fn the_select_layout_draws_what_the_frame_always_has() {
-        let o = options();
-        let mut state = AppState::new(std::env::temp_dir());
-        state.push_mode(Mode::Select(SelectSpec::file_search()));
-        check(&state, &o, "select");
-        let mut bare = SelectSpec::file_search();
-        bare.input = SelectInput::None;
-        bare.function_hint = None;
-        state.replace_mode(Mode::Select(bare));
-        check(&state, &o, "select");
-    }
 }

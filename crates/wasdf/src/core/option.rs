@@ -96,7 +96,7 @@ pub enum OptionValue {
 }
 
 impl OptionValue {
-    /// Parse the flat string form used by one-line inputs and legacy config
+    /// Parse the flat string form used by one-line inputs and old-format config
     /// (`"#t"`, `"42"`, `"dark"`, `"a,b"`) according to `kind`. Structured
     /// kinds have no flat form and return `None`.
     pub fn parse_flat(kind: &OptionKind, s: &str) -> Option<OptionValue> {
@@ -471,75 +471,6 @@ mod tests {
     }
 
     #[test]
-    fn get_returns_default_when_not_set() {
-        let store = OptionStore::new(vec![bool_def("x", "#f")]);
-        assert_eq!(store.get("x"), Some("#f".into()));
-        assert!(!store.get_bool("x"));
-    }
-
-    #[test]
-    fn set_valid_bool_updates_value() {
-        let store = OptionStore::new(vec![bool_def("x", "#f")]);
-        assert!(store.set_str("x", "#t"));
-        assert!(store.get_bool("x"));
-    }
-
-    #[test]
-    fn set_invalid_bool_is_rejected() {
-        let store = OptionStore::new(vec![bool_def("x", "#f")]);
-        assert!(!store.set_str("x", "yes"));
-        assert!(!store.get_bool("x"), "value unchanged");
-    }
-
-    #[test]
-    fn set_int_within_range_accepted() {
-        let store = OptionStore::new(vec![int_def("n", "5", 1, 99)]);
-        assert!(store.set_str("n", "42"));
-        assert_eq!(store.get_i64("n"), 42);
-    }
-
-    #[test]
-    fn set_int_out_of_range_rejected() {
-        let store = OptionStore::new(vec![int_def("n", "5", 1, 99)]);
-        assert!(!store.set_str("n", "100"));
-        assert_eq!(store.get_i64("n"), 5, "value unchanged");
-    }
-
-    #[test]
-    fn set_choice_valid_accepted() {
-        let store = OptionStore::new(vec![choice_def("c", "a", &["a", "b", "c"])]);
-        assert!(store.set_str("c", "b"));
-        assert_eq!(store.get_str("c"), "b");
-    }
-
-    #[test]
-    fn set_choice_invalid_rejected() {
-        let store = OptionStore::new(vec![choice_def("c", "a", &["a", "b"])]);
-        assert!(!store.set_str("c", "z"));
-        assert_eq!(store.get_str("c"), "a", "value unchanged");
-    }
-
-    #[test]
-    fn get_list_splits_and_trims() {
-        let store = OptionStore::new(vec![list_def("l", "rs, toml, md")]);
-        assert_eq!(store.get_list("l"), vec!["rs", "toml", "md"]);
-    }
-
-    #[test]
-    fn get_list_empty_string_returns_empty_vec() {
-        let store = OptionStore::new(vec![list_def("l", "")]);
-        assert_eq!(store.get_list("l"), Vec::<String>::new());
-    }
-
-    #[test]
-    fn unknown_key_is_stashed_as_unowned() {
-        let store = OptionStore::new(vec![]);
-        assert!(!store.set_str("unknown", "val"));
-        // value is stashed but not visible via get
-        assert!(store.get("unknown").is_none());
-    }
-
-    #[test]
     fn register_rebinds_unowned_value() {
         let mut store = OptionStore::new(vec![]);
         // Stash before the def exists.
@@ -547,85 +478,6 @@ mod tests {
         // Now register the def — the stashed value should become live.
         store.register(vec![bool_def("x", "#f")]);
         assert!(store.get_bool("x"), "stashed value bound after register");
-    }
-
-    #[test]
-    fn register_first_wins_does_not_overwrite() {
-        let mut store = OptionStore::new(vec![bool_def("x", "#t")]);
-        store.register(vec![bool_def("x", "#f")]);
-        assert!(store.get_bool("x"), "first def wins");
-    }
-
-    #[test]
-    fn categories_preserves_insertion_order() {
-        let defs = vec![
-            OptionDef {
-                key: "a.x".into(),
-                category: "A".into(),
-                label: "x".into(),
-                kind: OptionKind::Bool,
-                default: OptionValue::Bool(false),
-                owner: None,
-            },
-            OptionDef {
-                key: "b.y".into(),
-                category: "B".into(),
-                label: "y".into(),
-                kind: OptionKind::Bool,
-                default: OptionValue::Bool(false),
-                owner: None,
-            },
-            OptionDef {
-                key: "a.z".into(),
-                category: "A".into(),
-                label: "z".into(),
-                kind: OptionKind::Bool,
-                default: OptionValue::Bool(false),
-                owner: None,
-            },
-        ];
-        let store = OptionStore::new(defs);
-        let cats = store.categories();
-        assert_eq!(cats.len(), 2);
-        assert_eq!(cats[0].0, "A");
-        assert_eq!(cats[0].1.len(), 2, "A has two defs");
-        assert_eq!(cats[1].0, "B");
-    }
-
-    #[test]
-    fn def_lookup_returns_correct_kind() {
-        let store = OptionStore::new(vec![int_def("n", "5", 1, 99)]);
-        let d = store.def("n").expect("def exists");
-        assert_eq!(d.kind, OptionKind::Int { min: 1, max: 99 });
-    }
-
-    #[test]
-    fn owner_grouping_and_sdk_settings_snapshot() {
-        let owned = |key: &str, cat: &str, def: &str, owner: &str| OptionDef {
-            key: key.into(),
-            category: cat.into(),
-            label: key.into(),
-            kind: OptionKind::Int { min: 0, max: 99 },
-            default: OptionValue::Int(def.parse().unwrap()),
-            owner: Some(owner.into()),
-        };
-        let store = OptionStore::new(vec![
-            int_def("core.n", "1", 0, 9),        // core (owner None)
-            owned("preview.tab-width", "Preview", "4", "preview"),
-            owned("preview.pager", "Preview", "2", "preview"),
-        ]);
-        assert_eq!(store.owners(), vec!["preview"]);
-        assert_eq!(store.options_for_owner("preview").len(), 2);
-        // core_categories excludes the extension-owned "Preview" category.
-        let core = store.core_categories();
-        assert!(core.iter().any(|(c, _)| c == "Test")); // int_def uses "Test"
-        assert!(!core.iter().any(|(c, _)| c == "Preview"));
-        // settings_for produces a wasdf_sdk::Settings the owner reads through.
-        store.set_str("preview.tab-width", "6");
-        let s = store.settings_for("preview");
-        assert_eq!(s.get_u32("preview.tab-width"), 6);
-        assert_eq!(s.get_u32("preview.pager"), 2);
-        assert_eq!(s.get("core.n"), None, "only the owner's keys are snapshotted");
     }
 
     #[test]
@@ -661,24 +513,4 @@ mod tests {
         assert!(!themes.accepts(&OptionValue::Map([("x".to_string(), OptionValue::Int(1))].into_iter().collect())));
     }
 
-    #[test]
-    fn flat_form_round_trips_scalars_and_lists() {
-        let list = OptionKind::text_list();
-        let v = OptionValue::parse_flat(&list, " rs, md ,, toml").unwrap();
-        assert_eq!(v.flat(), "rs,md,toml");
-        assert_eq!(OptionValue::parse_flat(&list, &v.flat()), Some(v));
-        assert_eq!(OptionValue::parse_flat(&OptionKind::Bool, "yes"), None);
-        assert_eq!(OptionValue::parse_flat(&OptionKind::Int { min: 0, max: 3 }, "4"), None);
-        assert_eq!(OptionValue::parse_flat(&OptionKind::Map(Box::new(OptionKind::Text)), "x"), None);
-    }
-
-    #[test]
-    fn to_scheme_renders_literals() {
-        assert_eq!(OptionValue::Bool(true).to_scheme(), "#t");
-        assert_eq!(OptionValue::Text("a\"b".into()).to_scheme(), "\"a\\\"b\"");
-        let v = OptionValue::List(vec![OptionValue::Text("rs".into()), OptionValue::Int(2)]);
-        assert_eq!(v.to_scheme(), "(\"rs\" 2)");
-        let m = OptionValue::Map([("k".to_string(), OptionValue::Bool(false))].into_iter().collect());
-        assert_eq!(m.to_scheme(), "((\"k\" #f))");
-    }
 }

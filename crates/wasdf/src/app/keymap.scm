@@ -1,17 +1,18 @@
 (quote (
     (file file (
         ("w" cursor-up "cursor") ("a" cursor-left "cursor") ("s" cursor-down "cursor") ("d" cursor-right "cursor")
+        ;; The arrows are the file cursor too; unlabelled, so the chip stays `wasd`.
+        ("Up" cursor-up) ("Left" cursor-left) ("Down" cursor-down) ("Right" cursor-right)
         ("Enter" activate)
-        ("k" func-up)   ("Up" func-up)    ("j" func-down)   ("Down" func-down)
-        ("h" func-left) ("Left" func-left) ("l" func-right) ("Right" func-right)
+        ("k" func-up) ("j" func-down) ("h" func-left) ("l" func-right)
         ("Space" toggle-select "select") ("e" activate) ("z" command-palette "palette")
         ;; f: deep search (recursive walk) on a real directory; shallow filter
         ;; (rank the listing already on screen, no I/O) on a virtual one, where
-        ;; there is nothing for the walk to read. See SEARCH_RENEW.md.
+        ;; there is nothing for the walk to read. See doc/UI.md.
         ("f" file-search (and (not filter-maxed) (not cwd-virtual)) "find")
         ("f" filter-list (and (not filter-maxed) cwd-virtual) "filter")
         ("W" cursor-top) ("S" cursor-bottom) ("Ctrl-a" select-all)
-        ("E" start-edit "edit full")
+        ("E" start-edit "Edit full")
         ("@" toggle-vfs-root "vfs")
         ("~" (navigate-to "~"))
         ("," cycle-function-panel "panel") ("." toggle-dotfiles) ("v" cycle-list-layout)
@@ -48,7 +49,7 @@
         ("W" cursor-top   select-phase-navigate) ("S" cursor-bottom select-phase-navigate)
         ("v" cycle-list-layout select-phase-navigate)
         ;; Shallow refine: rank the current result view (deep file-search, or
-        ;; an earlier filter/refine) further, in place. See SEARCH_RENEW.md.
+        ;; an earlier filter/refine) further, in place. See doc/UI.md.
         ("f" select-refine (and select-phase-navigate select-has-view))
         ("Space" toggle-select select-phase-navigate "mark") ("q" cancel select-phase-navigate)))
     (policy #f (

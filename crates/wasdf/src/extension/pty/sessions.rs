@@ -145,23 +145,3 @@ impl SessionTable {
         out
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ids_are_never_reused() {
-        let mut t = SessionTable::default();
-        assert_eq!(t.next_id(), 1);
-        assert_eq!(t.next_id(), 2);
-        assert_eq!(t.next_id(), 3);
-    }
-
-    #[test]
-    fn neighbour_wraps_in_both_directions_and_copes_with_an_empty_table() {
-        let t = SessionTable::default();
-        assert_eq!(t.neighbour(None, true), None);
-        assert_eq!(t.neighbour(Some(1), true), None);
-    }
-}

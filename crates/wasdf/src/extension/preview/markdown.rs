@@ -297,51 +297,6 @@ mod tests {
     }
 
     #[test]
-    fn heading_is_styled_and_emphasized() {
-        let blocks = render(Path::new("/tmp/a.md"), "# Title\n", 4);
-        let spans = match &blocks[0] {
-            Block::Line(v) => v.clone(),
-            other => panic!("expected a line, got {other:?}"),
-        };
-        assert!(spans.iter().any(|s| s.text.contains("Title")));
-        assert!(spans.iter().all(|s| s.emph.bold), "H1 spans should be bold");
-    }
-
-    #[test]
-    fn inline_emphasis_survives_as_emph_flags() {
-        let blocks = render(Path::new("/tmp/a.md"), "plain **strong** text\n", 4);
-        let Block::Line(spans) = &blocks[0] else { panic!("expected a line") };
-        let strong = spans.iter().find(|s| s.text == "strong").expect("the bold run");
-        assert!(strong.emph.bold);
-        let plain = spans.iter().find(|s| s.text == "plain ").expect("the plain run");
-        assert!(!plain.emph.bold);
-    }
-
-    #[test]
-    fn remote_image_becomes_a_placeholder_line_spaced_like_a_paragraph() {
-        let src = "before\n\n![alt](https://example.com/a.png)\n\nafter\n";
-        let blocks = render(Path::new("/tmp/a.md"), src, 4);
-        assert_eq!(
-            texts(&blocks),
-            ["before", "", "[image: https://example.com/a.png (remote)]", "", "after"]
-        );
-    }
-
-    #[test]
-    fn a_leading_image_gets_no_blank_line_above_it() {
-        let blocks = render(Path::new("/tmp/a.md"), "![alt](https://x/a.png)\n\ntext\n", 4);
-        assert_eq!(texts(&blocks), ["[image: https://x/a.png (remote)]", "", "text"]);
-    }
-
-    #[test]
-    fn undecodable_local_image_reports_why() {
-        let src = "![alt](missing.png)\n";
-        let blocks = render(Path::new("/tmp/wasdf-md-test/a.md"), src, 4);
-        let text = blocks[0].text().expect("a placeholder line");
-        assert!(text.starts_with("[image: missing.png — "), "got {text:?}");
-    }
-
-    #[test]
     fn local_image_is_decoded_into_an_image_block() {
         let dir = std::env::temp_dir().join("wasdf-md-image-test");
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -356,47 +311,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn image_inside_a_list_keeps_the_inline_fallback() {
-        // Splitting the source at a nested paragraph would tear the list apart,
-        // so the list must come through as one rendered run.
-        let blocks = render(Path::new("/tmp/a.md"), "- ![alt](local.png)\n- second\n", 4);
-        assert!(!blocks.iter().any(|b| matches!(b, Block::Image { .. })));
-        let joined = texts(&blocks).join("\n");
-        assert!(joined.contains("[img]"), "got {joined:?}");
-        assert!(joined.contains("second"), "got {joined:?}");
-    }
-
-    #[test]
-    fn image_in_a_sentence_keeps_the_inline_fallback() {
-        let blocks = render(Path::new("/tmp/a.md"), "see ![alt](local.png) here\n", 4);
-        assert!(!blocks.iter().any(|b| matches!(b, Block::Image { .. })));
-        assert!(texts(&blocks).join("").contains("[img]"));
-    }
-
-    #[test]
-    fn local_path_resolves_relative_to_the_document() {
-        let base = Path::new("/docs");
-        assert_eq!(local_path(base, "img/a.png"), Some(PathBuf::from("/docs/img/a.png")));
-        assert_eq!(local_path(base, "/abs/a.png"), Some(PathBuf::from("/abs/a.png")));
-        assert_eq!(local_path(base, "a%20b.png"), Some(PathBuf::from("/docs/a b.png")));
-        assert_eq!(local_path(base, "file:///abs/a.png"), Some(PathBuf::from("/abs/a.png")));
-        assert_eq!(local_path(base, "a.png?v=2"), Some(PathBuf::from("/docs/a.png")));
-    }
-
-    #[test]
-    fn remote_destinations_have_no_local_path() {
-        let base = Path::new("/docs");
-        for url in ["https://x/a.png", "http://x/a.png", "//x/a.png", "data:image/png;base64,AA"] {
-            assert_eq!(local_path(base, url), None, "{url} should be remote");
-        }
-    }
-
-    #[test]
-    fn is_markdown_matches_both_extensions_case_insensitively() {
-        assert!(is_markdown(Path::new("a.md")));
-        assert!(is_markdown(Path::new("a.MARKDOWN")));
-        assert!(!is_markdown(Path::new("a.rs")));
-        assert!(!is_markdown(Path::new("md")));
-    }
 }

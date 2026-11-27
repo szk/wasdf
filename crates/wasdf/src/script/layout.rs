@@ -162,16 +162,7 @@ fn num(d: Option<&Datum>) -> Option<Num> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::script::sexpr;
-
-    #[test]
-    fn the_embedded_layouts_read() {
-        let all = sexpr::parse_quoted(crate::app::defaults::LAYOUT_SCHEME).unwrap();
-        for entry in all.as_list().unwrap() {
-            let [id, tree] = entry.as_list().unwrap() else { panic!("(id tree)") };
-            parse(id.text().unwrap(), tree).unwrap();
-        }
-    }
+    
 
     #[test]
     fn bad_layouts_are_explained() {

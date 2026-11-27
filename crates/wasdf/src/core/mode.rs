@@ -23,9 +23,8 @@ pub enum Mode {
     File,
     Select(SelectSpec),
     Policy(Box<Intent>),
-    /// A small popup text-entry dialog — the unified replacement for the old
-    /// candidate-list (`emit_static`) and free-text (`emit_path_input`) Select
-    /// flows. Shares its chrome with `Policy`'s Confirm box (see
+    /// A small popup text-entry dialog for one value (free text or a choice
+    /// among candidates). Shares its chrome with `Policy`'s Confirm box (see
     /// `ui/render.rs`); Enter confirms (emits `spec.template` with the typed
     /// text under `KEY_ITEM`), Esc cancels. Runtime text/cursor state lives in
     /// `AppState::input_form`, mirroring how `SelectState` sits beside `Select`.
@@ -100,8 +99,8 @@ pub struct InputFormSpec {
     pub initial: String,
     pub kind: InputKind,
     /// Emitted on confirm with the encoded value inserted under `KEY_ITEM` —
-    /// exactly the same contract `Select`'s `OnConfirm::Emit` used, so every
-    /// existing `*-apply` handler needs no changes. Nothing is emitted before
+    /// the same contract as `Select`'s `OnConfirm::Emit`, so one `*-apply`
+    /// handler serves both. Nothing is emitted before
     /// confirm; there is no live-apply.
     pub template: ExtensionIntent,
     /// What this form's input is for; see [`SelectSpec::input_hint`].
@@ -145,7 +144,7 @@ impl InputFormSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectSource {
     /// Deep search: a recursive walk from `AppState.cwd`, ranked async via
-    /// `Plan::Search`. See SEARCH_RENEW.md's deep/shallow vocabulary.
+    /// `Plan::Search`. See doc/UI.md (Deep search vs. shallow filter).
     FileWalk,
     Commands,
     Static(Vec<Candidate>),
@@ -268,7 +267,7 @@ impl SelectSpec {
     /// The shallow-filter picker (`f` on a virtual dir, or the file-search
     /// result view's own `f`/refine): rank a fixed `Entry` pool synchronously,
     /// navigate on confirm. Shares `commit_file_search`'s commit path with
-    /// `file_search` — see SEARCH_RENEW.md decision 4.
+    /// `file_search`.
     pub fn filter_list(entries: Vec<Entry>) -> Self {
         SelectSpec {
             id: "filter-list".into(),

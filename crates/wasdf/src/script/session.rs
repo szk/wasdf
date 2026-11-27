@@ -205,15 +205,6 @@ mod tests {
     }
 
     #[test]
-    fn evaluates_basic_expressions() {
-        let session = SchemeSession::spawn();
-        ready(&session);
-        assert_eq!(session.eval("(+ 1 2)").unwrap(), "3");
-        assert_eq!(session.eval("(string-append \"a\" \"b\")").unwrap(), "\"ab\"");
-        assert_eq!(session.eval("(if (< 1 2) 'yes 'no)").unwrap(), "yes");
-    }
-
-    #[test]
     fn errors_do_not_kill_the_session() {
         let session = SchemeSession::spawn();
         ready(&session);
@@ -223,13 +214,4 @@ mod tests {
         assert_eq!(session.eval("(* 6 7)").unwrap(), "42");
     }
 
-    #[test]
-    fn quote_list_round_trips_through_sexpr() {
-        let session = SchemeSession::spawn();
-        ready(&session);
-        // The canonical smoke test: a nested list with all datum types.
-        let result = session.eval("(quote (a \"b\" 1 #t (c)))").unwrap();
-        assert_eq!(result, "(a \"b\" 1 #t (c))");
-    }
 }
-

@@ -3,6 +3,7 @@
 
 pub mod encode;
 pub mod extension;
+pub mod graphics;
 pub mod kbmode;
 pub mod provider;
 pub mod session;

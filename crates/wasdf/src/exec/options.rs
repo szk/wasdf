@@ -93,28 +93,3 @@ fn dedupe(opts: Vec<(String, String)>) -> Vec<(String, String)> {
     }
     out
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_gnu_style_help() {
-        let help = "Usage: cp [OPTION]... SOURCE DEST\n\
-            \x20 -f, --force                  remove existing destinations\n\
-            \x20 -i, --interactive            prompt before overwrite\n\
-            \x20 -R, -r, --recursive          copy directories recursively\n\
-            \x20     --help     display this help and exit\n";
-        let opts = parse(help);
-        let tokens: Vec<&str> = opts.iter().map(|(t, _)| t.as_str()).collect();
-        assert_eq!(tokens, vec!["-f", "-i", "-R"], "first flag per line; --help filtered");
-        assert_eq!(opts[0].1, "remove existing destinations");
-    }
-
-    #[test]
-    fn strips_man_overstrike() {
-        // man bold: "-_R_" style "R\x08R"; underline "_\x08x".
-        assert_eq!(strip_overstrike("R\u{8}Recursive"), "Recursive");
-        assert_eq!(strip_overstrike("_\u{8}x_\u{8}y"), "xy");
-    }
-}

@@ -1,7 +1,7 @@
 //! Panel chrome: one connected single-line border drawn from all panel rects,
 //! titles embedded in the top border, and a ratatui Scrollbar in place of each
 //! scrollable panel's right border (no begin/end arrows). See doc/UI.md
-//! (Borders and Scrollbars) and doc/SCREEN.md for the intended look.
+//! (Borders and Scrollbars, Screen chrome) for the intended look.
 //!
 //! ratatui's per-widget `Block` borders cannot merge where panels meet (they
 //! double up and form no junctions), so the border is rendered here as a single
@@ -14,6 +14,12 @@ use ratatui::layout::Rect;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use crate::core::{Role, Theme};
+
+/// The "this one" / "done" marker (the active theme, the Confirm row). ASCII
+/// on purpose: ✓/✔ are missing from small bitmap fonts (the CardputerZero's
+/// PCF), and ●/◆/☑ are East Asian ambiguous width — two cells on a terminal
+/// set to ambiguous-wide, one in ratatui's count, which breaks the row.
+pub const CHECK_MARK: char = '*';
 
 const N: u8 = 1;
 const S: u8 = 2;
@@ -66,11 +72,11 @@ pub struct PanelFrame {
     pub scroll: Option<ScrollInfo>,
     /// When true, the panel has no bottom border: the side borders run down
     /// through its last row (a content row, not a separator) and stop there
-    /// with no closing line or corners — see doc/SCREEN.md, where the file
+    /// with no closing line or corners — see doc/UI.md, where the file
     /// and function panels open directly onto the unboxed help row below.
     pub open_bottom: bool,
     /// When true, the panel has no left border: its content runs flush to the
-    /// screen's left column — see doc/SCREEN.md, where the main (file/select)
+    /// screen's left column — see doc/UI.md, where the main (file/select)
     /// area has no left edge, so the top panel's bottom-left corner is `└`
     /// rather than `├`.
     pub open_left: bool,

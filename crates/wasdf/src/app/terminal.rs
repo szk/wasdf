@@ -33,6 +33,8 @@ static KITTY_PUSHED: AtomicBool = AtomicBool::new(false);
 /// Enter the alternate screen and raw mode, returning the ratatui terminal.
 pub fn init() -> DefaultTerminal {
     let term = ratatui::init();
+    // Once, in raw mode, before crossterm's reader owns stdin.
+    GRAPHICS.get_or_init(probe_graphics);
     // Best-effort. A terminal without the protocol (every Windows console, and
     // plenty of Unix ones) is left alone and everything degrades to legacy
     // keys — disable, notify, continue.
@@ -103,6 +105,103 @@ fn drain_pending_input() {
     }
 }
 
+static GRAPHICS: std::sync::OnceLock<crate::ui::graphics::Support> = std::sync::OnceLock::new();
+
+/// Which image protocols this terminal draws, probed once by [`init`].
+pub fn graphics_support() -> crate::ui::graphics::Support {
+    GRAPHICS.get().copied().unwrap_or_default()
+}
+
+/// Ask the terminal: a kitty graphics query (answered `…;OK` only by a
+/// terminal that implements it) followed by DA1 (answered by every terminal;
+/// a `4` among its parameters means sixel). DA1's reply ends the wait, so a
+/// terminal that ignores the kitty query costs no timeout; one that answers
+/// nothing at all costs at most the deadline. Keys typed in that instant are
+/// lost — the probe runs once, at start.
+fn probe_graphics() -> crate::ui::graphics::Support {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+    let none = crate::ui::graphics::Support::default();
+    // SAFETY: isatty has no preconditions.
+    if unsafe { libc::isatty(0) != 1 || libc::isatty(1) != 1 } {
+        return none;
+    }
+    let mut out = io::stdout();
+    if out.write_all(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c").and_then(|_| out.flush()).is_err() {
+        return none;
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut buf = Vec::new();
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd; read into a stack buffer of its length.
+        let n = unsafe {
+            if libc::poll(&mut pfd, 1, left.as_millis() as libc::c_int) <= 0 {
+                break;
+            }
+            let mut chunk = [0u8; 256];
+            let n = libc::read(0, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len());
+            if n > 0 {
+                buf.extend_from_slice(&chunk[..n as usize]);
+            }
+            n
+        };
+        if n <= 0 || da1_params(&buf).is_some() {
+            break;
+        }
+    }
+    parse_graphics_replies(&buf)
+}
+
+/// The parameters of a DA1 reply (`ESC [ ? p ; p … c`) in `buf`, if complete.
+fn da1_params(buf: &[u8]) -> Option<&[u8]> {
+    let start = buf.windows(3).position(|w| w == b"\x1b[?")? + 3;
+    let len = buf[start..].iter().position(|&b| b == b'c')?;
+    Some(&buf[start..start + len])
+}
+
+fn parse_graphics_replies(buf: &[u8]) -> crate::ui::graphics::Support {
+    let kitty = buf.windows(9).any(|w| w == b"_Gi=31;OK");
+    let sixel = da1_params(buf).is_some_and(|p| p.split(|&b| b == b';').any(|v| v == b"4"));
+    crate::ui::graphics::Support { kitty, sixel }
+}
+
+/// The terminal's cell size in pixels, from the window size it reports
+/// (TIOCGWINSZ). `None` when it reports no pixels — graphics then stay off.
+pub fn cell_px(term: &mut DefaultTerminal) -> Option<(u16, u16)> {
+    use ratatui::backend::Backend;
+    let ws = term.backend_mut().window_size().ok()?;
+    let (c, r) = (ws.columns_rows.width, ws.columns_rows.height);
+    let (w, h) = (ws.pixels.width, ws.pixels.height);
+    (c > 0 && r > 0 && w >= c && h >= r).then(|| (w / c, h / r))
+}
+
+/// Whether the terminal runs elsewhere (ssh), so it cannot read our shared
+/// memory and kitty pixels must travel inline.
+pub fn remote() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+}
+
+/// Write graphics control strings (ui/graphics.rs) after the draw — the only
+/// bytes images cost on the tty; kitty pixels travel through shared memory.
+pub fn write_graphics(term: &mut DefaultTerminal, cmds: &[crate::ui::graphics::Cmd]) -> io::Result<()> {
+    use crossterm::cursor::MoveTo;
+    use crossterm::queue;
+    use crossterm::style::Print;
+    use std::io::Write;
+    if cmds.is_empty() {
+        return Ok(());
+    }
+    let out = term.backend_mut();
+    for c in cmds {
+        if let Some((x, y)) = c.at {
+            queue!(out, MoveTo(x, y))?;
+        }
+        queue!(out, Print(&c.data))?;
+    }
+    out.flush()
+}
+
 /// Convert a crossterm key event into a core Key. Returns None for events that
 /// are not key presses or carry no representable code.
 pub fn convert_key(ev: KeyEvent) -> Option<Key> {
@@ -137,13 +236,30 @@ pub fn convert_key(ev: KeyEvent) -> Option<Key> {
         hyper: m.contains(KeyModifiers::HYPER),
         meta: m.contains(KeyModifiers::META),
     };
-    // Releases are no longer dropped here: a PTY child that enabled the Kitty
-    // protocol's event types expects them. Nothing else in the app sees one —
-    // `KeymapRegistry::resolve` refuses to match a non-press.
+    // Releases are kept here: a PTY child that enabled the Kitty
+    // protocol's event types expects them. `App::handle_key` drops them for
+    // everything but an input capture.
     let kind = match ev.kind {
         KeyEventKind::Press => KeyKind::Press,
         KeyEventKind::Repeat => KeyKind::Repeat,
         KeyEventKind::Release => KeyKind::Release,
     };
     Some(Key { code, mods, kind })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replies_tell_kitty_and_sixel_apart() {
+        let s = parse_graphics_replies(b"\x1b_Gi=31;OK\x1b\\\x1b[?62;4;22c");
+        assert!(s.kitty && s.sixel);
+        let s = parse_graphics_replies(b"\x1b[?62;22c");
+        assert!(!s.kitty && !s.sixel, "a DA1 without 4, and no kitty answer");
+        let s = parse_graphics_replies(b"\x1b_Gi=31;EINVAL:bad\x1b\\\x1b[?1;2c");
+        assert!(!s.kitty, "an error reply is not support");
+        assert!(da1_params(b"\x1b[?62;4").is_none(), "an unfinished reply keeps waiting");
+        assert!(!parse_graphics_replies(b"\x1b[?14;2c").sixel, "14 is not 4");
+    }
 }

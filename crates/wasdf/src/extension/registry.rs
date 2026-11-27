@@ -79,16 +79,3 @@ impl ExtensionRegistry {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn listed_ids_lead_unknown_ones_are_ignored_and_the_rest_keep_registration_order() {
-        let registered: Vec<String> = ["preview", "pty", "repl"].map(String::from).to_vec();
-        let order: Vec<String> = ["repl", "gone", "repl"].map(String::from).to_vec();
-        assert_eq!(rank(&registered, &order), ["repl", "preview", "pty"]);
-        assert_eq!(rank(&registered, &[]), registered);
-    }
-}

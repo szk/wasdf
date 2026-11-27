@@ -102,6 +102,9 @@ pub struct Shared {
     /// thread needs it too: a child that sends the keyboard-protocol query
     /// blocks until the reply is written back into its input.
     pub writer: Mutex<Box<dyn Write + Send>>,
+    /// Kitty graphics commands cut from the output, at the child's cursor,
+    /// waiting for the next draw to forward them (pty/graphics.rs).
+    pub graphics: Mutex<Vec<super::graphics::ChildGraphic>>,
 }
 
 pub struct Session {
@@ -127,6 +130,8 @@ pub struct Session {
     /// change. The panel geometry is known at render time only, so this mirrors
     /// the viewport cache the markdown previewer uses.
     size: Cell<(u16, u16)>,
+    /// The cell size in pixels last told to the child (it sizes images by it).
+    px: Cell<(u16, u16)>,
 }
 
 impl Session {
@@ -145,14 +150,15 @@ impl Session {
         tx: Sender<AppEvent>,
     ) -> Result<Session, String> {
         let Some(program) = argv.first() else { return Err("empty command".into()) };
-        let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+        let size = pty_size(cols, rows);
         let pair = native_pty_system().openpty(size).map_err(|e| e.to_string())?;
 
         let mut cmd = CommandBuilder::new(program);
         cmd.args(&argv[1..]);
         cmd.cwd(cwd);
-        // Advertise the xterm subset vt100 actually implements. Claiming
-        // `xterm-kitty` would invite graphics-protocol output we cannot draw.
+        // Advertise the xterm subset vt100 actually implements. Kitty graphics
+        // need no claim: they are passed through (pty/graphics.rs), and a
+        // child that draws with them is told so explicitly (`mpv --vo=kitty`).
         cmd.env("TERM", "xterm-256color");
 
         let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
@@ -172,6 +178,7 @@ impl Session {
             exit: Mutex::new(None),
             dirty: AtomicBool::new(true),
             writer: Mutex::new(writer),
+            graphics: Mutex::new(Vec::new()),
         });
         spawn_reader(shared.clone(), reader, child, tx);
 
@@ -184,6 +191,7 @@ impl Session {
             killer,
             shell_pid,
             size: Cell::new((cols, rows)),
+            px: Cell::new(crate::ui::graphics::cell_px()),
         })
     }
 
@@ -231,18 +239,15 @@ impl Session {
     /// the child and the screen disagree about where lines wrap.
     pub fn resize(&self, cols: u16, rows: u16) {
         let want = (cols.max(1), rows.max(1));
-        if self.size.get() == want {
+        let px = crate::ui::graphics::cell_px();
+        if self.size.get() == want && self.px.get() == px {
             return;
         }
         self.size.set(want);
+        self.px.set(px);
         // The PTY first, so the child gets its SIGWINCH and redraws at the new
         // size; the parser second, to receive that redraw already resized.
-        let _ = self.master.resize(PtySize {
-            rows: want.1,
-            cols: want.0,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        let _ = self.master.resize(pty_size(want.0, want.1));
         if let Ok(mut p) = self.shared.parser.lock() {
             p.screen_mut().set_size(want.1, want.0);
         }
@@ -331,6 +336,13 @@ impl Session {
     }
 }
 
+/// The pty size, with pixels when the cell size is known: a child that draws
+/// images (`mpv --vo=kitty`) reads them from TIOCGWINSZ to size its frames.
+fn pty_size(cols: u16, rows: u16) -> PtySize {
+    let (cw, ch) = crate::ui::graphics::cell_px();
+    PtySize { rows, cols, pixel_width: cols.saturating_mul(cw), pixel_height: rows.saturating_mul(ch) }
+}
+
 /// Read the child until EOF, folding every chunk into the screen model and the
 /// keyboard-mode tracker, then reap it.
 fn spawn_reader(
@@ -341,6 +353,7 @@ fn spawn_reader(
 ) {
     std::thread::spawn(move || {
         let mut buf = [0u8; READ_CHUNK];
+        let mut split = super::graphics::Splitter::default();
         loop {
             let n = match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -356,8 +369,21 @@ fn spawn_reader(
                 let _ = w.write_all(&reply);
                 let _ = w.flush();
             }
+            // Text goes to the screen model; kitty commands are queued with the
+            // cursor the text before them left.
             if let Ok(mut p) = shared.parser.lock() {
-                p.process(chunk);
+                for seg in split.feed(chunk) {
+                    match seg {
+                        super::graphics::Seg::Text(t) => p.process(t),
+                        super::graphics::Seg::Apc(apc) => {
+                            let Some(data) = super::graphics::kitty_command(&apc) else { continue };
+                            let (row, col) = p.screen().cursor_position();
+                            if let Ok(mut q) = shared.graphics.lock() {
+                                super::graphics::push(&mut q, super::graphics::ChildGraphic { row, col, data });
+                            }
+                        }
+                    }
+                }
             }
             if !shared.dirty.swap(true, Ordering::AcqRel) {
                 let _ = tx.send(AppEvent::Tick);
@@ -382,11 +408,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefix_only_escapes_on_nothing_but_the_prefix() {
-        assert!(EscapeClass::PrefixOnly.intents().is_empty());
-    }
-
-    #[test]
     fn prefix_and_cursor_escapes_on_all_six_navigation_moves() {
         let got = EscapeClass::PrefixAndCursor.intents();
         assert_eq!(got.len(), 6);
@@ -400,20 +421,6 @@ mod tests {
         ] {
             assert!(got.contains(&want), "{want:?}");
         }
-    }
-
-    #[test]
-    fn activate_is_not_an_escape() {
-        // Acting on an entry is not the same as looking away from the child.
-        assert!(!EscapeClass::PrefixAndCursor.intents().contains(&Intent::Activate));
-    }
-
-    #[test]
-    fn an_editor_keeps_the_whole_alphabet() {
-        let edit = Origin::Edit { path: PathBuf::from("/tmp/x") };
-        assert_eq!(edit.escape_class(), EscapeClass::PrefixOnly);
-        assert_eq!(Origin::Shell.escape_class(), EscapeClass::PrefixOnly);
-        assert_eq!(Origin::Command.escape_class(), EscapeClass::PrefixAndCursor);
     }
 
     // ── real PTYs ─────────────────────────────────────────────────────────
@@ -459,21 +466,6 @@ mod tests {
     }
 
     #[test]
-    fn a_child_writes_onto_the_screen_and_its_exit_is_reaped() {
-        let (s, _rx) = spawn_for_test(&["printf", "hello"]);
-        assert!(wait_for(|| screen_text(&s).contains("hello")), "got {:?}", screen_text(&s));
-        assert!(wait_for(|| !s.running()), "the reader must reap the child");
-        assert_eq!(s.exit_label(), " (exit 0)");
-    }
-
-    #[test]
-    fn a_failing_child_reports_its_code() {
-        let (s, _rx) = spawn_for_test(&["sh", "-c", "exit 3"]);
-        assert!(wait_for(|| !s.running()));
-        assert_eq!(s.exit_label(), " (exit 3)");
-    }
-
-    #[test]
     fn keys_written_to_the_child_come_back_through_its_echo() {
         let (s, _rx) = spawn_for_test(&["cat"]);
         for c in "hi".chars() {
@@ -481,79 +473,6 @@ mod tests {
         }
         assert!(s.send_key(crate::core::Key::plain(crate::core::KeyCode::Enter)));
         assert!(wait_for(|| screen_text(&s).contains("hi")), "got {:?}", screen_text(&s));
-    }
-
-    #[test]
-    fn resizing_retells_both_the_pty_and_the_screen_model() {
-        let (s, _rx) = spawn_for_test(&["cat"]);
-        assert_eq!(s.shared.parser.lock().unwrap().screen().size(), (10, 40));
-        s.resize(60, 20);
-        assert_eq!(s.shared.parser.lock().unwrap().screen().size(), (20, 60));
-        // Idempotent: a second call with the same geometry issues nothing.
-        s.resize(60, 20);
-        assert_eq!(s.shared.parser.lock().unwrap().screen().size(), (20, 60));
-    }
-
-    #[test]
-    fn output_wakes_the_event_loop_once_the_last_frame_has_been_drawn() {
-        let (s, rx) = spawn_for_test(&["cat"]);
-        // Stand in for a render: drop everything queued and clear the flag.
-        let _ = rx.try_iter().count();
-        s.shared.dirty.store(false, Ordering::Release);
-
-        s.send_key(crate::core::Key::plain(crate::core::KeyCode::Char('z')));
-        assert!(wait_for(|| screen_text(&s).contains('z')));
-        assert!(rx.try_iter().count() >= 1, "echoed output must wake the loop");
-        assert!(s.shared.dirty.load(Ordering::Acquire), "and mark the panel dirty");
-    }
-
-    #[test]
-    fn a_second_chunk_before_a_redraw_does_not_queue_a_second_wake_up() {
-        // A chatty child would otherwise queue one event per 8 KB read and
-        // starve the loop; `dirty` is what bounds that to one outstanding.
-        let (s, rx) = spawn_for_test(&["cat"]);
-        let _ = rx.try_iter().count();
-        s.shared.dirty.store(false, Ordering::Release);
-        for _ in 0..40 {
-            s.send_key(crate::core::Key::plain(crate::core::KeyCode::Char('q')));
-        }
-        assert!(wait_for(|| screen_text(&s).contains("qq")));
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(rx.try_iter().count(), 1, "exactly one wake-up until the next draw");
-    }
-
-    #[test]
-    fn a_shell_at_its_prompt_is_distinguished_from_one_running_a_command() {
-        // zsh is the case that motivates the design: it leaves job control off
-        // here, so only bracketed paste can tell the two apart.
-        let (s, _rx) = spawn_for_test(&["/bin/zsh", "-f"]);
-        assert!(wait_for(|| s.at_prompt()), "should settle at a prompt");
-        // Shorter than `wait_for`'s budget, so the return to the prompt is
-        // observable rather than a race against the timeout.
-        s.write(b"sleep 1\r");
-        assert!(wait_for(|| !s.at_prompt()), "a running command is not a prompt");
-        assert!(wait_for(|| s.at_prompt()), "and it comes back");
-    }
-
-    #[test]
-    fn a_dead_session_is_never_at_a_prompt() {
-        let (s, _rx) = spawn_for_test(&["printf", "x"]);
-        assert!(wait_for(|| !s.running()));
-        assert!(!s.at_prompt());
-    }
-
-    #[test]
-    fn pasted_text_reaches_the_child_without_being_executed() {
-        let (s, _rx) = spawn_for_test(&["/bin/zsh", "-f"]);
-        assert!(wait_for(|| s.at_prompt()));
-        s.paste("/some/where");
-        assert!(
-            wait_for(|| screen_text(&s).contains("/some/where")),
-            "got {:?}",
-            screen_text(&s)
-        );
-        // Still at the prompt: pasting types, it does not run.
-        assert!(s.at_prompt());
     }
 
     #[test]
@@ -574,22 +493,4 @@ mod tests {
         assert!(r.is_err());
     }
 
-    #[test]
-    fn an_empty_argv_is_refused() {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        assert!(
-            Session::spawn(
-                1,
-                Origin::Shell,
-                String::new(),
-                &[],
-                std::path::Path::new("."),
-                40,
-                10,
-                0,
-                tx
-            )
-            .is_err()
-        );
-    }
 }

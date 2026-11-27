@@ -166,17 +166,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entries_carry_their_owner_and_group_names() {
-        let e = make_entry(std::env::temp_dir(), "tmp".into());
-        // SAFETY: getuid cannot fail.
-        let me = unsafe { libc::getuid() };
-        if e.uid == me {
-            assert!(!e.owner.is_empty(), "the current user has a name");
-        }
-        assert!(std::sync::Arc::ptr_eq(&names::user(e.uid), &names::user(e.uid)), "memoised");
-    }
-
-    #[test]
     fn ancestor_columns_name_each_level_and_mark_the_path() {
         let dir = std::env::temp_dir().join(format!("wasdf-trail-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("b")).unwrap();

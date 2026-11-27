@@ -448,8 +448,6 @@ pub fn render_prop(
     frame: &mut Frame,
     pa: PanelArea,
     state: &AppState,
-    load: Option<[f64; 3]>,
-    border_style: &str,
     panels: &mut Vec<PanelFrame>,
     theme: &Theme,
 ) {
@@ -478,32 +476,62 @@ pub fn render_prop(
         None => vec![Line::from("(empty)")],
     };
     frame.render_widget(Paragraph::new(lines), inner);
-    let avail = pa.rect.width.saturating_sub(4) as usize;
-    let readout = prop_readout(load, SystemTime::now(), h_rule(border_style), avail);
-    panels.push(match readout {
-        Some(r) => pa.frame().info(r),
-        None => pa.frame(),
-    });
+    // When prop is the rightmost top panel, the clock is put on its border
+    // afterwards by `place_status` — it depends on what else the top row shows.
+    panels.push(pa.frame());
 }
 
-/// The prop panel's live readout (doc/UI.md): `[l1, l5, l15]─[YY-MM-DD HH:MM:SS]─`,
-/// giving up detail — the date, then the load, then the seconds — until it
-/// fits in `avail` columns. Every form keeps a trailing rule, so the bracket
-/// never sits flush against the corner.
-fn prop_readout(load: Option<[f64; 3]>, now: SystemTime, rule: char, avail: usize) -> Option<String> {
+/// What the top row's status readout shows besides the clock.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Status {
+    pub battery: Option<crate::services::monitor::Battery>,
+    pub wifi: Option<u8>,
+}
+
+/// The status readout (doc/UI.md): `[WiFi:76%]─[BAT:87%]─[YY-MM-DD HH:MM:SS]─`,
+/// right-aligned so the clock sits at the right end, BAT and WiFi to its left
+/// (each only when the machine reports it). It gives up detail until it fits
+/// in `avail` columns: the date, the seconds, then WiFi, then BAT — the readings
+/// outlast the clock's precision. Every form keeps a trailing rule, so the
+/// bracket never sits on the corner.
+pub fn status_readout(st: Status, now: SystemTime, rule: char, avail: usize) -> Option<String> {
     let full = fmt_time(Some(now), true); // "YYYY-MM-DD HH:MM:SS"
     let (date_time, time_ss, time_mm) = (&full[2..], &full[11..], &full[11..16]);
-    let load = load.map(|[a, b, c]| format!("[{a:.2}, {b:.2}, {c:.2}]{rule}"));
-    let with_load = |clock: &str| load.as_ref().map(|l| format!("{l}[{clock}]{rule}"));
-    [with_load(date_time), with_load(time_ss), Some(format!("[{time_ss}]{rule}")), Some(format!("[{time_mm}]{rule}"))]
-        .into_iter()
-        .flatten()
-        .find(|s| s.chars().count() <= avail)
+    let wifi = st.wifi.map(|p| format!("[WiFi:{p}%]{rule}"));
+    let bat = st.battery.map(|b| format!("[BAT:{}%{}]{rule}", b.percent, if b.charging { "+" } else { "" }));
+    let join = |parts: &[&Option<String>], clock: &str| {
+        let mut s: String = parts.iter().filter_map(|p| p.as_deref()).collect();
+        s.push_str(&format!("[{clock}]{rule}"));
+        s
+    };
+    [
+        join(&[&wifi, &bat], date_time),
+        join(&[&wifi, &bat], time_ss),
+        join(&[&wifi, &bat], time_mm),
+        join(&[&bat], time_mm),
+        join(&[], time_ss),
+        join(&[], time_mm),
+    ]
+    .into_iter()
+    .find(|s| s.chars().count() <= avail)
+}
+
+/// Put the status readout on the rightmost top panel's border (right-aligned,
+/// clear of the corner). `top` lists the top panels drawn this frame, by id
+/// and index into `panels`.
+pub fn place_status(panels: &mut [PanelFrame], top: &[(&str, usize)], snap: &crate::services::monitor::Snapshot, border_style: &str, now: SystemTime) {
+    let rule = h_rule(border_style);
+    let avail = |p: &PanelFrame| p.rect.width.saturating_sub(4) as usize;
+    let Some(&(_, hi)) = top.iter().max_by_key(|(_, i)| panels[*i].rect.x + panels[*i].rect.width) else { return };
+    let st = Status { battery: snap.battery, wifi: snap.wifi };
+    panels[hi].info = status_readout(st, now, rule, avail(&panels[hi]));
 }
 
 // ── Monitor panel ─────────────────────────────────────────────────────────────
 
-/// The monitor panel: CPU load, memory, disk, network throughput. Each metric's
+/// The monitor panel: CPU load, memory, network throughput, disk — top to
+/// bottom in that order, so when the panel is too short the rows that go are
+/// the last ones (DSK first), and CPU/MEM/NET stay. Each metric's
 /// visibility, gauge/value, ratio, refresh cadence, and gauge style are driven by
 /// its `MetricCfg` (configured under `@/settings/Layout/Monitor/<Metric>`).
 pub fn render_monitor(
@@ -522,8 +550,8 @@ pub fn render_monitor(
     let metrics: [(&str, &str, Role, Role, Role); 4] = [
         ("cpu", "CPU", Role::MonitorCpuLabel, Role::MonitorCpuBar, Role::MonitorCpuValue),
         ("mem", "MEM", Role::MonitorMemLabel, Role::MonitorMemBar, Role::MonitorMemValue),
-        ("dsk", "DSK", Role::MonitorDskLabel, Role::MonitorDskBar, Role::MonitorDskValue),
         ("net", "NET", Role::MonitorNetLabel, Role::MonitorNetBar, Role::MonitorNetValue),
+        ("dsk", "DSK", Role::MonitorDskLabel, Role::MonitorDskBar, Role::MonitorDskValue),
     ];
     for (id, name, lbl_role, bar_role, val_role) in metrics {
         let cfg = mon.get(id);
@@ -626,10 +654,7 @@ fn muted_metric_row(
     theme: &Theme,
 ) -> Line<'static> {
     let name_str = format!("{name} ");
-    let avail = width.saturating_sub(name_str.chars().count());
-    let value_w = if cfg.label { (cfg.label_max as usize).min(avail) } else { 0 };
-    let sep = usize::from(value_w > 0);
-    let bar_w = avail.saturating_sub(value_w + sep);
+    let (bar_w, sep, value_w) = row_columns(&name_str, cfg, width);
 
     let muted_style = theme.style(Role::Muted);
     let mut spans = vec![Span::styled(name_str, theme.style(label_role))];
@@ -661,11 +686,7 @@ fn metric_row(
     theme: &Theme,
 ) -> Line<'static> {
     let name_str = format!("{name} ");
-    let avail = width.saturating_sub(name_str.chars().count());
-    // The value field: a fixed `label_max` columns reserved at the right edge.
-    let value_w = if cfg.label { (cfg.label_max as usize).min(avail) } else { 0 };
-    let sep = usize::from(value_w > 0); // one column between gauge and value
-    let bar_w = avail.saturating_sub(value_w + sep);
+    let (bar_w, sep, value_w) = row_columns(&name_str, cfg, width);
 
     let val_style = Style::default().fg(cascade_fg(theme, value_role));
     let mut spans = vec![Span::styled(name_str, theme.style(label_role))];
@@ -674,11 +695,7 @@ fn metric_row(
             // Sparklines auto-range to the window's min..max so movement shows
             // even for a near-constant signal; the fill bar shows the absolute ratio.
             let (mn, mx) = range(history);
-            let bar = match cfg.bar_kind.as_str() {
-                "blocks" => block_sparkline(&scale_minmax(history, mn, mx), bar_w),
-                "braille" => braille_sparkline(&scale_minmax(history, mn, mx), bar_w),
-                _ => mini_bar(ratio, bar_w), // "bar" and any unknown value
-            };
+            let bar = gauge_str(&cfg.bar_kind, ratio, &scale_minmax(history, mn, mx), bar_w);
             spans.push(Span::styled(bar, theme.style(bar_role)));
         } else {
             // Keep the value at the right edge even with the gauge hidden.
@@ -690,6 +707,17 @@ fn metric_row(
         spans.push(Span::styled(fit_right(value, value_w), val_style));
     }
     Line::from(spans)
+}
+
+/// A metric row's columns after its `name_str`: `(gauge, separator, value)`.
+/// The value field is a fixed `label_max` columns at the right edge (when
+/// shown), one column clear of the gauge, so the gauge's width never follows
+/// the value text's length.
+fn row_columns(name_str: &str, cfg: &MetricCfg, width: usize) -> (usize, usize, usize) {
+    let avail = width.saturating_sub(name_str.chars().count());
+    let value_w = if cfg.label { (cfg.label_max as usize).min(avail) } else { 0 };
+    let sep = usize::from(value_w > 0);
+    (avail.saturating_sub(value_w + sep), sep, value_w)
 }
 
 /// Right-align `s` in `w` columns (truncate the tail when too long, pad left).
@@ -710,9 +738,6 @@ fn fit_left(s: &str, w: usize) -> String {
     format!("{t:<w$}")
 }
 
-
-
-
 /// `Fg`-cascade: if the specific role resolves to Reset, fall back to the
 /// global `Fg` role, which itself defaults to Reset (terminal default).
 #[inline]
@@ -720,11 +745,6 @@ fn cascade_fg(theme: &Theme, role: Role) -> ratatui::style::Color {
     let c = theme.role(role);
     if c == ratatui::style::Color::Reset { theme.role(Role::Base) } else { c }
 }
-
-
-
-
-
 
 /// Compact count formatter for op rates: `999`, `1K`, `12M`.
 fn fmt_count(n: u64) -> String {
@@ -737,15 +757,13 @@ fn fmt_count(n: u64) -> String {
     }
 }
 
-
-
 /// Render one gauge of `width` chars per the `bar_kind`. `cur` is the current
 /// ratio (for the fill bar); `hist` is the normalized history (for sparklines).
 fn gauge_str(bar_kind: &str, cur: f64, hist: &[f64], width: usize) -> String {
     match bar_kind {
         "blocks" => block_sparkline(hist, width),
         "braille" => braille_sparkline(hist, width),
-        _ => mini_bar(cur, width),
+        _ => mini_bar(cur, width), // "bar" and any unknown value
     }
 }
 
@@ -759,11 +777,7 @@ fn range(hist: &[f64]) -> (f64, f64) {
 /// and the window peak to full, so a graph shows movement even when the absolute
 /// signal is nearly constant (e.g. memory pressure). A flat window → all zero.
 fn scale_minmax(hist: &[f64], mn: f64, mx: f64) -> Vec<f64> {
-    let span = mx - mn;
-    if !span.is_finite() || span <= 1e-9 {
-        return vec![0.0; hist.len()];
-    }
-    hist.iter().map(|v| ((v - mn) / span).clamp(0.0, 1.0)).collect()
+    hist.iter().map(|&v| lerp_minmax(v, mn, mx)).collect()
 }
 
 /// Auto-range a single value to `0..1` over `[mn, mx]` (the current-sample
@@ -791,11 +805,7 @@ fn disk_row(
     theme: &Theme,
 ) -> Line<'static> {
     let name_str = "DSK ".to_string();
-    let avail = width.saturating_sub(name_str.chars().count());
-    // Fixed value field at the right edge; `:` centered within it.
-    let value_w = if cfg.label { (cfg.label_max as usize).min(avail) } else { 0 };
-    let sep = usize::from(value_w > 0);
-    let gauge_area = avail.saturating_sub(value_w + sep);
+    let (gauge_area, sep, value_w) = row_columns(&name_str, cfg, width);
 
     let lbl = theme.style(label_role);
     let bar = theme.style(bar_role);
@@ -855,11 +865,6 @@ fn disk_value(reads: u64, writes: u64, width: usize) -> String {
     let right = width - 1 - left;
     format!("{}:{}", fit_right(&fmt_count(reads), left), fit_left(&fmt_count(writes), right))
 }
-
-
-
-
-
 
 // ── Prop helpers ──────────────────────────────────────────────────────────────
 
@@ -939,17 +944,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_prop_readout_gives_up_detail_until_it_fits() {
+    fn the_status_readout_gives_up_detail_until_it_fits() {
+        use crate::services::monitor::Battery;
         let now = SystemTime::now();
-        let load = Some([1.9, 2.26, 2.734]);
-        let full = prop_readout(load, now, '─', 80).unwrap();
-        assert!(full.starts_with("[1.90, 2.26, 2.73]─[") && full.ends_with("]─"), "{full}");
-        assert_eq!(full.chars().count(), 39, "YY-MM-DD HH:MM:SS: {full}");
-        let no_date = prop_readout(load, now, '─', 38).unwrap();
-        assert_eq!(no_date.chars().count(), 30, "{no_date}");
-        assert_eq!(prop_readout(load, now, '─', 12).unwrap().chars().count(), 11, "time only");
-        assert_eq!(prop_readout(None, now, '─', 80).unwrap().chars().count(), 11, "no load: time only");
-        assert_eq!(prop_readout(load, now, '─', 8).unwrap().chars().count(), 8, "HH:MM");
-        assert_eq!(prop_readout(load, now, '─', 5), None);
+        let st = Status { battery: Some(Battery { percent: 87, charging: true }), wifi: Some(76) };
+        let full = status_readout(st, now, '─', 80).unwrap();
+        assert!(full.starts_with("[WiFi:76%]─[BAT:87%+]─[") && full.ends_with("]─"), "{full}");
+        let count = |a| status_readout(st, now, '─', a).map(|s| s.chars().count());
+        assert_eq!(count(80), Some(42), "everything, the clock with its date, rightmost");
+        assert_eq!(count(41), Some(33), "the date goes first");
+        assert_eq!(count(32), Some(30), "then the seconds");
+        let bat_only = status_readout(st, now, '─', 29).unwrap();
+        assert!(bat_only.starts_with("[BAT:87%+]─[") && bat_only.chars().count() == 19, "then WiFi: {bat_only}");
+        assert_eq!(count(18), Some(11), "then BAT: the clock alone");
+        assert_eq!(count(8), Some(8), "HH:MM");
+        assert_eq!(count(5), None);
+        // Nothing reported: just the clock.
+        assert_eq!(status_readout(Status::default(), now, '─', 80).unwrap().chars().count(), 20);
     }
+
 }

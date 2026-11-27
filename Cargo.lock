@@ -2918,7 +2918,7 @@ dependencies = [
 
 [[package]]
 name = "wasdf"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chafa-syms-rs",
  "crossterm",
@@ -2940,14 +2940,14 @@ dependencies = [
 
 [[package]]
 name = "wasdf-example-ext"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "wasdf-sdk",
 ]
 
 [[package]]
 name = "wasdf-sdk"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "wasi"

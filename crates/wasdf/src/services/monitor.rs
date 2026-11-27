@@ -1,7 +1,8 @@
 //! Monitor: samples system metrics on its own thread into a shared snapshot
-//! that render reads (doc/ARCHITECTURE.md, Render Contract). The load average
-//! is always sampled; the monitor panel's metrics only while the panel is on
-//! screen. A new sample wakes the loop with `AppEvent::Tick`.
+//! that render reads (doc/ARCHITECTURE.md, Render Contract). The battery and
+//! WiFi (the top row's status readout) are always sampled; the
+//! monitor panel's metrics only while the panel is on screen. A new sample
+//! wakes the loop with `AppEvent::Tick`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,12 +36,26 @@ pub struct DiskSample {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
-    pub load: Option<[f64; 3]>,
+    /// The battery, when the machine has one the OS reports.
+    pub battery: Option<Battery>,
+    /// WiFi signal strength in percent, when a wireless link reports one.
+    pub wifi: Option<u8>,
     pub cpu: Option<MetricSample>,
     pub mem: Option<MetricSample>,
     pub net: Option<MetricSample>,
     pub disk: DiskSample,
 }
+
+/// Battery charge, and whether it is charging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Battery {
+    pub percent: u8,
+    pub charging: bool,
+}
+
+/// How often battery and WiFi are read: they change slowly, and on macOS the
+/// battery costs a process spawn.
+const POWER_EVERY: Duration = Duration::from_secs(30);
 
 /// One metric's sampling cadence (from its `monitor.<id>.*` options).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +142,7 @@ impl Monitor {
 /// The sampling state the thread carries between steps.
 #[derive(Default)]
 struct Sampler {
-    load_at: Option<Instant>,
+    power_at: Option<Instant>,
     due: [Option<Instant>; 4], // cpu, mem, dsk, net
     cpu: VecDeque<f64>,
     mem: VecDeque<f64>,
@@ -153,11 +168,12 @@ impl Sampler {
     fn step(&mut self, now: Instant, config: &Config, active: bool, current: &Snapshot) -> Option<Snapshot> {
         let mut next = current.clone();
         let mut changed = false;
-        if self.load_at.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
-            self.load_at = Some(now);
-            let load = loadavg();
-            changed |= load != next.load;
-            next.load = load;
+        if self.power_at.is_none_or(|t| now.duration_since(t) >= POWER_EVERY) {
+            self.power_at = Some(now);
+            let (battery, wifi) = (battery(), wifi_percent());
+            changed |= battery != next.battery || wifi != next.wifi;
+            next.battery = battery;
+            next.wifi = wifi;
         }
         if !active {
             return changed.then_some(next);
@@ -476,6 +492,69 @@ fn window_rate(
     }
 }
 
+/// The first battery the OS reports. Linux: `/sys/class/power_supply/*` of
+/// type `Battery` (`capacity`, `status`). macOS: `pmset -g batt`.
+#[cfg(target_os = "linux")]
+fn battery() -> Option<Battery> {
+    let dirs = std::fs::read_dir("/sys/class/power_supply").ok()?;
+    for d in dirs.flatten() {
+        let p = d.path();
+        let read = |f: &str| std::fs::read_to_string(p.join(f)).ok().map(|s| s.trim().to_string());
+        if read("type").as_deref() != Some("Battery") {
+            continue;
+        }
+        let Some(percent) = read("capacity").and_then(|c| c.parse::<u8>().ok()) else { continue };
+        let charging = matches!(read("status").as_deref(), Some("Charging" | "Full"));
+        return Some(Battery { percent: percent.min(100), charging });
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn battery() -> Option<Battery> {
+    let out = std::process::Command::new("pmset").args(["-g", "batt"]).output().ok()?;
+    parse_pmset(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn battery() -> Option<Battery> {
+    None
+}
+
+/// `pmset -g batt`: `… -InternalBattery-0 (id=…)\t87%; charging; …`. A desktop
+/// lists no battery line.
+fn parse_pmset(text: &str) -> Option<Battery> {
+    let line = text.lines().find(|l| l.contains("InternalBattery"))?;
+    let pct = line.split(['\t', ' ']).find_map(|w| w.strip_suffix("%;").and_then(|n| n.parse::<u8>().ok()))?;
+    let state = line.split(';').nth(1).map(str::trim).unwrap_or("");
+    Some(Battery { percent: pct.min(100), charging: matches!(state, "charging" | "charged" | "finishing charge") })
+}
+
+/// WiFi signal in percent. Linux: `/proc/net/wireless` signal level (dBm),
+/// mapped the usual way (−100 dBm = 0 %, −50 dBm = 100 %). Elsewhere there is
+/// no source without a privileged tool, so none.
+fn wifi_percent() -> Option<u8> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/net/wireless").ok()?;
+        parse_wireless(&text)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// `/proc/net/wireless`: two header lines, then `iface: status link level noise …`
+/// (level in dBm, with a trailing `.`). The first interface wins.
+fn parse_wireless(text: &str) -> Option<u8> {
+    let line = text.lines().skip(2).find(|l| l.contains(':'))?;
+    let level: f64 = line.split(':').nth(1)?.split_whitespace().nth(2)?.trim_end_matches('.').parse().ok()?;
+    // Drivers that report a 0..100-style level instead of dBm give a positive value.
+    let pct = if level > 0.0 { level } else { 2.0 * (level + 100.0) };
+    Some(pct.clamp(0.0, 100.0) as u8)
+}
+
 /// 1/5/15-minute load averages, if available.
 fn loadavg() -> Option<[f64; 3]> {
     let mut a = [0f64; 3];
@@ -485,15 +564,6 @@ fn loadavg() -> Option<[f64; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_the_load_is_sampled_while_the_panel_is_off_screen() {
-        let mut s = Sampler::default();
-        let now = Instant::now();
-        let snap = s.step(now, &Config::default(), false, &Snapshot::default()).unwrap_or_default();
-        assert!(snap.cpu.is_none() && snap.mem.is_none() && snap.net.is_none());
-        assert_eq!(s.step(now, &Config::default(), false, &snap), None, "nothing due yet");
-    }
 
     #[test]
     fn metrics_follow_their_cadence_and_keep_a_bounded_history() {

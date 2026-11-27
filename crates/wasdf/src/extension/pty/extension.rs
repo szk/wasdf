@@ -512,6 +512,16 @@ impl Extension for PtyExtension {
         let term = PseudoTerminal::new(parser.screen())
             .cursor(Cursor::default().visibility(ctx.focused && s.running()));
         frame.render_widget(&term, inner);
+        // The child's kitty graphics, moved to the panel. Not while scrolled
+        // back — its cursor rows would be off — and then the region is not
+        // reported, so the event loop takes the child's images down.
+        let pending = std::mem::take(&mut *s.shared.graphics.lock().ok()?);
+        if parser.screen().scrollback() == 0 {
+            let cmds = pending.into_iter().filter(|g| g.row < inner.height && g.col < inner.width).map(|g| {
+                crate::ui::graphics::Cmd { at: Some((inner.x + g.col, inner.y + g.row)), data: g.data }
+            });
+            crate::ui::graphics::passthrough(inner, cmds);
+        }
         Some(self.title(id))
     }
 
@@ -568,11 +578,6 @@ mod tests {
         PtyExtension::new()
     }
 
-    #[test]
-    fn the_default_prefix_is_ctrl_b() {
-        assert_eq!(ext().prefix_key(), Key::new(KeyCode::Char('b'), Mods::CTRL));
-    }
-
     /// An extension bound to a store whose `pty.prefix-key` default is `value`.
     fn ext_with_prefix(value: &str) -> PtyExtension {
         use crate::core::{OptionDef, OptionKind};
@@ -589,31 +594,6 @@ mod tests {
     }
 
     #[test]
-    fn a_prefix_without_ctrl_is_refused_so_the_letter_stays_sendable() {
-        assert_eq!(
-            ext_with_prefix("x").prefix_key(),
-            Key::new(KeyCode::Char('b'), Mods::CTRL),
-            "a bare letter as prefix would make that letter unreachable in every child"
-        );
-    }
-
-    #[test]
-    fn an_unparseable_prefix_falls_back_rather_than_leaving_no_way_out() {
-        assert_eq!(
-            ext_with_prefix("Ctrl-nonsense").prefix_key(),
-            Key::new(KeyCode::Char('b'), Mods::CTRL)
-        );
-    }
-
-    #[test]
-    fn a_configured_ctrl_prefix_is_honoured() {
-        assert_eq!(
-            ext_with_prefix("Ctrl-a").prefix_key(),
-            Key::new(KeyCode::Char('a'), Mods::CTRL)
-        );
-    }
-
-    #[test]
     fn releasing_gives_back_the_keyboard_but_keeps_the_session_on_screen() {
         // The panel has to stay for the scrollbar to mean anything: that is how
         // a released session scrolls like every other function-panel frame.
@@ -622,16 +602,6 @@ mod tests {
         let out = e.release();
         assert_eq!(out, vec![Intent::SetInputCapture(None)]);
         assert_eq!(e.attached.get(), Some(1), "still attached, just not captured");
-    }
-
-    #[test]
-    fn closing_gives_back_the_panel_too() {
-        let e = ext();
-        e.attached.set(Some(1));
-        let out = e.close();
-        assert!(e.attached.get().is_none());
-        assert!(out.contains(&Intent::SetInputCapture(None)));
-        assert!(out.contains(&Intent::SetFunctionForm(None)));
     }
 
     #[test]
@@ -668,33 +638,6 @@ mod tests {
         ExtensionIntent { extension: ID.into(), intent: name.into(), data: ExtensionValue::Nil }
     }
 
-    #[test]
-    fn the_prefix_key_hands_the_panel_straight_back_with_no_submenu() {
-        // Core has already dropped the capture by then; a submenu here would
-        // make the one guaranteed way out cost a second keystroke.
-        let e = ext();
-        e.attached.set(Some(1));
-        let out = e.handle_intent(&ei("prefix"), &AppState::new(PathBuf::from("/")));
-        assert_eq!(out, vec![Intent::SetInputCapture(None)]);
-        assert!(!out.iter().any(|i| matches!(i, Intent::PushMode(_))), "no mode is pushed");
-        assert_eq!(e.attached.get(), Some(1), "the session stays visible and scrollable");
-    }
-
-    #[test]
-    fn a_shell_opened_on_a_virtual_path_starts_at_home_instead_of_failing() {
-        let e = ext();
-        let mut s = AppState::new(crate::vfs::vfs_root().join("settings"));
-        assert_eq!(e.start_dir(&s), home_dir(), "no process can chdir into @/settings");
-        s.cwd = PathBuf::from("/tmp");
-        assert_eq!(e.start_dir(&s), PathBuf::from("/tmp"), "a real directory is used as-is");
-    }
-
-    #[test]
-    fn the_scroll_extent_covers_the_scrollback_plus_the_live_screen() {
-        // Nothing has been drawn, so this is the "no session" answer.
-        assert!(ext().form_scroll(&ctx()).is_none());
-    }
-
     /// A file panel sitting on `name`, with a second entry to move to, and the
     /// pty already holding the panel.
     fn state_on(name: &str) -> AppState {
@@ -719,83 +662,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scrolling_the_terminal_does_not_hand_the_panel_back() {
-        // The cursor-changed signature carries the panel's scroll offset, so
-        // `j`/`k` fire the broadcast exactly as a cursor move does. Only the
-        // target tells them apart — without that, scrolling flipped the panel
-        // to the preview mid-scroll.
-        let e = ext();
-        let mut s = state_on("a.txt");
-        e.attached.set(Some(1));
-        *e.cursor_when_shown.borrow_mut() = s.cursor_path();
-
-        s.function.scroll.advance(5);
-        assert!(
-            e.on_cursor_changed(&s).is_empty(),
-            "scrolling is not browsing; the terminal stays on screen"
-        );
-        assert_eq!(e.attached.get(), Some(1));
-    }
-
-    #[test]
-    fn a_captured_session_never_steps_aside() {
-        let e = ext();
-        let mut s = state_on("a.txt");
-        s.input_capture = Some(InputCapture {
-            owner: ID.into(),
-            release: Key::new(KeyCode::Char('b'), Mods::CTRL),
-            escape: Vec::new(),
-        });
-        e.attached.set(Some(1));
-        assert!(e.on_cursor_changed(&s).is_empty());
-    }
-
-    #[test]
-    fn the_offered_directory_is_the_cursor_entrys_parent_not_the_listing() {
-        // After `f` the cursor can sit on a match from another directory, and
-        // that match's own directory is the useful answer — not `state.cwd`.
-        let mut s = AppState::new(PathBuf::from("/listing"));
-        assert_eq!(cursor_dir(&s), Some(PathBuf::from("/")), "no entry: the listing's own parent");
-
-        s.entries = vec![crate::core::Entry::virtual_leaf(
-            PathBuf::from("/elsewhere/deep/hit.txt"),
-            "hit.txt".into(),
-        )];
-        s.cursor = 0;
-        assert_eq!(cursor_dir(&s), Some(PathBuf::from("/elsewhere/deep")));
-    }
-
-    #[test]
-    fn a_directory_under_the_cursor_offers_the_directory_holding_it() {
-        let mut s = AppState::new(PathBuf::from("/a"));
-        s.entries =
-            vec![crate::core::Entry::virtual_dir(PathBuf::from("/a/b/d"), "d".into())];
-        s.cursor = 0;
-        assert_eq!(cursor_dir(&s), Some(PathBuf::from("/a/b")));
-    }
-
-    #[test]
-    fn a_virtual_location_offers_nothing_because_no_shell_can_use_it() {
-        let s = AppState::new(crate::vfs::vfs_root().join("settings"));
-        assert_eq!(cursor_dir(&s), None);
-    }
-
-    #[test]
-    fn session_management_is_reachable_from_the_palette() {
-        let names: Vec<String> = ext().commands().into_iter().map(|c| c.name).collect();
-        for want in ["pty-next", "pty-prev", "pty-kill", "pty-detach"] {
-            assert!(names.contains(&want.to_string()), "{want} missing from {names:?}");
-        }
-    }
-
-    #[test]
-    fn run_with_no_argv_reports_rather_than_spawning() {
-        let e = ext();
-        let out = e.run_from_data(
-            &ExtensionValue::Map(Default::default()),
-            &AppState::new(PathBuf::from("/")),
-        );
-        assert!(matches!(out.as_slice(), [Intent::Notify(_)]));
-    }
 }

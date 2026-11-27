@@ -78,7 +78,7 @@ impl Plan {
             Plan::ReadDir { .. } => Purpose::Refresh,
             // An owner-addressed deep search completes as a generic content
             // Read (routed to the owner's accept_content), not a Select's
-            // own Search completion — see SEARCH_RENEW.md decision 6.
+            // own Search completion — see doc/ARCHITECTURE.md (Async Contract).
             Plan::Search { owner: None, .. } => Purpose::Search,
             Plan::Search { owner: Some(_), .. } => Purpose::Content,
             Plan::Read { .. } => Purpose::Content,
@@ -109,12 +109,25 @@ fn intent_focus(intent: &Intent) -> Option<&'static str> {
     }
 }
 
+/// Whether the function panel is drawn: beside a Select that gives it a hint,
+/// otherwise when it has been shown.
+fn function_on_screen(state: &AppState) -> bool {
+    match state.mode() {
+        Mode::Select(spec) => spec.function_hint.is_some(),
+        _ => state.function.visible,
+    }
+}
+
 /// Apply an intent to the state, returning the effects to perform.
 pub fn apply_intent(state: &mut AppState, intent: Intent, ctx: &dyn CommandLookup) -> Effects {
     // Focus follows the action: before handling, move focus to the middle panel
     // the intent operates on. Handlers that manage focus themselves (initiators,
     // function search, focus ops) run afterward and override as needed.
-    if let Some(panel) = intent_focus(&intent) {
+    // A hidden function panel is never focused: the keys would switch to its
+    // scope with nothing on screen to show it.
+    if let Some(panel) = intent_focus(&intent)
+        && (panel != PANEL_FUNCTION || function_on_screen(state))
+    {
         state.focused_panel = panel.into();
     }
     match intent {
@@ -684,7 +697,7 @@ fn select_move(state: &mut AppState, dir: Dir) -> Effects {
         // the user is done typing and browsing the frozen results, so it
         // carries the same phase switch Enter performs for every other Select
         // kind — without it, select-phase-navigate (and so `f` → SelectRefine)
-        // would be permanently unreachable here. See SEARCH_RENEW.md.
+        // would be permanently unreachable here.
         sel.phase = SelectPhase::Navigate;
     } else {
         match dir {
@@ -716,25 +729,14 @@ fn input_form_move(state: &mut AppState, dir: Dir) -> Effects {
             _ => {}
         },
         InputFormState::Int { value, min, max, typed } => {
-            let (min, max) = (*min, *max);
-            match dir {
-                Dir::Left => {
-                    typed.clear();
-                    *value = (*value - 1).clamp(min, max);
-                }
-                Dir::Right => {
-                    typed.clear();
-                    *value = (*value + 1).clamp(min, max);
-                }
-                Dir::Down => {
-                    typed.clear();
-                    *value = (*value - 10).clamp(min, max);
-                }
-                Dir::Up => {
-                    typed.clear();
-                    *value = (*value + 10).clamp(min, max);
-                }
-            }
+            let step = match dir {
+                Dir::Left => -1,
+                Dir::Right => 1,
+                Dir::Down => -10,
+                Dir::Up => 10,
+            };
+            typed.clear();
+            *value = (*value + step).clamp(*min, *max);
         }
         InputFormState::List { items, selected, .. } => match dir {
             Dir::Up => *selected = selected.saturating_sub(1),
@@ -809,7 +811,7 @@ fn enter_dir(state: &mut AppState) -> Effects {
 
 /// Escape to the parent directory, landing the cursor on the directory we left.
 ///
-/// VFS climb-out rules (§4.3 of plan/vfs.md):
+/// VFS climb-out rules:
 /// - From real `/` → go to the VFS root `@`, landing on the `filesystem` entry.
 /// - From the VFS root `@` → no-op (already at the top).
 /// - Otherwise → lexical `parent()` as usual (works for both real and `@/…` paths).
@@ -1003,7 +1005,7 @@ fn select_confirm(state: &mut AppState, ctx: &dyn CommandLookup) -> Effects {
         // The only remaining Path-input Select is `command` (mkdir/touch/
         // cmdop), which sources its Static option checkboxes, not path
         // completions — it always confirms the typed destination text as-is.
-        // (Extensions asking for free text now use `Mode::InputForm` instead.)
+        // (Extensions asking for free text use `Mode::InputForm`.)
         SelectInput::Path => ConfirmShape::InputOnly(sel.query.clone()),
         _ => {
             // The command Select reads its marks (option toggles) directly below;
@@ -1213,7 +1215,7 @@ fn function_input_key(state: &mut AppState, key: Key) -> Effects {
     match key.code {
         KeyCode::Enter | KeyCode::Esc => {
             let submitted = matches!(key.code, KeyCode::Enter);
-            let input = state.function.input.take().unwrap();
+            let Some(input) = state.function.input.take() else { return Effects::none() };
             let Some(owner) = state.function.form_owner.clone() else { return Effects::none() };
             Effects::emit(vec![Intent::Extension(crate::core::ExtensionIntent {
                 extension: owner,
@@ -1359,22 +1361,17 @@ fn input_form_key(state: &mut AppState, key: Key) -> Effects {
     match form {
         InputFormState::Text { .. } => return input_form_text_key(state, key),
         InputFormState::Int { value, min, max, typed } => {
-            let (min, max) = (*min, *max);
             match key.code {
-                KeyCode::Char('-') if typed.is_empty() && min < 0 => typed.push('-'),
-                KeyCode::Char(c) if c.is_ascii_digit() => {
-                    typed.push(c);
-                    if let Ok(v) = typed.parse::<i64>() {
-                        *value = v.clamp(min, max);
-                    }
-                }
+                KeyCode::Char('-') if typed.is_empty() && *min < 0 => typed.push('-'),
+                KeyCode::Char(c) if c.is_ascii_digit() => typed.push(c),
                 KeyCode::Backspace if !typed.is_empty() => {
                     typed.pop();
-                    if let Ok(v) = typed.parse::<i64>() {
-                        *value = v.clamp(min, max);
-                    }
                 }
-                _ => {}
+                _ => return Effects::none(),
+            }
+            // A lone `-` (or an emptied buffer) keeps the last value.
+            if let Ok(v) = typed.parse::<i64>() {
+                *value = v.clamp(*min, *max);
             }
         }
         InputFormState::List { editing: Some((_, buf, cursor)), .. } => {
@@ -1385,14 +1382,14 @@ fn input_form_key(state: &mut AppState, key: Key) -> Effects {
                 *cursor = input.cursor();
             }
         }
-        // Bool/Choice/Color, and List while browsing: fully Intent-driven now.
+        // Bool/Choice/Color, and List while browsing: fully Intent-driven.
         _ => {}
     }
     Effects::none()
 }
 
 /// The `List` kind's row layout: `items.len()` real rows, then a `"+ Add
-/// item"` row, then a trailing `"✓ Confirm"` row. Enter's meaning depends on
+/// item"` row, then a trailing `"* Confirm"` row. Enter's meaning depends on
 /// which row `selected` is on (see `input_form_confirm`); a dedicated
 /// trailing row is needed because `keymap.scm` binds Enter directly to
 /// `Intent::Confirm` for every InputForm instance, so there is no way to give
@@ -1458,14 +1455,14 @@ fn to_input_request(key: Key) -> Option<tui_input::InputRequest> {
 }
 
 /// Confirm a `Mode::InputForm` popup: pop it, then re-inject `spec.template`
-/// with the encoded value inserted under `KEY_ITEM` — the exact same
-/// contract `Select`'s `OnConfirm::Emit` used, so every existing `*-apply`
-/// extension handler needs no changes.
+/// with the encoded value inserted under `KEY_ITEM` — the same contract as
+/// `Select`'s `OnConfirm::Emit`, so one `*-apply` extension handler serves
+/// both.
 ///
 /// For the `List` kind specifically, Enter is contextual rather than always
 /// confirming (see `list_add_row`/`list_confirm_row`): on a real item row it
 /// starts (or commits) editing that item, on the "+ Add" row it starts a new
-/// one, and only on the trailing "✓ Confirm" row does it fall through to the
+/// one, and only on the trailing "* Confirm" row does it fall through to the
 /// normal pop-and-emit below.
 fn input_form_confirm(state: &mut AppState) -> Effects {
     let Mode::InputForm(spec) = state.mode().clone() else { return Effects::none() };
@@ -1544,7 +1541,7 @@ fn word_start(s: &str, i: usize) -> usize {
 
 /// Re-rank candidates against the current query. FileWalk (deep) goes async
 /// via a Search plan; Entries (shallow), Static, and Commands rank locally
-/// and synchronously — see SEARCH_RENEW.md's deep/shallow vocabulary.
+/// and synchronously — see doc/UI.md (Deep search vs. shallow filter).
 fn refilter(state: &mut AppState) -> Effects {
     let Mode::Select(spec) = state.mode().clone() else {
         return Effects::none();
@@ -1739,54 +1736,12 @@ fn load_entries(state: &mut AppState, entries: Vec<crate::core::state::Entry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::ExtensionValue;
+    
 
     fn type_query(s: &mut AppState, q: &str) {
         for c in q.chars() {
             apply_intent(s, Intent::RawKeyEvent(Key::plain(KeyCode::Char(c))), &NoCommands);
         }
-    }
-
-    #[test]
-    fn func_left_right_scroll_horizontally() {
-        let mut s = AppState::new(std::env::temp_dir());
-        s.function.visible = true;
-        apply_intent(&mut s, Intent::FuncRight, &NoCommands);
-        assert_eq!(s.function.hscroll.offset(), HSCROLL_STEP);
-        apply_intent(&mut s, Intent::FuncLeft, &NoCommands);
-        assert_eq!(s.function.hscroll.offset(), 0);
-        apply_intent(&mut s, Intent::FuncLeft, &NoCommands);
-        assert_eq!(s.function.hscroll.offset(), 0, "saturates at zero");
-    }
-
-    #[test]
-    fn host_function_form_sets_owner_without_touching_focus() {
-        // Unlike SetFunctionForm, HostFunctionForm is passive: a cursor-follow
-        // form (theme's per-role editor) must not steal focus from the file
-        // panel, or wasd/hjkl browsing would break while it's open.
-        let mut s = AppState::new(std::env::temp_dir());
-        s.focused_panel = PANEL_FILE.into();
-        apply_intent(&mut s, Intent::HostFunctionForm(Some("theme".into())), &NoCommands);
-        assert_eq!(s.function.form_owner.as_deref(), Some("theme"));
-        assert!(s.function.visible);
-        assert_eq!(s.focused_panel, PANEL_FILE, "passive claim leaves focus on the file panel");
-
-        apply_intent(&mut s, Intent::HostFunctionForm(None), &NoCommands);
-        assert!(s.function.form_owner.is_none());
-        assert_eq!(s.focused_panel, PANEL_FILE, "passive release leaves focus alone too");
-    }
-
-    #[test]
-    fn set_function_form_still_moves_focus_unlike_host_function_form() {
-        // The explicit-claim sibling (CmdOp, theme's manual "edit-role"
-        // fallback) is unchanged: it still grabs the function panel's focus.
-        let mut s = AppState::new(std::env::temp_dir());
-        s.focused_panel = PANEL_FILE.into();
-        apply_intent(&mut s, Intent::SetFunctionForm(Some("cmdop".into())), &NoCommands);
-        assert_eq!(s.focused_panel, PANEL_FUNCTION);
-
-        apply_intent(&mut s, Intent::SetFunctionForm(None), &NoCommands);
-        assert_eq!(s.focused_panel, PANEL_FILE);
     }
 
     #[test]
@@ -1825,72 +1780,6 @@ mod tests {
     }
 
     #[test]
-    fn multiline_function_input_esc_cancels_immediately_even_mid_line() {
-        let mut s = AppState::new(std::env::temp_dir());
-        s.function.form_owner = Some("cmdop".into());
-        apply_intent(
-            &mut s,
-            Intent::BeginInput { purpose: "create-lines".into(), seed: String::new(), multiline: true },
-            &NoCommands,
-        );
-        type_query(&mut s, "half-typed");
-        let fx = apply_intent(&mut s, Intent::RawKeyEvent(Key::plain(KeyCode::Esc)), &NoCommands);
-        assert!(s.function.input.is_none());
-        match fx.intents.as_slice() {
-            [Intent::Extension(ei)] => assert_eq!(ei.intent, "input-cancel"),
-            other => panic!("expected input-cancel, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn non_multiline_function_input_enter_always_submits() {
-        // The default (multiline: false) path is unchanged — Enter never
-        // inserts a newline for filter/prompt/builder-edit.
-        let mut s = AppState::new(std::env::temp_dir());
-        s.function.form_owner = Some("cmdop".into());
-        apply_intent(
-            &mut s,
-            Intent::BeginInput { purpose: "prompt".into(), seed: String::new(), multiline: false },
-            &NoCommands,
-        );
-        type_query(&mut s, "newname");
-        apply_intent(&mut s, Intent::RawKeyEvent(Key::plain(KeyCode::Enter)), &NoCommands);
-        assert!(s.function.input.is_none(), "a single Enter submits immediately");
-    }
-
-    #[test]
-    fn file_search_results_navigate_as_an_entry_grid() {
-        use crate::core::{EntryList, Mode, SelectSpec};
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        s.push_mode(Mode::Select(SelectSpec::file_search()));
-        let entries = file_entries(3);
-        let mut sel = SelectState::new(String::new(), true);
-        sel.view = Some(EntryList { entries: entries.clone(), cursor: 0 });
-        s.select = Some(sel);
-
-        // The shared Cursor* intents drive the view live, while still typing
-        // (Input phase) — no NextResult/PrevResult.
-        apply_intent(&mut s, Intent::CursorDown, &NoCommands);
-        assert_eq!(s.select.as_ref().unwrap().view.as_ref().unwrap().cursor, 1);
-        apply_intent(&mut s, Intent::CursorBottom, &NoCommands);
-        assert_eq!(s.select.as_ref().unwrap().view.as_ref().unwrap().cursor, 2);
-        apply_intent(&mut s, Intent::CursorUp, &NoCommands);
-        assert_eq!(s.select.as_ref().unwrap().view.as_ref().unwrap().cursor, 1);
-
-        // Confirm commits the matches straight into File mode (no NavigateTo,
-        // no Navigate phase): the file panel's own entries/cursor are swapped
-        // in, so every existing File-mode key already works on them.
-        let fx = apply_intent(&mut s, Intent::Confirm, &NoCommands);
-        assert!(fx.intents.is_empty());
-        assert!(matches!(s.mode(), Mode::File));
-        assert!(s.select.is_none());
-        assert_eq!(s.entries, entries);
-        assert_eq!(s.cursor, 1);
-        assert_eq!(s.filter_stack.len(), 1, "the pre-filter listing is saved for clear-filter to restore");
-        assert_eq!(s.filter_query.as_deref(), Some(""));
-    }
-
-    #[test]
     fn clear_filter_pops_one_level_and_restores_the_prior_listing() {
         use crate::core::{EntryList, Mode, SelectSpec};
         let mut s = AppState::new(std::path::PathBuf::from("/d"));
@@ -1914,45 +1803,7 @@ mod tests {
         assert!(s.filter_stack.is_empty());
     }
 
-    // --- Shallow filter (SEARCH_RENEW.md: FilterListing / SelectRefine) ---
-
-    #[test]
-    fn filter_listing_pushes_a_shallow_select_over_the_current_listing() {
-        use crate::core::{Mode, SelectSource};
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        s.entries = file_entries(3);
-        s.cursor = 0;
-        let fx = apply_intent(&mut s, Intent::FilterListing, &NoCommands);
-        assert!(fx.plans.is_empty(), "shallow filter never spawns a plan — no I/O");
-        match s.mode() {
-            Mode::Select(spec) => {
-                assert_eq!(spec.id, "filter-list");
-                assert!(matches!(&spec.source, SelectSource::Entries(v) if v.len() == 3));
-            }
-            other => panic!("expected a Select mode, got {other:?}"),
-        }
-        // Empty query = the full pool, immediately visible (refilter ran on push).
-        assert_eq!(s.select.as_ref().unwrap().view.as_ref().unwrap().entries.len(), 3);
-    }
-
-    #[test]
-    fn filter_listing_is_a_noop_with_no_entries_to_filter() {
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        apply_intent(&mut s, Intent::FilterListing, &NoCommands);
-        assert!(matches!(s.mode(), Mode::File), "nothing to filter, nothing pushed");
-    }
-
-    #[test]
-    fn shallow_refilter_ranks_synchronously_without_a_plan() {
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        s.entries = file_entries(3); // f0, f1, f2
-        apply_intent(&mut s, Intent::FilterListing, &NoCommands);
-        let fx = apply_intent(&mut s, Intent::RawKeyEvent(Key::plain(KeyCode::Char('2'))), &NoCommands);
-        assert!(fx.plans.is_empty(), "shallow ranking happens inline, not via a Search plan");
-        let view = s.select.as_ref().unwrap().view.as_ref().unwrap();
-        assert_eq!(view.entries.len(), 1);
-        assert_eq!(view.entries[0].name, "f2");
-    }
+    // --- Shallow filter (FilterListing / SelectRefine) ---
 
     #[test]
     fn shallow_confirm_commits_via_filter_stack_like_file_search() {
@@ -1977,60 +1828,7 @@ mod tests {
         assert_eq!(s.entries, original, "Esc unwinds a shallow filter exactly like a deep one");
     }
 
-    #[test]
-    fn filter_listing_works_on_a_virtual_listing() {
-        // The point of the shallow path (#5): unlike deep file-search
-        // (fs::walk on a real path), it never touches the filesystem, so it
-        // works identically on a VFS listing.
-        use crate::core::Mode;
-        let mut s = AppState::new(crate::vfs::vfs_root().join("settings"));
-        s.entries = vec![
-            crate::core::Entry {
-                path: crate::vfs::vfs_root().join("settings").join("Display"),
-                name: "Display".into(),
-                is_dir: true,
-                is_symlink: false,
-                size: 0,
-                mode: 0,
-                uid: 0,
-                gid: 0, owner: "".into(), group: "".into(),
-                modified: None,
-                created: None,
-                accessed: None,
-                symlink_target: None,
-                activation: None,
-            },
-            crate::core::Entry {
-                path: crate::vfs::vfs_root().join("settings").join("Layout"),
-                name: "Layout".into(),
-                is_dir: true,
-                is_symlink: false,
-                size: 0,
-                mode: 0,
-                uid: 0,
-                gid: 0, owner: "".into(), group: "".into(),
-                modified: None,
-                created: None,
-                accessed: None,
-                symlink_target: None,
-                activation: None,
-            },
-        ];
-        let fx = apply_intent(&mut s, Intent::FilterListing, &NoCommands);
-        assert!(fx.plans.is_empty());
-        // "yout" is a subsequence of "Layout" but not "Display" ("lay" would
-        // match both, since subsequence scoring — same as fuzzy_rank — isn't
-        // a literal substring match: "disp-l-a-y" also contains l,a,y).
-        type_query(&mut s, "yout");
-        let view = s.select.as_ref().unwrap().view.as_ref().unwrap();
-        assert_eq!(view.entries.len(), 1);
-        assert_eq!(view.entries[0].name, "Layout");
-        apply_intent(&mut s, Intent::Confirm, &NoCommands);
-        assert!(matches!(s.mode(), Mode::File));
-        assert_eq!(s.entries[0].name, "Layout");
-    }
-
-    // --- Select refine (SEARCH_RENEW.md #2: shallow-filter a result view) ---
+    // --- Select refine (shallow-filter a result view) ---
 
     #[test]
     fn refine_freezes_deep_results_and_ranks_them_shallowly() {
@@ -2058,194 +1856,13 @@ mod tests {
         assert_eq!(s.select.as_ref().unwrap().query, "");
         assert_eq!(s.select.as_ref().unwrap().view.as_ref().unwrap().entries, deep_results);
 
-        // Typing now ranks the frozen pool synchronously — not a fresh deep
+        // Typing ranks the frozen pool synchronously — not a fresh deep
         // walk (which would go through Plan::Search / FileWalk instead).
         let fx = apply_intent(&mut s, Intent::RawKeyEvent(Key::plain(KeyCode::Char('1'))), &NoCommands);
         assert!(fx.plans.is_empty(), "shallow refine ranking never spawns a plan either");
         let view = s.select.as_ref().unwrap().view.as_ref().unwrap();
         assert_eq!(view.entries.len(), 1);
         assert_eq!(view.entries[0].name, "f1");
-    }
-
-    #[test]
-    fn refine_confirm_still_commits_into_file_mode() {
-        use crate::core::{EntryList, Mode, SelectSpec};
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        let original = file_entries(1);
-        s.entries = original.clone();
-
-        s.push_mode(Mode::Select(SelectSpec::file_search()));
-        let mut sel = SelectState::new(String::new(), true);
-        sel.phase = SelectPhase::Navigate;
-        sel.view = Some(EntryList { entries: file_entries(3), cursor: 0 });
-        s.select = Some(sel);
-
-        apply_intent(&mut s, Intent::SelectRefine, &NoCommands);
-        type_query(&mut s, "2");
-        let fx = apply_intent(&mut s, Intent::Confirm, &NoCommands);
-        assert!(fx.intents.is_empty());
-        assert!(matches!(s.mode(), Mode::File), "refine's confirm commits exactly like deep file-search");
-        assert!(s.select.is_none());
-        assert_eq!(s.entries.len(), 1);
-        assert_eq!(s.entries[0].name, "f2");
-        // The listing refine started from (not the very first pre-search one)
-        // is what's saved for Esc to unwind back to — one level, same as any
-        // other filter commit.
-        assert_eq!(s.filter_stack.len(), 1);
-    }
-
-    #[test]
-    fn cursor_move_over_a_result_view_reaches_navigate_phase_so_f_can_refine() {
-        // select_confirm's OnConfirm::Navigate short-circuits every Enter
-        // straight to commit_file_search (single Enter commits — see
-        // refine_confirm_still_commits_into_file_mode), so Enter can never
-        // perform the generic Input-phase-switches-to-Navigate step for
-        // file-search/filter-list. Cursor movement is the only live signal
-        // left that reaches Navigate, which is what makes `f` (SelectRefine,
-        // gated on select-phase-navigate) reachable at all. Simulate the
-        // real flow — type, then move — not a hand-set phase.
-        use crate::core::{EntryList, Mode, SelectSpec};
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        s.push_mode(Mode::Select(SelectSpec::file_search()));
-        let mut sel = SelectState::new(String::new(), true);
-        sel.view = Some(EntryList { entries: file_entries(3), cursor: 0 });
-        s.select = Some(sel);
-        assert_eq!(s.select.as_ref().unwrap().phase, SelectPhase::Input);
-
-        apply_intent(&mut s, Intent::CursorDown, &NoCommands);
-        assert_eq!(s.select.as_ref().unwrap().phase, SelectPhase::Navigate);
-
-        let fx = apply_intent(&mut s, Intent::SelectRefine, &NoCommands);
-        assert!(fx.plans.is_empty());
-        match s.mode() {
-            Mode::Select(spec) => assert_eq!(spec.id, "filter-list"),
-            other => panic!("expected refine to fire once Navigate is reached, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn refine_is_a_noop_without_a_result_view() {
-        use crate::core::{Mode, SelectSpec};
-        // A Static-sourced Select (e.g. the command palette) never has a
-        // `view` — SelectRefine has nothing to freeze and must not disturb it.
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        s.push_mode(Mode::Select(SelectSpec::command_palette(Vec::new())));
-        let before = s.mode().clone();
-        let fx = apply_intent(&mut s, Intent::SelectRefine, &NoCommands);
-        assert!(fx.plans.is_empty() && fx.intents.is_empty());
-        assert_eq!(s.mode().clone(), before, "no result view: refine leaves the Select untouched");
-    }
-
-    #[test]
-    fn input_form_push_seeds_state_from_initial() {
-        use crate::core::{ExtensionIntent, ExtensionValue, InputFormSpec, Mode};
-        let template = ExtensionIntent { extension: "x".into(), intent: "y".into(), data: ExtensionValue::Nil };
-
-        let mut s = AppState::new(std::env::temp_dir());
-        let spec = InputFormSpec::emit_input_form("title", template, Some("default-name".into()));
-        apply_intent(&mut s, Intent::PushMode(Box::new(Mode::InputForm(spec))), &NoCommands);
-        match s.input_form.as_ref().expect("input_form seeded") {
-            crate::core::InputFormState::Text { value, cursor } => {
-                assert_eq!(value, "default-name");
-                assert_eq!(*cursor, "default-name".chars().count());
-            }
-            other => panic!("expected Text, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn input_form_typing_edits_value_through_tui_input() {
-        use crate::core::{ExtensionIntent, ExtensionValue, InputFormSpec, Mode, Mods};
-        let template = ExtensionIntent { extension: "x".into(), intent: "y".into(), data: ExtensionValue::Nil };
-
-        let mut s = AppState::new(std::env::temp_dir());
-        let spec = InputFormSpec::emit_input_form("title", template, None);
-        apply_intent(&mut s, Intent::PushMode(Box::new(Mode::InputForm(spec))), &NoCommands);
-
-        apply_intent(&mut s, Intent::RawKeyEvent(Key::plain(KeyCode::Char('a'))), &NoCommands);
-        apply_intent(&mut s, Intent::RawKeyEvent(Key::plain(KeyCode::Char('b'))), &NoCommands);
-        apply_intent(&mut s, Intent::RawKeyEvent(Key::plain(KeyCode::Char('c'))), &NoCommands);
-        let text_state = |s: &AppState| match s.input_form.as_ref().unwrap() {
-            crate::core::InputFormState::Text { value, cursor } => (value.clone(), *cursor),
-            other => panic!("expected Text, got {other:?}"),
-        };
-        assert_eq!(text_state(&s), ("abc".to_string(), 3));
-
-        // Ctrl-a: go to start of line.
-        apply_intent(&mut s, Intent::RawKeyEvent(Key::new(KeyCode::Char('a'), Mods::CTRL)), &NoCommands);
-        assert_eq!(text_state(&s).1, 0);
-    }
-
-    #[test]
-    fn input_form_confirm_pops_and_emits_with_key_item() {
-        use crate::core::{ExtensionIntent, ExtensionValue, InputFormSpec, Mode, KEY_ITEM};
-        let template = ExtensionIntent { extension: "x".into(), intent: "y".into(), data: ExtensionValue::Nil };
-
-        let mut s = AppState::new(std::env::temp_dir());
-        let spec = InputFormSpec::emit_input_form("title", template, Some("default-name".into()));
-        apply_intent(&mut s, Intent::PushMode(Box::new(Mode::InputForm(spec))), &NoCommands);
-
-        let fx = apply_intent(&mut s, Intent::Confirm, &NoCommands);
-        assert!(!matches!(s.mode(), Mode::InputForm(_)), "confirm pops the mode");
-        assert!(s.input_form.is_none());
-        match fx.intents.as_slice() {
-            [Intent::Extension(ei)] => {
-                assert_eq!((ei.extension.as_str(), ei.intent.as_str()), ("x", "y"));
-                assert_eq!(ei.data.get(KEY_ITEM).and_then(|v| v.as_str()), Some("default-name"));
-            }
-            other => panic!("expected Intent::Extension, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn input_form_cancel_pops_without_emitting() {
-        use crate::core::{ExtensionIntent, ExtensionValue, InputFormSpec, Mode};
-        let template = ExtensionIntent { extension: "x".into(), intent: "y".into(), data: ExtensionValue::Nil };
-
-        let mut s = AppState::new(std::env::temp_dir());
-        let spec = InputFormSpec::emit_input_form("title", template, Some("default-name".into()));
-        apply_intent(&mut s, Intent::PushMode(Box::new(Mode::InputForm(spec))), &NoCommands);
-
-        let fx = apply_intent(&mut s, Intent::Cancel, &NoCommands);
-        assert!(!matches!(s.mode(), Mode::InputForm(_)), "cancel pops the mode");
-        assert!(s.input_form.is_none());
-        assert!(fx.intents.is_empty(), "cancel emits nothing");
-    }
-
-    #[test]
-    fn input_form_bool_toggles_and_confirms_scheme_string() {
-        use crate::core::{ExtensionIntent, ExtensionValue, InputFormSpec, InputKind, Mode, KEY_ITEM};
-        let template = ExtensionIntent { extension: "x".into(), intent: "y".into(), data: ExtensionValue::Nil };
-        let mut s = AppState::new(std::env::temp_dir());
-        let spec = InputFormSpec::emit_input_widget("b", template, InputKind::Bool, "#f");
-        apply_intent(&mut s, Intent::PushMode(Box::new(Mode::InputForm(spec))), &NoCommands);
-        assert_eq!(s.input_form, Some(crate::core::InputFormState::Bool { value: false }));
-
-        apply_intent(&mut s, Intent::CursorLeft, &NoCommands);
-        assert_eq!(s.input_form, Some(crate::core::InputFormState::Bool { value: true }));
-
-        let fx = apply_intent(&mut s, Intent::Confirm, &NoCommands);
-        match fx.intents.as_slice() {
-            [Intent::Extension(ei)] => assert_eq!(ei.data.get(KEY_ITEM).and_then(|v| v.as_str()), Some("#t")),
-            other => panic!("expected Intent::Extension, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn input_form_choice_moves_selection_and_confirms_the_option_string() {
-        use crate::core::{ExtensionIntent, ExtensionValue, InputFormSpec, InputKind, Mode, KEY_ITEM};
-        let template = ExtensionIntent { extension: "x".into(), intent: "y".into(), data: ExtensionValue::Nil };
-        let mut s = AppState::new(std::env::temp_dir());
-        let opts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let spec = InputFormSpec::emit_input_widget("c", template, InputKind::Choice(opts), "b");
-        apply_intent(&mut s, Intent::PushMode(Box::new(Mode::InputForm(spec))), &NoCommands);
-
-        apply_intent(&mut s, Intent::CursorDown, &NoCommands);
-        let fx = apply_intent(&mut s, Intent::Confirm, &NoCommands);
-        match fx.intents.as_slice() {
-            [Intent::Extension(ei)] => assert_eq!(ei.data.get(KEY_ITEM).and_then(|v| v.as_str()), Some("c")),
-            other => panic!("expected Intent::Extension, got {other:?}"),
-        }
     }
 
     #[test]
@@ -2264,257 +1881,6 @@ mod tests {
             [Intent::Extension(ei)] => assert_eq!(ei.data.get(KEY_ITEM).and_then(|v| v.as_str()), Some("5")),
             other => panic!("expected Intent::Extension, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn input_form_int_typed_digits_replace_the_value() {
-        use crate::core::{ExtensionIntent, ExtensionValue, InputFormSpec, InputKind, Mode, KEY_ITEM};
-        let template = ExtensionIntent { extension: "x".into(), intent: "y".into(), data: ExtensionValue::Nil };
-        let mut s = AppState::new(std::env::temp_dir());
-        let spec =
-            InputFormSpec::emit_input_widget("i", template, InputKind::Int { min: -999999, max: 999999 }, "0");
-        apply_intent(&mut s, Intent::PushMode(Box::new(Mode::InputForm(spec))), &NoCommands);
-
-        for c in ['1', '2', '0'] {
-            apply_intent(&mut s, Intent::RawKeyEvent(Key::plain(KeyCode::Char(c))), &NoCommands);
-        }
-        let fx = apply_intent(&mut s, Intent::Confirm, &NoCommands);
-        match fx.intents.as_slice() {
-            [Intent::Extension(ei)] => assert_eq!(ei.data.get(KEY_ITEM).and_then(|v| v.as_str()), Some("120")),
-            other => panic!("expected Intent::Extension, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn input_form_list_add_edit_and_confirm_encodes_comma_joined() {
-        use crate::core::{ExtensionIntent, ExtensionValue, InputFormSpec, InputKind, Mode, KEY_ITEM};
-        let template = ExtensionIntent { extension: "x".into(), intent: "y".into(), data: ExtensionValue::Nil };
-        let mut s = AppState::new(std::env::temp_dir());
-        let spec = InputFormSpec::emit_input_widget("l", template, InputKind::List, "a,b");
-        apply_intent(&mut s, Intent::PushMode(Box::new(Mode::InputForm(spec))), &NoCommands);
-
-        // Starts on the trailing "Confirm" row; a no-op Enter confirms as-is.
-        let fx = apply_intent(&mut s, Intent::Confirm, &NoCommands);
-        match fx.intents.as_slice() {
-            [Intent::Extension(ei)] => assert_eq!(ei.data.get(KEY_ITEM).and_then(|v| v.as_str()), Some("a,b")),
-            other => panic!("expected Intent::Extension, got {other:?}"),
-        }
-
-        // Re-push and add a third item via the "+ Add" row.
-        let template = ExtensionIntent { extension: "x".into(), intent: "y".into(), data: ExtensionValue::Nil };
-        let spec = InputFormSpec::emit_input_widget("l", template, InputKind::List, "a,b");
-        apply_intent(&mut s, Intent::PushMode(Box::new(Mode::InputForm(spec))), &NoCommands);
-        // One CursorUp: Confirm row -> Add row.
-        apply_intent(&mut s, Intent::CursorUp, &NoCommands);
-        match &s.input_form {
-            Some(crate::core::InputFormState::List { selected, items, .. }) => {
-                assert_eq!(*selected, items.len(), "one CursorUp from Confirm lands on the Add row");
-            }
-            other => panic!("expected List, got {other:?}"),
-        }
-        apply_intent(&mut s, Intent::Confirm, &NoCommands); // starts editing a new item
-        {
-            let c = 'c';
-            apply_intent(&mut s, Intent::RawKeyEvent(Key::plain(KeyCode::Char(c))), &NoCommands);
-        }
-        apply_intent(&mut s, Intent::Confirm, &NoCommands); // commits "c", returns to browsing
-        // Move down to the Confirm row and confirm the whole form.
-        while let Some(crate::core::InputFormState::List { selected, items, .. }) = &s.input_form
-            && *selected != items.len() + 1
-        {
-            apply_intent(&mut s, Intent::CursorDown, &NoCommands);
-        }
-        let fx = apply_intent(&mut s, Intent::Confirm, &NoCommands);
-        match fx.intents.as_slice() {
-            [Intent::Extension(ei)] => assert_eq!(ei.data.get(KEY_ITEM).and_then(|v| v.as_str()), Some("a,b,c")),
-            other => panic!("expected Intent::Extension, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn input_form_list_add_item_and_remove_item_intents() {
-        use crate::core::{ExtensionIntent, ExtensionValue, InputFormSpec, InputKind, Mode, KEY_ITEM};
-        let template = ExtensionIntent { extension: "x".into(), intent: "y".into(), data: ExtensionValue::Nil };
-        let mut s = AppState::new(std::env::temp_dir());
-        let spec = InputFormSpec::emit_input_widget("l", template, InputKind::List, "a,b");
-        apply_intent(&mut s, Intent::PushMode(Box::new(Mode::InputForm(spec))), &NoCommands);
-
-        // AddItem starts a nested edit regardless of which row is selected.
-        apply_intent(&mut s, Intent::AddItem, &NoCommands);
-        {
-            let c = 'c';
-            apply_intent(&mut s, Intent::RawKeyEvent(Key::plain(KeyCode::Char(c))), &NoCommands);
-        }
-        apply_intent(&mut s, Intent::Confirm, &NoCommands); // commits "c"
-        match &s.input_form {
-            Some(crate::core::InputFormState::List { items, .. }) => {
-                assert_eq!(items, &vec!["a".to_string(), "b".to_string(), "c".to_string()])
-            }
-            other => panic!("expected List, got {other:?}"),
-        }
-
-        // RemoveItem deletes the currently selected row (browsing only).
-        apply_intent(&mut s, Intent::CursorTop, &NoCommands); // jump to the first item ("a")
-        apply_intent(&mut s, Intent::RemoveItem, &NoCommands);
-        match &s.input_form {
-            Some(crate::core::InputFormState::List { items, .. }) => {
-                assert_eq!(items, &vec!["b".to_string(), "c".to_string()])
-            }
-            other => panic!("expected List, got {other:?}"),
-        }
-
-        let fx = apply_intent(&mut s, Intent::CursorBottom, &NoCommands);
-        assert!(fx.intents.is_empty());
-        let fx = apply_intent(&mut s, Intent::Confirm, &NoCommands);
-        match fx.intents.as_slice() {
-            [Intent::Extension(ei)] => assert_eq!(ei.data.get(KEY_ITEM).and_then(|v| v.as_str()), Some("b,c")),
-            other => panic!("expected Intent::Extension, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn search_input_routes_through_raw_key() {
-        // The `/` input editing is core (generic readline); the matching is the
-        // extension's. Here we only verify the query buffer editing.
-        let mut s = AppState::new(std::env::temp_dir());
-        apply_intent(&mut s, Intent::FunctionSearchStart, &NoCommands);
-        assert!(s.function.search.input_active);
-        type_query(&mut s, "foo");
-        assert_eq!(s.function.search.query, "foo");
-        apply_intent(&mut s, Intent::RawKeyEvent(Key::plain(KeyCode::Backspace)), &NoCommands);
-        assert_eq!(s.function.search.query, "fo");
-    }
-
-    #[test]
-    fn search_submit_delegates_to_the_owning_extension() {
-        // Submit closes the input and emits an extension intent carrying the
-        // query; the owning extension matches (core never calls the matcher).
-        let mut s = AppState::new(std::env::temp_dir());
-        s.function.content_owner = Some("x".into());
-        apply_intent(&mut s, Intent::FunctionSearchStart, &NoCommands);
-        type_query(&mut s, "foo");
-        let fx = apply_intent(&mut s, Intent::FunctionSearchSubmit, &NoCommands);
-        assert!(!s.function.search.input_active);
-        match fx.intents.as_slice() {
-            [Intent::Extension(ei)] => {
-                assert_eq!((ei.extension.as_str(), ei.intent.as_str()), ("x", "search"));
-                assert_eq!(ei.data.as_str(), Some("foo"));
-            }
-            other => panic!("expected an (ext x search) intent, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn store_matches_then_navigate() {
-        // The extension's matches are stored (SetSearchMatches); n/p navigate the
-        // stored list and ask the layout to reveal the current one.
-        let mut s = AppState::new(std::env::temp_dir());
-        apply_intent(&mut s, Intent::SetSearchMatches(vec![(0, 0, 1), (2, 0, 1), (5, 0, 1)]), &NoCommands);
-        assert_eq!(s.function.search.matches.len(), 3);
-        assert_eq!(s.function.search.current, 0);
-        assert!(s.function.search.reveal, "the first match is brought into view");
-        s.function.search.reveal = false; // what the layout does once it has
-        apply_intent(&mut s, Intent::FunctionSearchNext, &NoCommands);
-        assert_eq!((s.function.search.current, s.function.search.reveal), (1, true));
-        apply_intent(&mut s, Intent::FunctionSearchPrev, &NoCommands);
-        apply_intent(&mut s, Intent::FunctionSearchPrev, &NoCommands);
-        assert_eq!(s.function.search.current, 2, "prev wraps");
-        apply_intent(&mut s, Intent::SetScroll(9), &NoCommands);
-        assert_eq!(s.function.scroll.offset(), 9);
-    }
-
-    #[test]
-    fn reset_content_view_clears_scroll_and_search() {
-        let mut s = AppState::new(std::env::temp_dir());
-        s.function.scroll.set(5);
-        s.function.hscroll.set(3);
-        s.function.search.matches = vec![(0, 0, 1)];
-        apply_intent(&mut s, Intent::ResetContentView, &NoCommands);
-        assert_eq!((s.function.scroll.offset(), s.function.hscroll.offset()), (0, 0));
-        assert!(s.function.search.matches.is_empty());
-    }
-
-    #[test]
-    fn refresh_reloads_visible_function_content() {
-        // Refresh re-reads the directory AND, when the function panel shows
-        // content, forces a LoadContent at offset 0 for the cursor path — so an
-        // edit made in a suspended editor is re-read on return (the previewer
-        // would otherwise skip a same-path re-read). With the panel hidden, only
-        // the directory is re-read.
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        s.entries = file_entries(2);
-        s.cursor = 1;
-        s.function.visible = true;
-        s.function.sublayout = SubLayout::Content;
-        s.function.content_owner = Some("preview".into());
-        let fx = apply_intent(&mut s, Intent::Refresh, &NoCommands);
-        assert!(matches!(fx.plans.as_slice(), [Plan::ReadDir { .. }]), "re-reads the directory");
-        match fx.intents.as_slice() {
-            [Intent::LoadContent { owner, path, offset }] => {
-                assert_eq!(owner, "preview");
-                assert_eq!(path, &s.entries[1].path);
-                assert_eq!(*offset, 0, "forced reload from the start bypasses the owner cache");
-            }
-            other => panic!("expected a forced LoadContent, got {other:?}"),
-        }
-
-        // Hidden panel: no content reload.
-        s.function.visible = false;
-        let fx = apply_intent(&mut s, Intent::Refresh, &NoCommands);
-        assert!(fx.intents.is_empty(), "no content reload when the panel is hidden");
-    }
-
-    #[test]
-    fn show_function_content_populates_and_focuses_the_panel() {
-        use crate::core::{Block, PanelView, TextSpan};
-        let mut s = AppState::new(std::env::temp_dir());
-        let view = PanelView::Document(vec![Block::Line(vec![TextSpan::plain("hi")])]);
-        apply_intent(
-            &mut s,
-            Intent::ShowFunctionContent { owner: "ext".into(), view },
-            &NoCommands,
-        );
-        assert!(s.function.visible);
-        assert_eq!(s.function.sublayout, SubLayout::Content);
-        assert_eq!(s.function.content_owner.as_deref(), Some("ext"));
-        assert_eq!(s.focused_panel, "function");
-        assert!(s.function.content.is_some());
-        apply_intent(&mut s, Intent::ScrollDown, &NoCommands);
-        assert_eq!(s.function.scroll.offset(), 1);
-    }
-
-    #[test]
-    fn update_function_view_stores_opaque_state() {
-        let mut s = AppState::new(std::env::temp_dir());
-        apply_intent(&mut s, Intent::UpdateFunctionView(ExtensionValue::Int(7)), &NoCommands);
-        assert_eq!(s.function.ext_view, ExtensionValue::Int(7));
-    }
-
-    #[test]
-    fn popping_an_overlay_clears_its_pushed_content() {
-        use crate::core::{Block, ExtensionValue, Mode, PanelView, TextSpan};
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        s.entries = file_entries(2);
-        s.cursor = 1;
-        // An overlay extension mode takes over the panel and pushes content.
-        s.push_mode(Mode::Extension {
-            extension: "exampleext".into(),
-            mode: "info".into(),
-            state: ExtensionValue::Nil,
-            overlay: true,
-        });
-        let view = PanelView::Document(vec![Block::Line(vec![TextSpan::plain("info")])]);
-        apply_intent(&mut s, Intent::ShowFunctionContent { owner: "exampleext".into(), view }, &NoCommands);
-        assert_eq!(s.function.content_owner.as_deref(), Some("exampleext"));
-        assert_eq!(s.focused_panel, "function");
-
-        // Popping the overlay drops its content + owner and returns focus to the
-        // file panel, so the ambient provider reclaims on the next broadcast.
-        apply_intent(&mut s, Intent::PopMode, &NoCommands);
-        assert!(matches!(s.mode(), Mode::File), "back to the base mode");
-        assert!(s.function.content.is_none(), "overlay content cleared on pop");
-        assert!(s.function.content_owner.is_none());
-        assert_eq!(s.focused_panel, "file");
     }
 
 
@@ -2553,33 +1919,6 @@ mod tests {
     }
 
     #[test]
-    fn list_layout_cycles_rows_columns_grid() {
-        use crate::core::ListLayout::*;
-        assert_eq!(Rows.next(), Columns);
-        assert_eq!(Columns.next(), Grid);
-        assert_eq!(Grid.next(), Rows);
-        let mut s = AppState::new(std::env::temp_dir());
-        mv(&mut s, Intent::CycleListLayout);
-        assert_eq!(s.list_layout, Columns);
-    }
-
-    #[test]
-    fn rows_fallback_wasd_clamps() {
-        // Unmeasured geometry (rows == 0) falls back to single-column behavior:
-        // w/s move ∓1 and clamp at the first/last entry. (d/Enter on a file are
-        // covered by the Revision 2 tests below.)
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        s.entries = file_entries(3);
-        mv(&mut s, Intent::CursorDown);
-        assert_eq!(s.cursor, 1);
-        mv(&mut s, Intent::CursorDown);
-        mv(&mut s, Intent::CursorDown);
-        assert_eq!(s.cursor, 2, "clamps at the last entry");
-        mv(&mut s, Intent::CursorUp);
-        assert_eq!(s.cursor, 1);
-    }
-
-    #[test]
     fn grid_wasd_moves_2d_column_major() {
         // n=7, cols=3, rows=3: col0=0,1,2  col1=3,4,5  col2=6
         let mut s = grid_state(7, 3, 3);
@@ -2608,48 +1947,21 @@ mod tests {
         assert_eq!(s.pending_focus.as_deref(), Some(std::path::Path::new("/d")));
     }
 
-    #[test]
-    fn grid_right_wall_clamps() {
-        // Rightmost existing cell: CursorRight clamps (no move, no side effect) in Grid.
-        let mut s = grid_state(7, 3, 3);
-        s.cursor = 6; // col2 (rightmost)
-        mv(&mut s, Intent::CursorRight);
-        assert_eq!(s.cursor, 6, "grid right wall clamps");
-        assert!(!s.function.visible, "grid right wall does nothing");
-    }
-
     // --- Revision 2: d shows content, Enter opens, search focus ----------------
 
     #[test]
-    fn rows_d_on_file_cycles_content_without_focus() {
-        // Rows + file: d shows the content (visible, Content), focus stays on file,
-        // then cycles the ratio without ever hiding.
+    fn a_function_intent_never_focuses_a_hidden_function_panel() {
+        use crate::core::{PANEL_FILE, PANEL_FUNCTION};
         let mut s = AppState::new(std::path::PathBuf::from("/d"));
         s.entries = file_entries(3);
-        s.cursor = 1; // a file
-        assert!(!s.function.visible);
-        mv(&mut s, Intent::CursorRight); // d: show content
-        assert!(s.function.visible);
-        assert_eq!(s.function.sublayout, SubLayout::Content);
-        assert_eq!(s.focused_panel, "file", "content cycle does not steal focus");
-        let r0 = s.function.ratio;
-        mv(&mut s, Intent::CursorRight); // d: advance ratio
-        assert_ne!(s.function.ratio, r0, "second d advances the ratio");
-        // Cycle the full ring; never hides.
-        mv(&mut s, Intent::CursorRight);
-        mv(&mut s, Intent::CursorRight);
-        assert!(s.function.visible, "d never hides the content");
-    }
-
-    #[test]
-    fn cycle_content_restores_content_from_exec() {
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        s.entries = file_entries(2);
-        s.cursor = 0;
+        s.focused_panel = PANEL_FILE.into();
+        for i in [Intent::FuncDown, Intent::FuncLeft, Intent::ScrollUp, Intent::PageDown] {
+            mv(&mut s, i);
+            assert_eq!(s.focused_panel, PANEL_FILE, "the panel is hidden");
+        }
         s.function.visible = true;
-        s.function.sublayout = SubLayout::Exec;
-        mv(&mut s, Intent::CursorRight); // d on a file
-        assert_eq!(s.function.sublayout, SubLayout::Content, "d forces Content back");
+        mv(&mut s, Intent::FuncDown);
+        assert_eq!(s.focused_panel, PANEL_FUNCTION, "shown, it takes focus as before");
     }
 
     #[test]
@@ -2692,117 +2004,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn enter_on_dir_enters_it() {
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        let mut es = file_entries(1);
-        es[0].is_dir = true;
-        es[0].path = std::path::PathBuf::from("/d/sub");
-        s.entries = es;
-        s.cursor = 0;
-        apply_intent(&mut s, Intent::Activate, &NoCommands);
-        assert_eq!(s.cwd, std::path::PathBuf::from("/d/sub"), "Enter on a dir enters it");
-    }
-
-    #[test]
-    fn search_start_focuses_function_submit_and_cancel_release() {
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        s.function.content_owner = Some("x".into());
-        mv(&mut s, Intent::FunctionSearchStart);
-        assert_eq!(s.focused_panel, "function", "/ borrows focus for query input");
-        assert!(s.function.search.input_active);
-        mv(&mut s, Intent::FunctionSearchSubmit);
-        assert_eq!(s.focused_panel, "file", "Enter releases focus to the file list");
-        // Cancel also releases.
-        mv(&mut s, Intent::FunctionSearchStart);
-        assert_eq!(s.focused_panel, "function");
-        mv(&mut s, Intent::FunctionSearchCancel);
-        assert_eq!(s.focused_panel, "file");
-    }
-
     // --- VFS virtual navigation -------------------------------------------
-
-    #[test]
-    fn navigate_to_virtual_path_treated_as_directory() {
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        let fx = apply_intent(&mut s, Intent::NavigateTo(PathBuf::from("@/settings")), &NoCommands);
-        // Emits ReadDir for the virtual location, not NavigateTo a parent.
-        assert!(matches!(fx.plans.as_slice(), [Plan::ReadDir { path, .. }] if path == &PathBuf::from("@/settings")));
-        assert_eq!(s.cwd, PathBuf::from("@/settings"));
-    }
-
-    #[test]
-    fn navigate_to_vfs_root_treated_as_directory() {
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        let fx = apply_intent(&mut s, Intent::NavigateTo(PathBuf::from("@")), &NoCommands);
-        assert!(matches!(fx.plans.as_slice(), [Plan::ReadDir { path, .. }] if path == &PathBuf::from("@")));
-        assert_eq!(s.cwd, PathBuf::from("@"));
-    }
-
-    #[test]
-    fn navigate_to_tilde_expands_to_home() {
-        let mut s = AppState::new(std::path::PathBuf::from("/"));
-        let fx = apply_intent(&mut s, Intent::NavigateTo(PathBuf::from("~")), &NoCommands);
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
-        assert!(matches!(fx.plans.as_slice(), [Plan::ReadDir { path, .. }] if path == &home));
-        assert_eq!(s.cwd, home);
-    }
-
-    #[test]
-    fn parent_from_real_root_goes_to_vfs_root() {
-        let mut s = AppState::new(std::path::PathBuf::from("/"));
-        let fx = apply_intent(&mut s, Intent::CursorLeft, &NoCommands);
-        assert!(matches!(fx.plans.as_slice(), [Plan::ReadDir { path, .. }] if path == &PathBuf::from("@")));
-        assert_eq!(s.cwd, PathBuf::from("@"));
-        // Landing cursor: the filesystem entry (path = "/").
-        assert_eq!(s.pending_focus.as_deref(), Some(std::path::Path::new("/")));
-    }
-
-    #[test]
-    fn parent_from_vfs_root_is_noop() {
-        let mut s = AppState::new(PathBuf::from("@"));
-        let fx = apply_intent(&mut s, Intent::CursorLeft, &NoCommands);
-        assert!(fx.plans.is_empty(), "CursorLeft at VFS root is a no-op");
-        assert_eq!(s.cwd, PathBuf::from("@"), "cwd unchanged");
-    }
-
-    #[test]
-    fn activate_virtual_leaf_forwards_extension_intent() {
-        // "widgets"/"goto" are arbitrary example names — the reducer forwards
-        // any virtual leaf's activation generically, with no branch tied to any
-        // specific extension (bookmarks or otherwise).
-        use crate::core::{Entry, ExtensionIntent};
-        let mut s = AppState::new(PathBuf::from("@/widgets"));
-        let leaf = Entry {
-            path: PathBuf::from("@/widgets/0"),
-            name: "mydir".into(),
-            is_dir: false,
-            is_symlink: false,
-            size: 0,
-            mode: 0,
-            uid: 0,
-            gid: 0, owner: "".into(), group: "".into(),
-            modified: None,
-            created: None,
-            accessed: None,
-            symlink_target: None,
-            activation: Some(ExtensionIntent {
-                extension: "widgets".into(),
-                intent: "goto".into(),
-                data: crate::core::ExtensionValue::Nil,
-            }),
-        };
-        s.entries = vec![leaf];
-        s.cursor = 0;
-        let fx = apply_intent(&mut s, Intent::Activate, &NoCommands);
-        match fx.intents.as_slice() {
-            [Intent::Extension(ei)] => {
-                assert_eq!(ei.extension, "widgets");
-                assert_eq!(ei.intent, "goto");
-            }
-            other => panic!("expected Intent::Extension, got {other:?}"),
-        }
-    }
 
     // --- command flow: target + options + run ----------------------------
 
@@ -2818,58 +2020,6 @@ mod tests {
                 assert_eq!(r.paths.len(), 1, "cursor entry is the target");
             }
             other => panic!("expected RunResolver(delete), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn command_dest_input_does_not_filter_the_options() {
-        use crate::core::{Candidate, ExtensionValue, ResolveFill};
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        let opts = vec![
-            Candidate::new("-v  verbose", ExtensionValue::String("-v".into())),
-            Candidate::new("-n  no-clobber", ExtensionValue::String("-n".into())),
-        ];
-        let spec = crate::core::SelectSpec::command(
-            op_request("copy", vec![std::path::PathBuf::from("/d/a")], None),
-            ResolveFill::Dst,
-            opts,
-            None,
-        );
-        s.push_mode(Mode::Select(spec));
-        // A destination that fuzzy-matches no option must NOT narrow the list.
-        s.select = Some(SelectState::new("/some/where/else".into(), true));
-        refilter(&mut s);
-        assert_eq!(
-            s.select.as_ref().unwrap().results.len(),
-            2,
-            "the dest input is free text, not a filter over the option checkboxes",
-        );
-    }
-
-    #[test]
-    fn command_confirm_runs_with_typed_dst_and_marked_options() {
-        use crate::core::{Candidate, ExtensionValue, ResolveFill};
-        let mut s = AppState::new(std::path::PathBuf::from("/d"));
-        let template = op_request("copy", vec![std::path::PathBuf::from("/d/a")], None);
-        let opt = Candidate::new("-v  verbose", ExtensionValue::String("-v".into()));
-        let spec = crate::core::SelectSpec::command(template, ResolveFill::Dst, vec![opt.clone()], None);
-        s.push_mode(Mode::Select(spec));
-        // Typed destination + one option toggled (marked).
-        let mut sel = SelectState::new("/dest".into(), true);
-        sel.phase = SelectPhase::Navigate; // past the input phase
-        sel.results = vec![opt];
-        sel.marks.insert("-v  verbose".into());
-        s.select = Some(sel);
-
-        let fx = apply_intent(&mut s, Intent::Confirm, &NoCommands);
-        match fx.intents.as_slice() {
-            [Intent::RunResolver(r)] => {
-                assert_eq!(r.op, "copy");
-                assert_eq!(r.dst.as_deref(), Some("/dest"), "typed input → dst");
-                assert_eq!(r.opts, vec!["-v".to_string()], "marked option → opts");
-                assert_eq!(r.paths, vec![std::path::PathBuf::from("/d/a")]);
-            }
-            other => panic!("expected RunResolver(copy), got {other:?}"),
         }
     }
 

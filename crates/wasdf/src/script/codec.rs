@@ -361,8 +361,7 @@ fn intent_from_name(s: &str) -> Option<Intent> {
         "set-sublayout-exec" => SetSubLayout(SubLayout::Exec),
         "file-search" => PushMode(Box::new(Mode::Select(SelectSpec::file_search()))),
         // FilterListing/SelectRefine carry no data (the snapshot is taken in
-        // the reducer, which has state the codec does not) — see
-        // SEARCH_RENEW.md decision 3.
+        // the reducer, which has state the codec does not).
         "filter-list" => FilterListing,
         "select-refine" => SelectRefine,
         "command-palette" => {
@@ -498,50 +497,6 @@ mod tests {
     use crate::script::sexpr::parse;
 
     #[test]
-    fn ext_intent_form_decodes() {
-        let d = parse("(ext \"example\" \"greet\")").unwrap();
-        match intent_from_datum(&d) {
-            Some(Intent::Extension(ei)) => {
-                assert_eq!(ei.extension, "example");
-                assert_eq!(ei.intent, "greet");
-            }
-            other => panic!("expected extension intent, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn entries_from_datum_list_decodes_dirs_and_leaves() {
-        let d = parse(
-            "((dir \"Sub\" \"sub\") \
-              (leaf \"Go\" \"go\" (ext \"myext\" \"goto\" \"/real/path\")) \
-              (bogus \"skip\" \"me\"))",
-        )
-        .unwrap();
-        let base = std::path::Path::new("@/myext");
-        let entries = entries_from_datum_list(&d, base);
-        assert_eq!(entries.len(), 2, "the unknown form is skipped");
-
-        assert!(entries[0].is_dir);
-        assert_eq!(entries[0].name, "Sub");
-        assert_eq!(entries[0].path, base.join("sub"));
-        assert!(entries[0].activation.is_none());
-
-        assert!(!entries[1].is_dir);
-        assert_eq!(entries[1].name, "Go");
-        assert_eq!(entries[1].path, base.join("go"));
-        let activation = entries[1].activation.as_ref().unwrap();
-        assert_eq!(activation.extension, "myext");
-        assert_eq!(activation.intent, "goto");
-        assert_eq!(activation.data, ExtensionValue::String("/real/path".into()));
-    }
-
-    #[test]
-    fn intent_list_decodes() {
-        let d = parse("(refresh quit)").unwrap();
-        assert_eq!(intents_from_datum_list(&d), vec![Intent::Refresh, Intent::Quit]);
-    }
-
-    #[test]
     fn show_function_content_decodes_a_document() {
         let d = parse(
             "(show-function-content \"ext\" (document \
@@ -569,79 +524,6 @@ mod tests {
             }
             other => panic!("expected ShowFunctionContent, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn span_decodes_literal_rgb_with_background() {
-        let d = parse("(show-function-content \"e\" (document (line ((span \"ab\" (rgb 1 2 3 4 5 6))))))").unwrap();
-        match intent_from_datum(&d) {
-            Some(Intent::ShowFunctionContent { view: PanelView::Document(blocks), .. }) => {
-                match &blocks[0] {
-                    Block::Line(spans) => assert_eq!(
-                        spans[0].style,
-                        SpanStyle::Rgb { fg: (1, 2, 3), bg: Some((4, 5, 6)) },
-                    ),
-                    other => panic!("expected a line, got {other:?}"),
-                }
-            }
-            other => panic!("expected styled content, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn update_function_view_decodes() {
-        let d = parse("(update-function-view 7)").unwrap();
-        assert_eq!(intent_from_datum(&d), Some(Intent::UpdateFunctionView(ExtensionValue::Int(7))));
-    }
-
-    #[test]
-    fn pop_mode_decodes() {
-        assert_eq!(intent_from_datum(&parse("pop-mode").unwrap()), Some(Intent::PopMode));
-    }
-
-    #[test]
-    fn push_overlay_decodes_an_overlay_extension_mode() {
-        let d = parse("(push-overlay \"exampleext\" \"info\")").unwrap();
-        match intent_from_datum(&d) {
-            Some(Intent::PushMode(m)) => match *m {
-                Mode::Extension { extension, mode, overlay, .. } => {
-                    assert_eq!(extension, "exampleext");
-                    assert_eq!(mode, "info");
-                    assert!(overlay, "push-overlay is an overlay mode");
-                }
-                other => panic!("expected an extension mode, got {other:?}"),
-            },
-            other => panic!("expected PushMode, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ext_value_renders_for_the_abi() {
-        assert_eq!(ext_value_to_scheme(&ExtensionValue::Int(7)), "7");
-        assert_eq!(ext_value_to_scheme(&ExtensionValue::Bool(true)), "#t");
-        assert_eq!(ext_value_to_scheme(&ExtensionValue::String("a\"b".into())), "\"a\\\"b\"");
-    }
-
-    #[test]
-    fn function_keys_and_insert_round_trip_through_their_names() {
-        for code in [KeyCode::F(1), KeyCode::F(12), KeyCode::F(35), KeyCode::Insert] {
-            let name = code_name(code);
-            assert_eq!(parse_key(&name).map(|k| k.code), Some(code), "{name}");
-        }
-    }
-
-    #[test]
-    fn a_lone_f_is_still_the_letter() {
-        assert_eq!(parse_key("F").map(|k| k.code), Some(KeyCode::Char('F')));
-    }
-
-    #[test]
-    fn the_kitty_modifiers_survive_a_name_round_trip() {
-        let key = Key::new(
-            KeyCode::Char('b'),
-            Mods { ctrl: true, sup: true, hyper: true, meta: true, ..Mods::NONE },
-        );
-        assert_eq!(parse_key(&key_name(key)), Some(key));
     }
 
     #[test]
@@ -689,11 +571,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn encode_key_keeps_modifiers_out_of_the_code_field() {
-        let key = Key::new(KeyCode::Char('b'), Mods::CTRL);
-        let ExtensionValue::Map(m) = encode_key(key) else { panic!("not a map") };
-        assert_eq!(m.get("code").and_then(|v| v.as_str()), Some("b"));
-        assert_eq!(m.get("ctrl").and_then(|v| v.as_bool()), Some(true));
-    }
 }

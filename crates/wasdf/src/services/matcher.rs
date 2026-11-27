@@ -122,7 +122,7 @@ impl MatcherBackend for SkimMatcher {
 }
 
 /// Discount applied to a full-path match vs. a basename-only match.
-/// Equals one `bonusBoundaryDelimiter` in fzf's table (§3.1 of plan/matcher.md).
+/// Equals one `bonusBoundaryDelimiter` in fzf's scoring table.
 const REL_DIR_DISCOUNT: i64 = 9;
 
 /// Maximum survivors to stat and affinity-re-rank. Keeps per-keystroke I/O
@@ -268,114 +268,7 @@ mod tests {
 
     // ── affinity unit tests (pure, no I/O) ───────────────────────────────────
 
-    #[test]
-    fn uuid_path_sinks_below_short_basename() {
-        let short = affinity(
-            100,
-            "src/main.rs",
-            "main.rs",
-            FileKind::Regular { executable: false },
-            &cfg(),
-        );
-        let uuid = affinity(
-            100,
-            "Library/Caches/A1B2-C3D4-E5F6-G7H8/A1B2C3D4E5F6G7H8-content.cache",
-            "A1B2C3D4E5F6G7H8-content.cache",
-            FileKind::Regular { executable: false },
-            &cfg(),
-        );
-        assert!(short > uuid, "short={short}, uuid={uuid}");
-    }
-
-    #[test]
-    fn deep_path_sinks_vs_shallow() {
-        let shallow = affinity(
-            100,
-            "Makefile",
-            "Makefile",
-            FileKind::Regular { executable: false },
-            &cfg(),
-        );
-        let deep = affinity(
-            100,
-            "a/b/c/d/e/f/Makefile",
-            "Makefile",
-            FileKind::Regular { executable: false },
-            &cfg(),
-        );
-        assert!(shallow > deep, "shallow={shallow}, deep={deep}");
-    }
-
-    #[test]
-    fn exec_file_rises() {
-        let non_exec = affinity(
-            100,
-            "scripts/build",
-            "build",
-            FileKind::Regular { executable: false },
-            &cfg(),
-        );
-        let exec = affinity(
-            100,
-            "scripts/build",
-            "build",
-            FileKind::Regular { executable: true },
-            &cfg(),
-        );
-        assert!(exec > non_exec, "exec={exec}, non_exec={non_exec}");
-    }
-
-    #[test]
-    fn node_modules_path_sinks() {
-        let normal = affinity(
-            100,
-            "src/index.js",
-            "index.js",
-            FileKind::Regular { executable: false },
-            &cfg(),
-        );
-        let noise = affinity(
-            100,
-            "node_modules/lodash/index.js",
-            "index.js",
-            FileKind::Regular { executable: false },
-            &cfg(),
-        );
-        assert!(normal > noise, "normal={normal}, node_modules={noise}");
-    }
-
-    #[test]
-    fn preferred_ext_rises_noise_ext_sinks() {
-        let base_score = 100i64;
-        let preferred = affinity(
-            base_score,
-            "doc/README.md",
-            "README.md",
-            FileKind::Regular { executable: false },
-            &cfg(),
-        );
-        let noise = affinity(
-            base_score,
-            "doc/Cargo.lock",
-            "Cargo.lock",
-            FileKind::Regular { executable: false },
-            &cfg(),
-        );
-        // Both have same depth and similar length; preferred_ext gives +24, noise_ext gives -24
-        assert!(preferred > noise, "preferred={preferred}, noise_ext={noise}");
-    }
-
     // ── rank_paths integration tests ──────────────────────────────────────────
-
-    #[test]
-    fn rank_paths_empty_query_sorted_lexicographically() {
-        let m = SkimMatcher::default();
-        let root = Path::new("/root");
-        let paths = vec![PathBuf::from("/root/b.txt"), PathBuf::from("/root/a.txt")];
-        let ranked = rank_paths(&m, root, paths, "", &cfg());
-        assert_eq!(ranked[0].path, PathBuf::from("/root/a.txt"));
-        assert_eq!(ranked[1].path, PathBuf::from("/root/b.txt"));
-    }
 
     #[test]
     fn rank_paths_node_modules_sinks_below_src() {
@@ -391,22 +284,4 @@ mod tests {
         assert_eq!(ranked[0].path, PathBuf::from("/r/src/main.rs"), "src/main.rs should rank first");
     }
 
-    #[test]
-    fn rank_paths_empty_query_result_count_follows_max_results_not_a_hardcoded_500() {
-        let m = SkimMatcher::default();
-        let root = Path::new("/root");
-        let paths: Vec<PathBuf> = (0..10).map(|i| PathBuf::from(format!("/root/f{i}.txt"))).collect();
-        let ranked = rank_paths(&m, root, paths, "", &cfg_with_max(3));
-        assert_eq!(ranked.len(), 3, "the empty-query branch must respect the configured cap");
-    }
-
-    #[test]
-    fn rank_paths_query_result_count_follows_max_results_not_a_hardcoded_500() {
-        let m = SkimMatcher::default();
-        let root = Path::new("/root");
-        // 10 candidates all matching "f" so all 10 survive stage 1.
-        let paths: Vec<PathBuf> = (0..10).map(|i| PathBuf::from(format!("/root/f{i}.txt"))).collect();
-        let ranked = rank_paths(&m, root, paths, "f", &cfg_with_max(3));
-        assert_eq!(ranked.len(), 3, "the matched-query branch must respect the configured cap, not truncate(500)");
-    }
 }

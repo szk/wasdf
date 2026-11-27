@@ -3,7 +3,7 @@
 //!
 //! It demonstrates that a **fat extension owns its behavior**: the file-info
 //! logic and the toggle state live here (this library), not in the kernel.
-//! Nothing feature-specific was added to core / codec / the keymap for it — it
+//! Nothing in core / codec / the keymap is specific to it — it
 //! rides entirely on generic seams over the existing C ABI:
 //!
 //!   - `wasdf_on_cursor_changed(path)` records the path now under the cursor
@@ -123,7 +123,7 @@ fn toggle(data: &str) -> String {
 
 /// Build the cursor entry's info as a single `(show-function-content …)` form
 /// carrying a logical `document` — the extension emits key/value fields and lets
-/// core lay them out (label alignment, theming, scroll); it no longer assembles
+/// core lay them out (label alignment, theming, scroll); it does not assemble
 /// styled lines itself.
 fn show_info() -> String {
     let path = CURSOR.with(|c| c.borrow().clone());

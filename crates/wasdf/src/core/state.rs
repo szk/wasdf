@@ -505,7 +505,7 @@ impl AppState {
         match self.mode() {
             Mode::File => self.current_entry().map(|e| e.path.clone()),
             // Any Select with an entry-grid view — deep file-search, a
-            // shallow filter/refine (SEARCH_RENEW.md) — not just file-search
+            // shallow filter/refine — not just file-search
             // by id, so cursor-follow (theme editor, preview) works
             // identically inside every one of them.
             Mode::Select(_) => self
@@ -519,7 +519,7 @@ impl AppState {
     }
 
     /// The operation target list: the selection if non-empty, else the cursor
-    /// entry. See RESOLVER.md.
+    /// entry. See doc/ARCHITECTURE.md (Resolver Contract).
     pub fn targets(&self) -> Vec<PathBuf> {
         if !self.selection.is_empty() {
             let mut v: Vec<PathBuf> = self.entries

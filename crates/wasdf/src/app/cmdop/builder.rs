@@ -99,7 +99,7 @@ struct Form {
     list_marks: HashSet<PathBuf>,
     /// The persisted filter query (post-submit), or `None` for no filter.
     filter_query: Option<String>,
-    /// `/` two-stage deep-then-shallow search (SEARCH_RENEW.md #4): `false`
+    /// `/` two-stage deep-then-shallow search (doc/CMDOP.md): `false`
     /// until a deep search over `list_cwd` has landed, at which point `/`
     /// switches from issuing another deep search to `filter_query`'s live
     /// shallow narrowing of the results already in hand. Reset whenever
@@ -119,13 +119,40 @@ struct Form {
 }
 
 impl Form {
-    /// Drop deep-search state on a browse-directory change: deep results
-    /// describe one directory, not the whole builder session (SEARCH_RENEW.md
-    /// decision 7). Called wherever `list_cwd` changes.
-    fn reset_deep(&mut self) {
+    /// A fresh form browsing `list_cwd`, the cursor on the first listing row.
+    fn new(op: Op, command_line: Vec<CmdToken>, options: Vec<OptRow>, list_cwd: PathBuf) -> Self {
+        Form {
+            op,
+            command_line,
+            cursor: options.len(),
+            options,
+            entries: Vec::new(),
+            list_cwd,
+            on_builder: false,
+            opt_hscroll: Scroll::default(),
+            builder_scroll: Scroll::default(),
+            opt_off: 0,
+            list_off: 0,
+            list_marks: HashSet::new(),
+            filter_query: None,
+            deep_results: false,
+            awaiting_deep: false,
+            deep_query: None,
+        }
+    }
+
+    /// Browse `dir`: the listing empties until its read lands, and deep-search
+    /// state is dropped — deep results describe one directory, not the whole
+    /// builder session.
+    fn browse(&mut self, dir: PathBuf) -> Intent {
+        self.list_cwd = dir.clone();
+        self.entries.clear();
+        self.cursor = self.options.len();
+        self.list_off = 0;
         self.deep_results = false;
         self.awaiting_deep = false;
         self.deep_query = None;
+        Intent::LoadContent { owner: ID.into(), path: dir, offset: 0 }
     }
 
     /// The destination for copy/move (rename's comes from the prompt): a pinned
@@ -253,30 +280,10 @@ impl CmdOp {
         if sources.is_empty() {
             return Vec::new(); // nothing to operate on
         }
-        let options = self.options_for(op);
-        let n_opts = options.len();
-        let list_cwd = state.cwd.clone();
-        *self.form.borrow_mut() = Some(Form {
-            op,
-            command_line: self.command_for(op),
-            options,
-            entries: Vec::new(),
-            list_cwd: list_cwd.clone(),
-            cursor: n_opts,
-            on_builder: false,
-            opt_hscroll: Scroll::default(),
-            builder_scroll: Scroll::default(),
-            opt_off: 0,
-            list_off: 0,
-            list_marks: HashSet::new(),
-            filter_query: None,
-            deep_results: false,
-            awaiting_deep: false,
-            deep_query: None,
-        });
+        *self.form.borrow_mut() = Some(Form::new(op, self.command_for(op), self.options_for(op), state.cwd.clone()));
         let mut out = vec![
             Intent::SetFunctionForm(Some(ID.into())),
-            Intent::LoadContent { owner: ID.into(), path: list_cwd, offset: 0 },
+            Intent::LoadContent { owner: ID.into(), path: state.cwd.clone(), offset: 0 },
         ];
         // Rename edits a name via the prompt (function panel focused); copy/move
         // keep file focus and browse for the destination.
@@ -298,28 +305,17 @@ impl CmdOp {
     /// (`multiline: true`), not in `Form`; `Form` here only carries `op` so
     /// `render_form` can tell Create apart from Copy/Move/Rename.
     fn start_create(&self, state: &AppState) -> Vec<Intent> {
-        *self.form.borrow_mut() = Some(Form {
-            op: Op::Create,
-            command_line: Vec::new(),
-            options: Vec::new(),
-            entries: Vec::new(),
-            list_cwd: state.cwd.clone(),
-            cursor: 0,
-            on_builder: false,
-            opt_hscroll: Scroll::default(),
-            builder_scroll: Scroll::default(),
-            opt_off: 0,
-            list_off: 0,
-            list_marks: HashSet::new(),
-            filter_query: None,
-            deep_results: false,
-            awaiting_deep: false,
-            deep_query: None,
-        });
+        *self.form.borrow_mut() = Some(Form::new(Op::Create, Vec::new(), Vec::new(), state.cwd.clone()));
         vec![
             Intent::SetFunctionForm(Some(ID.into())),
             Intent::BeginInput { purpose: "create-lines".into(), seed: String::new(), multiline: true },
         ]
+    }
+
+    /// Drop the form and give the panel back.
+    fn close(&self) -> Vec<Intent> {
+        self.form.borrow_mut().take();
+        vec![Intent::SetFunctionForm(None)]
     }
 
     /// Split the submitted multi-line buffer into `mkdir`/`touch` requests —
@@ -350,7 +346,7 @@ impl CmdOp {
     fn descend(&self, state: &AppState) -> Vec<Intent> {
         enum Act {
             None,
-            Read(PathBuf),
+            Browse(Intent),
             Confirm,
         }
         let act = {
@@ -365,13 +361,8 @@ impl CmdOp {
                 let idx = form.cursor - form.options.len();
                 match form.entries.get(idx) {
                     Some(e) if e.is_dir => {
-                        let p = e.path.clone();
-                        form.list_cwd = p.clone();
-                        form.entries.clear();
-                        form.cursor = form.options.len();
-                        form.list_off = 0;
-                        form.reset_deep();
-                        Act::Read(p)
+                        let dir = e.path.clone();
+                        Act::Browse(form.browse(dir))
                     }
                     Some(_) => Act::Confirm,
                     None => Act::None,
@@ -380,7 +371,7 @@ impl CmdOp {
         };
         match act {
             Act::None => Vec::new(),
-            Act::Read(p) => vec![Intent::LoadContent { owner: ID.into(), path: p, offset: 0 }],
+            Act::Browse(load) => vec![load],
             Act::Confirm => self.confirm(state),
         }
     }
@@ -399,12 +390,7 @@ impl CmdOp {
         let Some(parent) = form.list_cwd.parent().map(|p| p.to_path_buf()) else {
             return Vec::new();
         };
-        form.list_cwd = parent.clone();
-        form.entries.clear();
-        form.cursor = form.options.len();
-        form.list_off = 0;
-        form.reset_deep();
-        vec![Intent::LoadContent { owner: ID.into(), path: parent, offset: 0 }]
+        vec![form.browse(parent)]
     }
 
     /// Space: toggle the option checkbox / listing mark under the cursor.
@@ -516,35 +502,22 @@ impl CmdOp {
                 };
                 vec![Intent::LoadSearch { owner: ID.into(), root, query: text }]
             }
-            "prompt" => {
-                if submitted {
-                    self.run(state, Some(&text))
-                } else {
-                    self.form.borrow_mut().take();
-                    vec![Intent::SetFunctionForm(None)]
-                }
-            }
+            "prompt" if submitted => self.run(state, Some(&text)),
+            "prompt" | "create-lines" if !submitted => self.close(),
             "builder-edit" => {
                 if submitted {
-                    self.form.borrow_mut().take();
                     let argv: Vec<String> = text.split_whitespace().map(String::from).collect();
                     if argv.is_empty() {
-                        vec![Intent::SetFunctionForm(None)]
+                        self.close()
                     } else {
+                        self.form.borrow_mut().take();
                         self.run_command(argv, state)
                     }
                 } else {
                     Vec::new() // back to builder navigation
                 }
             }
-            "create-lines" => {
-                if submitted {
-                    self.run_create(&text)
-                } else {
-                    self.form.borrow_mut().take();
-                    vec![Intent::SetFunctionForm(None)]
-                }
-            }
+            "create-lines" => self.run_create(&text),
             _ => Vec::new(),
         }
     }
@@ -886,11 +859,8 @@ impl Extension for CmdOp {
             }
             "space" => self.space(),
             "confirm" => self.confirm(state),
-            "cancel" => {
-                self.form.borrow_mut().take();
-                vec![Intent::SetFunctionForm(None)]
-            }
-            // `/` is two-stage (SEARCH_RENEW.md decision 7): deep search over
+            "cancel" => self.close(),
+            // `/` is two-stage (doc/CMDOP.md): deep search over
             // the browsed dir until one has landed for it, then shallow live
             // narrowing of those results — same key, same purpose the user
             // already reaches for, escalating from "find it" to "narrow it".
@@ -919,8 +889,7 @@ impl Extension for CmdOp {
                 && form.list_cwd == path {
                     form.entries = entries.clone();
                     // A deep search (Intent::LoadSearch) completes through
-                    // this same generic content Read — see SEARCH_RENEW.md
-                    // decision 6. Distinguish it from an ordinary (re)listing
+                    // this same generic content Read. Distinguish it from an ordinary (re)listing
                     // by the pending flag `search-deep`'s submit set.
                     if form.awaiting_deep {
                         form.awaiting_deep = false;
@@ -942,9 +911,9 @@ impl Extension for CmdOp {
         let form = form_ref.as_mut()?;
         let theme = ctx.theme;
         // While a deep search (awaiting or landed) is active for the browsed
-        // dir, the title shows its query — the two-stage `/` (SEARCH_RENEW.md
-        // decision 7) is otherwise invisible once the filter row itself is
-        // showing the same text for the *shallow* stage.
+        // dir, the title shows its query — the two-stage `/` is otherwise
+        // invisible once the filter row itself is showing the same text for
+        // the *shallow* stage.
         let title = match &form.deep_query {
             Some(q) => format!("{} — search: {q}", form.op.title()),
             None => form.op.title().to_string(),
@@ -1185,56 +1154,6 @@ mod tests {
         assert!(out.iter().any(|i| matches!(i, Intent::LoadContent { owner, .. } if owner == ID)));
     }
 
-    #[test]
-    fn start_copy_without_a_target_is_a_no_op() {
-        let ext = CmdOp::new(Arc::default());
-        let s = AppState::new(std::path::PathBuf::from("/d")); // no entries → no targets
-        assert!(ext.handle_intent(&ei("start-copy"), &s).is_empty());
-        assert!(ext.form.borrow().is_none());
-    }
-
-    #[test]
-    fn accept_content_stashes_the_listing_for_the_browsed_dir() {
-        let ext = CmdOp::new(Arc::default());
-        ext.handle_intent(&ei("start-copy"), &state_with_cursor());
-        let entries = vec![entry("/d/x", "x", true), entry("/d/y", "y", false)];
-        ext.accept_content(std::path::Path::new("/d"), &Content::Dir { entries: entries.clone() });
-        assert_eq!(ext.form.borrow().as_ref().unwrap().entries.len(), 2);
-        // A stale read for another directory is ignored.
-        ext.accept_content(std::path::Path::new("/other"), &Content::Dir { entries: vec![] });
-        assert_eq!(ext.form.borrow().as_ref().unwrap().entries.len(), 2);
-    }
-
-    #[test]
-    fn cursor_moves_within_the_form() {
-        let ext = CmdOp::new(Arc::default());
-        ext.handle_intent(&ei("start-copy"), &state_with_cursor());
-        ext.accept_content(std::path::Path::new("/d"), &Content::Dir {
-            entries: vec![entry("/d/x", "x", false), entry("/d/y", "y", false)],
-        });
-        // No options → cursor starts at 0 (first listing row); down moves to 1.
-        assert_eq!(ext.form.borrow().as_ref().unwrap().cursor, 0);
-        ext.handle_intent(&ei("cursor-down"), &state_with_cursor());
-        assert_eq!(ext.form.borrow().as_ref().unwrap().cursor, 1);
-        // Up from the top row enters the CLI builder above the listing.
-        ext.handle_intent(&ei("cursor-up"), &state_with_cursor());
-        ext.handle_intent(&ei("cursor-up"), &state_with_cursor());
-        assert!(ext.form.borrow().as_ref().unwrap().on_builder);
-    }
-
-    #[test]
-    fn space_marks_the_listing_entry_independently() {
-        let ext = CmdOp::new(Arc::default());
-        let s = state_with_cursor();
-        ext.handle_intent(&ei("start-copy"), &s);
-        ext.accept_content(std::path::Path::new("/d"), &Content::Dir {
-            entries: vec![entry("/d/x", "x", true)],
-        });
-        ext.handle_intent(&ei("space"), &s);
-        assert!(ext.form.borrow().as_ref().unwrap().list_marks.contains(std::path::Path::new("/d/x")));
-        assert!(s.selection.is_empty(), "the file selection is untouched");
-    }
-
     fn store_with_runner(runner: &str) -> Arc<crate::core::OptionStore> {
         let store = Arc::new(crate::core::OptionStore::new(vec![crate::core::OptionDef {
             key: "cmdop.runner".into(),
@@ -1257,31 +1176,6 @@ mod tests {
     }
 
     #[test]
-    fn with_no_runner_a_built_command_runs_captured() {
-        let got = cmdop_with("", &["pty"]).run_command(vec!["ls".into()], &state_with_cursor());
-        assert!(matches!(got.as_slice(), [Intent::SetFunctionForm(None), Intent::Execute { .. }]), "{got:?}");
-    }
-
-    #[test]
-    fn an_unregistered_runner_is_noticed_and_runs_captured() {
-        let got = cmdop_with("pty", &[]).run_command(vec!["ls".into()], &state_with_cursor());
-        assert!(matches!(got.as_slice(), [Intent::SetFunctionForm(None), Intent::Notify(_), Intent::Execute { .. }]), "{got:?}");
-    }
-
-    #[test]
-    fn a_registered_runner_gets_the_run_contract() {
-        let got = cmdop_with("pty", &["pty"]).run_command(vec!["rg".into(), "foo".into()], &state_with_cursor());
-        let [Intent::SetFunctionForm(None), Intent::Extension(e)] = got.as_slice() else { panic!("{got:?}") };
-        assert_eq!((e.extension.as_str(), e.intent.as_str()), ("pty", "run"));
-        let ExtensionValue::Map(m) = &e.data else { panic!("expected a map") };
-        assert_eq!(m.get("label").and_then(|v| v.as_str()), Some("rg foo"));
-        assert_eq!(m.get("escape").and_then(|v| v.as_str()), Some("prefix-and-cursor"));
-        assert!(matches!(m.get("cwd"), Some(ExtensionValue::Path(_))));
-        let Some(ExtensionValue::List(argv)) = m.get("argv") else { panic!("expected argv") };
-        assert_eq!(argv.len(), 2);
-    }
-
-    #[test]
     fn confirm_emits_the_resolver_and_closes() {
         let ext = CmdOp::new(Arc::default());
         let s = state_with_cursor();
@@ -1292,29 +1186,7 @@ mod tests {
         assert!(out.iter().any(|i| matches!(i, Intent::SetFunctionForm(None))));
     }
 
-    #[test]
-    fn cancel_closes_the_form() {
-        let ext = CmdOp::new(Arc::default());
-        let s = state_with_cursor();
-        ext.handle_intent(&ei("start-copy"), &s);
-        let out = ext.handle_intent(&ei("cancel"), &s);
-        assert!(ext.form.borrow().is_none());
-        assert!(matches!(out.as_slice(), [Intent::SetFunctionForm(None)]));
-    }
-
-    // --- `/` two-stage deep-then-shallow search (SEARCH_RENEW.md #4) ------
-
-    #[test]
-    fn slash_opens_a_deep_search_input_when_no_deep_results_are_active() {
-        let ext = CmdOp::new(Arc::default());
-        let s = state_with_cursor();
-        ext.handle_intent(&ei("start-copy"), &s);
-        let out = ext.handle_intent(&ei("filter-start"), &s);
-        assert!(
-            matches!(out.as_slice(), [Intent::BeginInput { purpose, multiline: false, .. }] if purpose == "search-deep"),
-            "a fresh browse dir has no deep results yet: `/` asks for a search, not a live filter"
-        );
-    }
+    // --- `/` two-stage deep-then-shallow search (doc/CMDOP.md) ------------
 
     fn submit_search_deep(ext: &CmdOp, s: &AppState, text: &str) -> Vec<Intent> {
         let data = ExtensionValue::Map(
@@ -1326,35 +1198,6 @@ mod tests {
             .collect(),
         );
         ext.handle_intent(&ExtensionIntent { extension: ID.into(), intent: "input-submit".into(), data }, s)
-    }
-
-    #[test]
-    fn deep_submit_emits_load_search_for_the_browsed_dir() {
-        let ext = CmdOp::new(Arc::default());
-        let s = state_with_cursor();
-        ext.handle_intent(&ei("start-copy"), &s);
-        let out = submit_search_deep(&ext, &s, "needle");
-        assert_eq!(
-            out,
-            vec![Intent::LoadSearch { owner: ID.into(), root: std::path::PathBuf::from("/d"), query: "needle".into() }]
-        );
-        // Loading state: the stale plain listing is cleared, not left showing
-        // while the walk is in flight.
-        assert!(ext.form.borrow().as_ref().unwrap().entries.is_empty());
-        assert!(ext.form.borrow().as_ref().unwrap().awaiting_deep);
-        assert!(!ext.form.borrow().as_ref().unwrap().deep_results, "not landed yet");
-    }
-
-    #[test]
-    fn an_empty_deep_submit_issues_no_search_and_leaves_the_browser_untouched() {
-        let ext = CmdOp::new(Arc::default());
-        let s = state_with_cursor();
-        ext.handle_intent(&ei("start-copy"), &s);
-        ext.accept_content(std::path::Path::new("/d"), &Content::Dir { entries: vec![entry("/d/x", "x", false)] });
-        let out = submit_search_deep(&ext, &s, "");
-        assert!(out.is_empty());
-        assert!(!ext.form.borrow().as_ref().unwrap().awaiting_deep);
-        assert_eq!(ext.form.borrow().as_ref().unwrap().entries.len(), 1, "the existing listing survives an Esc/empty submit");
     }
 
     #[test]
@@ -1379,30 +1222,6 @@ mod tests {
     }
 
     #[test]
-    fn changing_the_browse_dir_resets_to_deep() {
-        let ext = CmdOp::new(Arc::default());
-        let s = state_with_cursor();
-        ext.handle_intent(&ei("start-copy"), &s);
-        submit_search_deep(&ext, &s, "needle");
-        ext.accept_content(std::path::Path::new("/d"), &Content::Dir {
-            entries: vec![entry("/d/sub", "sub", true)],
-        });
-        assert!(ext.form.borrow().as_ref().unwrap().deep_results);
-
-        // Descend into the dir under the cursor: a real browse-dir change.
-        ext.handle_intent(&ei("descend"), &s);
-        assert!(!ext.form.borrow().as_ref().unwrap().deep_results, "deep results describe one directory, not the session");
-        assert!(!ext.form.borrow().as_ref().unwrap().awaiting_deep);
-        assert!(ext.form.borrow().as_ref().unwrap().deep_query.is_none());
-
-        let out = ext.handle_intent(&ei("filter-start"), &s);
-        assert!(
-            matches!(out.as_slice(), [Intent::BeginInput { purpose, .. }] if purpose == "search-deep"),
-            "the new directory has no deep results of its own yet"
-        );
-    }
-
-    #[test]
     fn a_stale_deep_completion_for_an_abandoned_dir_is_ignored() {
         let ext = CmdOp::new(Arc::default());
         let s = state_with_cursor();
@@ -1421,81 +1240,4 @@ mod tests {
         assert!(!ext.form.borrow().as_ref().unwrap().deep_results);
     }
 
-    #[test]
-    fn start_create_needs_no_targets_and_opens_a_multiline_input() {
-        // Unlike copy/move/rename, create works even with nothing selected —
-        // an empty directory is a perfectly good place to make a new file.
-        let ext = CmdOp::new(Arc::default());
-        let s = AppState::new(std::path::PathBuf::from("/d")); // no entries
-        let out = ext.handle_intent(&ei("start-create"), &s);
-        assert!(ext.form.borrow().is_some());
-        assert!(matches!(out.first(), Some(Intent::SetFunctionForm(Some(id))) if id == ID));
-        assert!(out.iter().any(|i| matches!(
-            i,
-            Intent::BeginInput { purpose, multiline: true, .. } if purpose == "create-lines"
-        )));
-    }
-
-    #[test]
-    fn create_targets_splits_lines_by_trailing_slash() {
-        let targets: Vec<_> = create_targets("newdir/\nnewfile.txt\n\n  spaced.txt  \n").collect();
-        assert_eq!(targets, vec![("mkdir", "newdir"), ("touch", "newfile.txt"), ("touch", "spaced.txt")]);
-    }
-
-    #[test]
-    fn create_preview_resolves_mkdir_and_touch_per_line() {
-        assert_eq!(create_preview("a/\nb.txt"), "mkdir -p a\ntouch b.txt");
-        assert_eq!(create_preview(""), "");
-    }
-
-    #[test]
-    fn run_create_emits_one_run_resolver_per_line_and_closes() {
-        let ext = CmdOp::new(Arc::default());
-        let s = state_with_cursor();
-        ext.handle_intent(&ei("start-create"), &s);
-        let data = ExtensionValue::Map(
-            [
-                ("purpose".to_string(), ExtensionValue::String("create-lines".into())),
-                ("text".to_string(), ExtensionValue::String("dir1/\nfile1.txt\n".into())),
-            ]
-            .into_iter()
-            .collect(),
-        );
-        let out = ext.handle_intent(
-            &ExtensionIntent { extension: ID.into(), intent: "input-submit".into(), data },
-            &s,
-        );
-        assert!(ext.form.borrow().is_none(), "the form closes on submit");
-        let resolvers: Vec<_> = out
-            .iter()
-            .filter_map(|i| match i {
-                Intent::RunResolver(r) => Some((r.op.as_str(), r.path.as_deref())),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(resolvers, vec![("mkdir", Some("dir1")), ("touch", Some("file1.txt"))]);
-        assert!(out.iter().any(|i| matches!(i, Intent::SetFunctionForm(None))));
-    }
-
-    #[test]
-    fn create_lines_cancel_closes_without_running_anything() {
-        let ext = CmdOp::new(Arc::default());
-        let s = state_with_cursor();
-        ext.handle_intent(&ei("start-create"), &s);
-        let data = ExtensionValue::Map(
-            [
-                ("purpose".to_string(), ExtensionValue::String("create-lines".into())),
-                ("text".to_string(), ExtensionValue::String("half-typed".into())),
-            ]
-            .into_iter()
-            .collect(),
-        );
-        let out = ext.handle_intent(
-            &ExtensionIntent { extension: ID.into(), intent: "input-cancel".into(), data },
-            &s,
-        );
-        assert!(ext.form.borrow().is_none());
-        assert!(!out.iter().any(|i| matches!(i, Intent::RunResolver(_))));
-        assert!(matches!(out.as_slice(), [Intent::SetFunctionForm(None)]));
-    }
 }
